@@ -10,14 +10,20 @@ function result_handler(jobId, ok, value)
     println(" value = ", value)
 end
 
-# ２．クライアントコードを読み込む
+using Sockets
+
 include("syncopadeClient.jl")
 
-# ３. クライアント側の結果受信用サーバを起動
-# ポート番号は自分で指定する
+status = query_server_status("192.168.2.99", 8099)
+println("server status = ", status)
+
+if status != "STATUS|idle"
+    println("server is busy now. aborting request.")
+    return
+end
+
 syncopade_result_server_once(9001, result_handler)
 
-# ４．計算要求を送信するクライアントの設定を作成
 client = SyncopadeClient(
     "192.168.2.99",  # server ip
     8099,         # server port（環境に合わせて）
@@ -29,6 +35,5 @@ client = SyncopadeClient(
     ["hogehoge"] # args
 )
 
-# ５．計算要求を送信
 jobId = syncopade_calc_request(client)
 println("submitted jobId = ", jobId)

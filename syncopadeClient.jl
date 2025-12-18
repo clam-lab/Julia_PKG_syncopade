@@ -148,3 +148,11 @@ function syncopade_result_server_once(port::Int, handler::Function)
         end
     end
 end
+
+function query_server_status(server_ip::String, server_port::Int)
+    sock = connect(server_ip, server_port)
+    println(sock, "STATUS")
+    resp = readline(sock)
+    close(sock)
+    return resp
+end
