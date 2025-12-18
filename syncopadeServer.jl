@@ -30,8 +30,11 @@ end
 # RESULT|jobId|ERROR|<errorType>|<errorMessage>|CHECKSUM
 # を送信する
 function syncopade_server(port::Int)
-    server = listen(port)  # 指定されたポート番号で待つ
-
+    # Explicitly bind to detected local IP address to allow LAN access (not just localhost)
+    bind_ip = getipaddr()
+    server = listen(bind_ip, port)
+    println("bind address: ", bind_ip, ":", port)
+    
     @async begin
         while true
             # クライアントからの接続を待つ
