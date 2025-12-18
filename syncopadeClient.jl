@@ -71,7 +71,9 @@ function syncopade_calc_request(pList::SyncopadeClient)
 end
 
 function syncopade_result_server(port::Int, handler::Function)
-    server = listen(port)
+    bind_ip = getipaddr()
+    server = listen(bind_ip, port)
+    println("result server bind address: ", bind_ip, ":", port)
     @async while true
         sock = accept(server)
         @async begin
@@ -103,6 +105,46 @@ function syncopade_result_server(port::Int, handler::Function)
                 # ignore errors in handler
             end
             close(sock)
+        end
+    end
+end
+
+# one-shot result server:
+# listens once, receives exactly one RESULT message, then shuts down
+function syncopade_result_server_once(port::Int, handler::Function)
+    bind_ip = getipaddr()
+    server = listen(bind_ip, port)
+    println("one-shot result server bind address: ", bind_ip, ":", port)
+    @async begin
+        try
+            sock = accept(server)
+            try
+                line = readline(sock)
+                ok, payload = verify_checksum(line)
+                if ok
+                    parts = split(payload, '|')
+                    # expected format:
+                    # RESULT|jobId|OK|value
+                    # or
+                    # RESULT|jobId|ERROR|errType|errMsg
+                    if length(parts) >= 4 && parts[1] == "RESULT"
+                        jobId = parts[2]
+                        status = parts[3]
+                        if status == "OK"
+                            value = join(parts[4:end], "|")
+                            handler(jobId, true, value)
+                        elseif status == "ERROR" && length(parts) >= 5
+                            errType = parts[4]
+                            errMsg = join(parts[5:end], "|")
+                            handler(jobId, false, errType * "|" * errMsg)
+                        end
+                    end
+                end
+            finally
+                close(sock)
+            end
+        finally
+            close(server)
         end
     end
 end
