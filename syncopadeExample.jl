@@ -10,20 +10,28 @@ function result_handler(jobId, ok, value)
     println(" value = ", value)
 end
 
+# ２．ソケットを使うので Sockets を使う
 using Sockets
 
+# ３．syncopadeClient.jl を読み込む
 include("syncopadeClient.jl")
 
+# ４．サーバの状態を問い合わせる
 status = query_server_status("192.168.2.99", 8099)
 println("server status = ", status)
 
+# ５．サーバがアイドル状態でなければ終了
 if status != "STATUS|idle"
     println("server is busy now. aborting request.")
     return
 end
 
+## ここまでは準備コード．以下でクライアントを作成してジョブを送信する．
+
+# ６．結果受信サーバを起動　ポート番号は任意　クライアントと被らなければ良い
 syncopade_result_server_once(9001, result_handler)
 
+# 7. クライアントの設定を作る
 client = SyncopadeClient(
     "192.168.2.99",  # server ip
     8099,         # server port（環境に合わせて）
@@ -35,5 +43,7 @@ client = SyncopadeClient(
     ["hogehoge"] # args
 )
 
+# 8. ジョブを送信
 jobId = syncopade_calc_request(client)
 println("submitted jobId = ", jobId)
+

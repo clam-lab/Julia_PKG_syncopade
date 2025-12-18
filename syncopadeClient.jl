@@ -151,7 +151,9 @@ end
 
 function query_server_status(server_ip::String, server_port::Int)
     sock = connect(server_ip, server_port)
-    println(sock, "STATUS")
+    payload = "STATUS"
+    msg = payload * "|" * checksum_hex(payload)
+    println(sock, msg)
     resp = readline(sock)
     close(sock)
     return resp
