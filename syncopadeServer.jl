@@ -1,5 +1,15 @@
 using Sockets
 
+# syncopade_serverのラッパー関数
+# 引数がないバージョン．指定しないとIPアドレスの最下位の数字＋8000がポートになる
+function syncopade_server()
+    ip_parts = split(getipaddr(), '.')
+    last_octet = parse(Int, ip_parts[end])
+    port = last_octet + 8000
+    syncopade_server(port)
+end
+
+
 # syncopadeクライアントからのデータを受信する
 # メッセージのフォーマットは FILENAME_MODULENAME_FUNCNAME_ARGS|CHECKSUM
 function syncopade_server(port::Int)
