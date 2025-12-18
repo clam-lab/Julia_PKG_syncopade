@@ -12,6 +12,9 @@ function syncopade_server()
     ip_parts = split(string(getipaddr()), '.')
     last_octet = parse(Int, ip_parts[end])
     port = last_octet + 8000
+
+    println("Starting syncopade server on port ", port, " ... ")
+    println("server IP address: ", string(getipaddr()))
     syncopade_server(port)
 end
 
