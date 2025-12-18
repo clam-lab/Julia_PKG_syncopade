@@ -1,15 +1,15 @@
 using Sockets
 using UUIDs
 
-# メインのサーバー起動関数
 
 
 # 以下関数群 ############################################################
 
+# NOTE: getipaddr() は IPv4/IPv6 オブジェクトを返すため、string() に変換してから split する
 # syncopade_serverのラッパー関数
 # 引数がないバージョン．指定しないとIPアドレスの最下位の数字＋8000がポートになる
 function syncopade_server()
-    ip_parts = split(getipaddr(), '.')
+    ip_parts = split(string(getipaddr()), '.')
     last_octet = parse(Int, ip_parts[end])
     port = last_octet + 8000
     syncopade_server(port)
