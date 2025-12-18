@@ -1,12 +1,14 @@
-include("syncopadeClient.jl")
-
-# 2. クライアント側の結果受信用サーバ
-syncopade_result_server(9001) do jobId, ok, value
+function result_handler(jobId, ok, value)
     println("RESULT:")
     println(" jobId = ", jobId)
     println(" ok    = ", ok)
     println(" value = ", value)
 end
+
+include("syncopadeClient.jl")
+
+# 2. クライアント側の結果受信用サーバ
+syncopade_result_server(9001, result_handler)
 
 client = SyncopadeClient(
     "192.168.2.99",  # server ip
