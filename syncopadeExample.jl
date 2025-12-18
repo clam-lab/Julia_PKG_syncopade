@@ -18,7 +18,7 @@ client = SyncopadeClient(
     "testScript", # .jl file name（拡張子なし）
     "testScript4syncopade", # module name
     "test_syncopade", # function name
-    String[] #args
+    ["hogehoge"] # args
 )
 
 jobId = syncopade_calc_request(client)
