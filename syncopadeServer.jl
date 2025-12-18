@@ -1,6 +1,7 @@
 using Sockets
 using UUIDs
 
+const server_state = Ref(:idle)  # :idle or :busy
 
 
 # 以下関数群 ############################################################
@@ -52,6 +53,13 @@ function syncopade_server(port::Int)
                         return
                     end
 
+                    # Check for STATUS command
+                    if msg == "STATUS"
+                        println(sock, "STATUS|" * string(server_state[]))
+                        close(sock)
+                        return
+                    end
+
                     # メッセージを解析してジョブ情報を得る
                     job = convMSG2JOB(msg)
 
@@ -61,6 +69,9 @@ function syncopade_server(port::Int)
                     # 即時応答を返しソケットを閉じる
                     println(sock, "OK|STARTED|" * jobId)
                     close(sock)
+
+                    # Set server state to busy
+                    server_state[] = :busy
 
                     # 非同期で計算を実行し，コールバックを送信
                     @async begin
@@ -81,6 +92,8 @@ function syncopade_server(port::Int)
                             end
                             errMsg = sprint(showerror, e)
                             send_result(job, jobId, false; errType=errType, errMsg=errMsg)
+                        finally
+                            server_state[] = :idle
                         end
                     end
                 catch e
