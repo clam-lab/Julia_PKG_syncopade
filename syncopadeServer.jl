@@ -217,8 +217,8 @@ end
 function call_func(file_name::String, module_name::String, func_name::String, args::Vector{String}=String[])
     include(file_name * ".jl")
 
-    mod = getfield(Main, Symbol(module_name))
-    f = getfield(mod, Symbol(func_name))
+    mod = Base.invokelatest(getfield, Main, Symbol(module_name))
+    f   = Base.invokelatest(getfield, mod,  Symbol(func_name))
 
-    return f(args...)
+    return Base.invokelatest(f, args...) 
 end
