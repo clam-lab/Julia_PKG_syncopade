@@ -9,14 +9,14 @@ syncopade_result_server(9001) do jobId, ok, value
 end
 
 client = SyncopadeClient(
-    "127.0.0.1",  # server ip
-    8000,         # server port（環境に合わせて）
+    "192.168.2.99",  # server ip
+    8099,         # server port（環境に合わせて）
     "127.0.0.1",  # self ip
     9001,         # self port
-    "testScript",
-    "testScript4syncopade",
-    "test_syncopade",
-    String[]
+    "testScript", # .jl file name（拡張子なし）
+    "testScript4syncopade", # module name
+    "test_syncopade", # function name
+    String[] #args
 )
 
 jobId = syncopade_calc_request(client)
