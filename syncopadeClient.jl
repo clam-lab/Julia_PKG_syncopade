@@ -1,8 +1,9 @@
 using Sockets
+using UUIDs
 
-# syncopade_serverに接続するためのクライアントの構造体
+# syncopade job request and callback endpoint struct
 struct SyncopadeClient
-    sever_ip_addr::String
+    server_ip_addr::String
     server_port::Int
     self_ip_addr::String
     self_port::Int
@@ -12,27 +13,96 @@ struct SyncopadeClient
     args::Vector{String}
 end
 
-# syncopade_serverに接続するためのクライアントのコード
-function syncopade_calc_request(pList::SyncopadeClient)
-    sock = connect(pList.server_ip_addr, pList.server_port)
-
-    # メッセージの作成
-    # フォーマットは fileName|moduleName|funcName|arg1|arg2|...|CHECKSUM
-    msg = join([pList.file_name, pList.module_name, pList.function_name, join(pList.args, "|")], "|")
-    msg_with_checksum = add_checksum(msg)   
-    println(sock, msg_with_checksum)
-
-    println(readline(sock))
-    close(sock)
-end
-
-
-
-# チェックサムを計算する関数
+# checksum utilities
 function geneXORchecksum(s::String)
     c = UInt8(0)
     for b in codeunits(s)
         c ⊻= b
     end
     return c
+end
+
+function checksum_hex(payload::String)::String
+    c = geneXORchecksum(payload)
+    return lowercase(string(c, base=16, pad=2))
+end
+
+function add_checksum(payload::String)::String
+    return payload * "|" * checksum_hex(payload)
+end
+
+function verify_checksum(msg::String)::Tuple{Bool,String}
+    parts = split(msg, '|')
+    if length(parts) < 2
+        return (false, "")
+    end
+    checksum_str = parts[end]
+    payload = join(parts[1:end-1], '|')
+    expected = checksum_hex(payload)
+    return (checksum_str == expected, payload)
+end
+
+# syncopade_serverに接続するためのクライアントのコード（非同期コールバック対応）
+function syncopade_calc_request(pList::SyncopadeClient)
+    sock = connect(pList.server_ip_addr, pList.server_port)
+
+    # フォーマットは self_ip_addr|self_port|file:module:func|arg1|arg2|...
+    func_spec = string(pList.file_name, ":", pList.module_name, ":", pList.function_name)
+    payload_parts = [pList.self_ip_addr, string(pList.self_port), func_spec]
+    if !isempty(pList.args)
+        append!(payload_parts, pList.args)
+    end
+    payload = join(payload_parts, "|")
+    msg_with_checksum = add_checksum(payload)
+    println(sock, msg_with_checksum)
+
+    # 1行だけ読み込み、OK|STARTED|jobIdを受け取る
+    resp = readline(sock)
+    close(sock)
+
+    # parse response: OK|STARTED|jobId
+    resp_parts = split(resp, '|')
+    if length(resp_parts) == 3 && resp_parts[1] == "OK" && resp_parts[2] == "STARTED"
+        jobId = resp_parts[3]
+        return jobId
+    else
+        error("Unexpected response from server: $resp")
+    end
+end
+
+function syncopade_result_server(port::Int, handler::Function)
+    server = listen(port)
+    @async while true
+        sock = accept(server)
+        @async begin
+            try
+                line = readline(sock)
+                ok, payload = verify_checksum(line)
+                if !ok
+                    close(sock)
+                    return
+                end
+                parts = split(payload, '|')
+                # expected format:
+                # RESULT|jobId|OK|value
+                # or
+                # RESULT|jobId|ERROR|errType|errMsg
+                if length(parts) >= 4 && parts[1] == "RESULT"
+                    jobId = parts[2]
+                    status = parts[3]
+                    if status == "OK"
+                        value = join(parts[4:end], "|")
+                        handler(jobId, true, value)
+                    elseif status == "ERROR" && length(parts) >= 5
+                        errType = parts[4]
+                        errMsg = join(parts[5:end], "|")
+                        handler(jobId, false, errType * "|" * errMsg)
+                    end
+                end
+            catch e
+                # ignore errors in handler
+            end
+            close(sock)
+        end
+    end
 end
