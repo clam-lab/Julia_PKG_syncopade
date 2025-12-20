@@ -16,8 +16,11 @@ using Sockets
 # ３．syncopadeClient.jl を読み込む
 include("syncopadeClient.jl")
 
+serverIp::String = "192.168.93.1"
+serverPort::Int = 8001
+
 # ４．サーバの状態を問い合わせる
-status = query_server_status("192.168.2.99", 8099)
+status = query_server_status(serverIp, serverPort)
 println("server status = ", status)
 
 # ５．サーバがアイドル状態でなければ終了
@@ -33,9 +36,9 @@ syncopade_result_server_once(9001, result_handler)
 
 # 7. クライアントの設定を作る
 client = SyncopadeClient(
-    "192.168.2.99",  # server ip
-    8099,         # server port（環境に合わせて）
-    "192.168.2.99",  # self ip 自分のIPアドレス
+    serverIp,        # server ip
+    serverPort,      # server port（環境に合わせて）
+    "192.168.93.1",  # self ip 自分のIPアドレス
     9001,         # self port　なんでもいい 数字を変えればパラレルで複数作れる
     "testScript", # .jl file name（拡張子なし）
     "testScript4syncopade", # module name
