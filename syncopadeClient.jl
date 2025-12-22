@@ -167,12 +167,17 @@ end
 #   Client -> Conductor : "LIST"
 #   Conductor -> Client : "NODES|ip:port|ip:port|..."
 
-function query_conductor_nodes(conductor_ip::String; conductor_port::Int)
+function query_conductor_nodes(conductor_ip::String; conductor_port::Int=9000)
     sock = connect(conductor_ip, conductor_port)
     println(sock, "LIST")
     resp = readline(sock)
     close(sock)
     return resp
+end
+
+# positional-arg overload for convenience
+function query_conductor_nodes(conductor_ip::String, conductor_port::Int)
+    return query_conductor_nodes(conductor_ip; conductor_port=conductor_port)
 end
 
 # Parse conductor response into Vector{Tuple{String,Int}}
@@ -199,7 +204,7 @@ function parse_conductor_nodes(resp::String)
 end
 
 
-function show_available_nodes(conductor_ip::String; conductor_port::Int)
+function show_available_nodes(conductor_ip::String; conductor_port::Int=9000)
     resp = query_conductor_nodes(conductor_ip; conductor_port=conductor_port)
     nodes = parse_conductor_nodes(resp)
 
@@ -213,5 +218,10 @@ function show_available_nodes(conductor_ip::String; conductor_port::Int)
     end
 
     return nodes
+end
+
+# positional-arg overload for convenience
+function show_available_nodes(conductor_ip::String, conductor_port::Int)
+    return show_available_nodes(conductor_ip; conductor_port=conductor_port)
 end
 
