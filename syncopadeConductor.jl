@@ -1,4 +1,5 @@
 include("syncopadeClient.jl")
+using Dates
 
 struct NODES
     IP::String
@@ -53,7 +54,7 @@ end
 function monitor_nodes(; interval=DEFAULT_POLL_INTERVAL)
     nodes = geneAvailableNodeList()
     while true
-        println("---- Syncopade Conductor Status ----")
+        println("---- Syncopade Conductor Status @ ", Dates.format(now(), "yyyy-mm-dd HH:MM:SS"), " ----")
         for node in nodes
             state = probe_node(node)
             println(" ", node.IP, ":", node.port, " => ", state)
