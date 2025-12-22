@@ -166,7 +166,8 @@ end
 # Protocol:
 #   Client -> Conductor : "LIST"
 #   Conductor -> Client : "NODES|ip:port|ip:port|..."
-function query_conductor_nodes(conductor_ip::String; conductor_port::Int=9000)
+
+function query_conductor_nodes(conductor_ip::String; conductor_port::Int)
     sock = connect(conductor_ip, conductor_port)
     println(sock, "LIST")
     resp = readline(sock)
@@ -197,7 +198,8 @@ function parse_conductor_nodes(resp::String)
     return nodes
 end
 
-function show_available_nodes(conductor_ip::String; conductor_port::Int=9000)
+
+function show_available_nodes(conductor_ip::String; conductor_port::Int)
     resp = query_conductor_nodes(conductor_ip; conductor_port=conductor_port)
     nodes = parse_conductor_nodes(resp)
 
