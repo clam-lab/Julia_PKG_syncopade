@@ -1,5 +1,9 @@
 include("syncopadeClient.jl")
 using Dates
+using Sockets
+
+# shared state for conductor
+const node_states = Dict{Tuple{String,Int},Symbol}()
 
 struct NODES
     IP::String
@@ -50,6 +54,13 @@ function geneAvailableNodeList()
     return nodes        
 end
 
+function conductor_port()
+    ip = string(getipaddr())
+    parts = split(ip, ".")
+    last = parse(Int, parts[end])
+    return 8000 + last
+end
+
 # Monitor the status of all candidate nodes by polling periodically and printing their state.
 function monitor_nodes(; interval=DEFAULT_POLL_INTERVAL)
     nodes = geneAvailableNodeList()
@@ -57,9 +68,45 @@ function monitor_nodes(; interval=DEFAULT_POLL_INTERVAL)
         println("---- Syncopade Conductor Status @ ", Dates.format(now(), "yyyy-mm-dd HH:MM:SS"), " ----")
         for node in nodes
             state = probe_node(node)
+            node_states[(node.IP, node.port)] = state
             println(" ", node.IP, ":", node.port, " => ", state)
         end
         println()
         sleep(interval)
     end
 end
+
+# Conductor server: returns idle nodes on LIST command
+function conductor_server()
+    port = conductor_port()
+    server = listen(getipaddr(), port)
+    println("Conductor server listening on ", string(getipaddr()), ":", port)
+
+    @async while true
+        sock = accept(server)
+        @async begin
+            try
+                cmd = strip(readline(sock))
+                if cmd == "LIST"
+                    idle_nodes = String[]
+                    for ((ip, p), state) in node_states
+                        if state == NODE_IDLE
+                            push!(idle_nodes, string(ip, ":", p))
+                        end
+                    end
+                    println(sock, "NODES|" * join(idle_nodes, "|"))
+                else
+                    println(sock, "ERROR|UNKNOWN_COMMAND")
+                end
+            catch e
+                println("Conductor server error: ", e)
+            finally
+                close(sock)
+            end
+        end
+    end
+end
+
+
+monitor_nodes(interval=1.0)
+conductor_server()
