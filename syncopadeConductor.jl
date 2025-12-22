@@ -58,7 +58,7 @@ function conductor_port()
     ip = string(getipaddr())
     parts = split(ip, ".")
     last = parse(Int, parts[end])
-    return 8000 + last
+    return 9000 + last
 end
 
 # Monitor the status of all candidate nodes by polling periodically and printing their state.

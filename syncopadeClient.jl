@@ -158,3 +158,58 @@ function query_server_status(server_ip::String, server_port::Int)
     close(sock)
     return resp
 end
+
+#
+# --- Conductor query helpers (ADD ONLY) ---
+#
+# Query Syncopade Conductor for available nodes
+# Protocol:
+#   Client -> Conductor : "LIST"
+#   Conductor -> Client : "NODES|ip:port|ip:port|..."
+function query_conductor_nodes(conductor_ip::String; conductor_port::Int=9000)
+    sock = connect(conductor_ip, conductor_port)
+    println(sock, "LIST")
+    resp = readline(sock)
+    close(sock)
+    return resp
+end
+
+# Parse conductor response into Vector{Tuple{String,Int}}
+function parse_conductor_nodes(resp::String)
+    parts = split(resp, '|')
+    if isempty(parts) || parts[1] != "NODES"
+        return Tuple{String,Int}[]
+    end
+
+    nodes = Tuple{String,Int}[]
+    for p in parts[2:end]
+        sp = split(p, ':')
+        if length(sp) == 2
+            ip = sp[1]
+            port = try
+                parse(Int, sp[2])
+            catch
+                continue
+            end
+            push!(nodes, (ip, port))
+        end
+    end
+    return nodes
+end
+
+function show_available_nodes(conductor_ip::String; conductor_port::Int=9000)
+    resp = query_conductor_nodes(conductor_ip; conductor_port=conductor_port)
+    nodes = parse_conductor_nodes(resp)
+
+    println("---- Available Syncopade Nodes ----")
+    if isempty(nodes)
+        println(" (none)")
+    else
+        for (ip, port) in nodes
+            println(" ", ip, ":", port)
+        end
+    end
+
+    return nodes
+end
+
