@@ -108,5 +108,5 @@ function conductor_server()
 end
 
 
-monitor_nodes(interval=1.0)
 conductor_server()
+monitor_nodes(interval=1.0)

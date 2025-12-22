@@ -216,8 +216,7 @@ function show_available_nodes(conductor_ip::String; conductor_port::Int=9000)
             println(" ", ip, ":", port)
         end
     end
-
-    return nodes
+    return nothing
 end
 
 # positional-arg overload for convenience
