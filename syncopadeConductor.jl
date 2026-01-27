@@ -8,6 +8,7 @@ const node_states = Dict{Tuple{String,Int},Symbol}()
 struct NODES
     IP::String
     port::Int
+    name::String
 end
 
 const NODE_IDLE = :idle
@@ -47,18 +48,18 @@ end
 # 利用可能な可能性のあるノードのリストを返す関数
 function geneAvailableNodeList()
     nodes = NODES[] 
-    push!(nodes, NODES("192.168.100.26", 8026)) # C-3PX - Phyduck
-    push!(nodes, NODES("192.168.100.30", 8030)) # Chopper
-    push!(nodes, NODES("192.168.100.37", 8037)) # BD-1
-    push!(nodes, NODES("192.168.100.38", 8038)) # GNK_EG-6
-    push!(nodes, NODES("192.168.100.48", 8048)) # GONKY
-    push!(nodes, NODES("192.168.100.73", 8073)) # Hunter
-    push!(nodes, NODES("192.168.100.74", 8074)) # Tech
-    push!(nodes, NODES("192.168.100.75", 8075)) # Crosshair
-    push!(nodes, NODES("192.168.100.76", 8076)) # Wrecker
-    push!(nodes, NODES("192.168.100.77", 8077)) # Echo
-    push!(nodes, NODES("192.168.100.78", 8078)) # Omega
-    push!(nodes, NODES("192.168.100.95", 8095)) # D-O
+    push!(nodes, NODES("192.168.100.26", 8026, "C-3PX"))
+    push!(nodes, NODES("192.168.100.30", 8030, "Chopper"))
+    push!(nodes, NODES("192.168.100.37", 8037, "BD-1"))
+    push!(nodes, NODES("192.168.100.38", 8038, "GNK_EG-6"))
+    push!(nodes, NODES("192.168.100.48", 8048, "GONKY"))
+    push!(nodes, NODES("192.168.100.73", 8073, "Hunter"))
+    push!(nodes, NODES("192.168.100.74", 8074, "Tech"))
+    push!(nodes, NODES("192.168.100.75", 8075, "Crosshair"))
+    push!(nodes, NODES("192.168.100.76", 8076, "Wrecker"))
+    push!(nodes, NODES("192.168.100.77", 8077, "Echo"))
+    push!(nodes, NODES("192.168.100.78", 8078, "Omega"))
+    push!(nodes, NODES("192.168.100.95", 8095, "D-O"))
 
     return nodes        
 end
@@ -78,7 +79,7 @@ function monitor_nodes(; interval=DEFAULT_POLL_INTERVAL)
         for node in nodes
             state = probe_node(node)
             node_states[(node.IP, node.port)] = state
-            println(" ", node.IP, ":", node.port, " => ", state)
+            println(rpad(node.name,10)," ", node.IP, ":", node.port, " => ", state)
         end
         println()
         sleep(interval)
