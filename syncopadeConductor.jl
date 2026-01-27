@@ -49,7 +49,16 @@ function geneAvailableNodeList()
     nodes = NODES[] 
     push!(nodes, NODES("192.168.100.26", 8026)) # C-3PX - Phyduck
     push!(nodes, NODES("192.168.100.30", 8030)) # Chopper
-    push!(nodes, NODES("192.168.100.5", 8105))  # dammy for test    
+    push!(nodes, NODES("192.168.100.37", 8037)) # BD-1
+    push!(nodes, NODES("192.168.100.38", 8038)) # GNK_EG-6
+    push!(nodes, NODES("192.168.100.48", 8048)) # GONKY
+    push!(nodes, NODES("192.168.100.73", 8073)) # Hunter
+    push!(nodes, NODES("192.168.100.74", 8074)) # Tech
+    push!(nodes, NODES("192.168.100.75", 8075)) # Crosshair
+    push!(nodes, NODES("192.168.100.76", 8076)) # Wrecker
+    push!(nodes, NODES("192.168.100.77", 8077)) # Echo
+    push!(nodes, NODES("192.168.100.78", 8078)) # Omega
+    push!(nodes, NODES("192.168.100.95", 8095)) # D-O
 
     return nodes        
 end
