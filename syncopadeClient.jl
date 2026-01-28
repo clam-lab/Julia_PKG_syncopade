@@ -2,6 +2,24 @@ using Sockets
 using UUIDs
 
 # syncopade job request and callback endpoint struct
+"""
+    SyncopadeClient
+
+Client-side configuration for submitting a Syncopade job request and receiving the async callback.
+
+# Fields
+- `server_ip_addr::String`: Syncopade server IP address.
+- `server_port::Int`: Syncopade server TCP port.
+- `self_ip_addr::String`: Callback receiver (this machine) IP address.
+- `self_port::Int`: Callback receiver TCP port.
+- `file_name::String`: Remote-side file name (or identifier) that contains the target function.
+- `module_name::String`: Remote-side module name.
+- `function_name::String`: Remote-side function name.
+- `args::Vector{String}`: Positional arguments encoded as strings.
+
+# Notes
+- This struct is purely a transport/config holder; validation is done by the server.
+"""
 struct SyncopadeClient
     server_ip_addr::String
     server_port::Int
@@ -14,6 +32,21 @@ struct SyncopadeClient
 end
 
 # checksum utilities
+"""
+    geneXORchecksum(s::String) -> UInt8
+
+Compute a simple XOR checksum over the code units of `s`.
+
+# Arguments
+- `s`: Input string.
+
+# Returns
+- `UInt8`: XOR checksum value (0x00–0xFF).
+
+# Notes
+- Lightweight integrity check for transport errors.
+- Not a cryptographic hash.
+"""
 function geneXORchecksum(s::String)
     c = UInt8(0)
     for b in codeunits(s)
@@ -22,15 +55,57 @@ function geneXORchecksum(s::String)
     return c
 end
 
+"""
+    checksum_hex(payload::String) -> String
+
+Return the XOR checksum of `payload` as a 2-digit, lowercase hex string.
+
+# Arguments
+- `payload`: Message payload without the checksum suffix.
+
+# Returns
+- `String`: Two-character hex string (e.g., "0a").
+"""
 function checksum_hex(payload::String)::String
     c = geneXORchecksum(payload)
     return lowercase(string(c, base=16, pad=2))
 end
 
+"""
+    add_checksum(payload::String) -> String
+
+Append a checksum suffix to `payload` in the format `payload|cc`.
+
+# Arguments
+- `payload`: Message payload without the checksum suffix.
+
+# Returns
+- `String`: Payload with appended checksum field.
+"""
 function add_checksum(payload::String)::String
     return payload * "|" * checksum_hex(payload)
 end
 
+"""
+    verify_checksum(msg::String) -> Tuple{Bool,String}
+
+Verify the checksum of a `|`-separated message.
+
+# Protocol
+- The last field is treated as the checksum.
+- Everything before it (including any intermediate `|`) is treated as the payload.
+
+# Arguments
+- `msg`: Full message string, expected to end with `|cc`.
+
+# Returns
+- `(ok, payload)` where:
+  - `ok::Bool` indicates checksum match.
+  - `payload::String` is the message without the trailing checksum field.
+
+# Notes
+- If the message does not have at least two fields, returns `(false, "")`.
+"""
 function verify_checksum(msg::String)::Tuple{Bool,String}
     parts = split(msg, '|')
     if length(parts) < 2
@@ -42,7 +117,29 @@ function verify_checksum(msg::String)::Tuple{Bool,String}
     return (checksum_str == expected, payload)
 end
 
-# syncopade_serverに接続するためのクライアントのコード（非同期コールバック対応）
+"""
+    syncopade_calc_request(pList::SyncopadeClient) -> String
+
+Submit a Syncopade job request to the server and receive a `jobId`.
+
+# Request Format (payload)
+`self_ip_addr|self_port|file:module:func|arg1|arg2|...`
+
+A checksum is appended automatically as `|cc`.
+
+# Response Format
+Expected single-line response:
+- `OK|STARTED|jobId`
+
+# Arguments
+- `pList`: Client configuration and encoded arguments.
+
+# Returns
+- `String`: `jobId` assigned by the server.
+
+# Throws
+- `error(...)` if the server response does not match the expected format.
+"""
 function syncopade_calc_request(pList::SyncopadeClient)
     sock = connect(pList.server_ip_addr, pList.server_port)
 
@@ -70,6 +167,28 @@ function syncopade_calc_request(pList::SyncopadeClient)
     end
 end
 
+"""
+    syncopade_result_server(port::Int, handler::Function)
+
+Start a result receiver server that listens forever and dispatches callbacks asynchronously.
+
+# Behavior
+- Binds to `getipaddr()` and the specified `port`.
+- For each incoming connection, reads one line, verifies checksum, and parses the payload.
+
+# Expected Payload Formats
+- `RESULT|jobId|OK|value`
+- `RESULT|jobId|ERROR|errType|errMsg`
+
+# Handler Signature
+`handler(jobId::String, ok::Bool, payload::String)`
+- When `ok == true`, `payload` is `value`.
+- When `ok == false`, `payload` is `"errType|errMsg"`.
+
+# Notes
+- Runs with `@async`; this function returns immediately.
+- Errors inside the accept/parse loop are intentionally swallowed to keep the server alive.
+"""
 function syncopade_result_server(port::Int, handler::Function)
     bind_ip = getipaddr()
     server = listen(bind_ip, port)
@@ -109,8 +228,22 @@ function syncopade_result_server(port::Int, handler::Function)
     end
 end
 
-# one-shot result server:
-# listens once, receives exactly one RESULT message, then shuts down
+"""
+    syncopade_result_server_once(port::Int, handler::Function)
+
+Start a one-shot result receiver: accepts exactly one connection, handles one RESULT message, then shuts down.
+
+# Expected Payload Formats
+- `RESULT|jobId|OK|value`
+- `RESULT|jobId|ERROR|errType|errMsg`
+
+# Handler Signature
+`handler(jobId::String, ok::Bool, payload::String)`
+
+# Notes
+- Runs with `@async`; this function returns immediately.
+- After handling a single message, both the client socket and server socket are closed.
+"""
 function syncopade_result_server_once(port::Int, handler::Function)
     bind_ip = getipaddr()
     server = listen(bind_ip, port)
@@ -149,6 +282,18 @@ function syncopade_result_server_once(port::Int, handler::Function)
     end
 end
 
+"""
+    query_server_status(server_ip::String, server_port::Int) -> String
+
+Query a Syncopade server for its status.
+
+# Protocol
+- Sends `STATUS|cc` where `cc` is the XOR checksum of `STATUS`.
+- Reads and returns a single-line response from the server.
+
+# Returns
+- `String`: Raw response line from the server.
+"""
 function query_server_status(server_ip::String, server_port::Int)
     sock = connect(server_ip, server_port)
     payload = "STATUS"
@@ -167,6 +312,21 @@ end
 #   Client -> Conductor : "LIST"
 #   Conductor -> Client : "NODES|ip:port|ip:port|..."
 
+"""
+    query_conductor_nodes(conductor_ip::String; conductor_port::Int=9000) -> String
+
+Query the Syncopade Conductor for available nodes.
+
+# Protocol
+Client -> Conductor:
+- `LIST`
+
+Conductor -> Client:
+- `NODES|ip:port|ip:port|...`
+
+# Returns
+- `String`: Raw response line from the conductor.
+"""
 function query_conductor_nodes(conductor_ip::String; conductor_port::Int=9000)
     sock = connect(conductor_ip, conductor_port)
     println(sock, "LIST")
@@ -175,12 +335,29 @@ function query_conductor_nodes(conductor_ip::String; conductor_port::Int=9000)
     return resp
 end
 
-# positional-arg overload for convenience
+"""
+    query_conductor_nodes(conductor_ip::String, conductor_port::Int) -> String
+
+Positional-argument overload of `query_conductor_nodes`.
+"""
 function query_conductor_nodes(conductor_ip::String, conductor_port::Int)
     return query_conductor_nodes(conductor_ip; conductor_port=conductor_port)
 end
 
-# Parse conductor response into Vector{Tuple{String,Int}}
+"""
+    parse_conductor_nodes(resp::String) -> Vector{Tuple{String,Int}}
+
+Parse a conductor response string into a list of `(ip, port)` tuples.
+
+# Input
+- `resp`: Expected to be `NODES|ip:port|ip:port|...`.
+
+# Returns
+- `Vector{Tuple{String,Int}}`: Parsed nodes; returns an empty vector on malformed input.
+
+# Notes
+- Any malformed `ip:port` entries are skipped.
+"""
 function parse_conductor_nodes(resp::String)
     parts = split(resp, '|')
     if isempty(parts) || parts[1] != "NODES"
@@ -204,6 +381,19 @@ function parse_conductor_nodes(resp::String)
 end
 
 
+"""
+    show_available_nodes(conductor_ip::String; conductor_port::Int=9000) -> Nothing
+
+Fetch and print the list of available Syncopade nodes from the conductor.
+
+# Output
+Prints:
+- `---- Available Syncopade Nodes ----`
+- One `ip:port` per line, or `(none)` if the list is empty.
+
+# Returns
+- `nothing`
+"""
 function show_available_nodes(conductor_ip::String; conductor_port::Int=9000)
     resp = query_conductor_nodes(conductor_ip; conductor_port=conductor_port)
     nodes = parse_conductor_nodes(resp)
@@ -219,7 +409,11 @@ function show_available_nodes(conductor_ip::String; conductor_port::Int=9000)
     return nothing
 end
 
-# positional-arg overload for convenience
+"""
+    show_available_nodes(conductor_ip::String, conductor_port::Int) -> Nothing
+
+Positional-argument overload of `show_available_nodes`.
+"""
 function show_available_nodes(conductor_ip::String, conductor_port::Int)
     return show_available_nodes(conductor_ip; conductor_port=conductor_port)
 end
