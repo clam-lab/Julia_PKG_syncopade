@@ -235,3 +235,27 @@ function call_func(file_name::String, module_name::String, func_name::String, ar
 
     return Base.invokelatest(f, args...) 
 end
+
+
+# ---------------------------------------------------------------------
+# Runnable entrypoint (for VSCode "Run" / ▶)
+# ---------------------------------------------------------------------
+# Usage:
+#   - Run without args: starts on auto port (last_octet + 8000)
+#   - Run with a port:  julia syncopadeServer.jl 9001
+if abspath(PROGRAM_FILE) == @__FILE__
+    try
+        if length(ARGS) >= 1
+            port = parse(Int, ARGS[1])
+            syncopade_server(port)
+        else
+            syncopade_server()
+        end
+
+        println("Syncopade server is running. Press Ctrl+C to stop.")
+        wait(Condition())  # block forever
+    catch e
+        println("Failed to start syncopade server: ", e)
+        rethrow(e)
+    end
+end
