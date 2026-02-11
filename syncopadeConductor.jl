@@ -62,8 +62,8 @@ function probe_node(node::NODES; timeout=DEFAULT_STATUS_TIMEOUT)
     end
 end
 
-function default_callback_port(ip::String)::Int
-    parts = split(ip, ".")
+function default_callback_port(ip::AbstractString)::Int
+    parts = split(String(ip), ".")
     if length(parts) != 4
         throw(ArgumentError("Invalid IPv4 address: $ip"))
     end
@@ -72,7 +72,7 @@ end
 
 function parse_submit_task(payload::String)::ConductorTask
     parts = split(payload, '|')
-    if length(parts) < 4 || parts[1] != "SUBMIT"
+    if length(parts) < 3 || parts[1] != "SUBMIT"
         throw(ArgumentError("Invalid SUBMIT format"))
     end
 
@@ -313,7 +313,7 @@ function conductor_server()
         end
     end
 end
-
-
-conductor_server()
-monitor_nodes(interval=1.0)
+if abspath(PROGRAM_FILE) == @__FILE__
+    conductor_server()
+    monitor_nodes(interval=1.0)
+end

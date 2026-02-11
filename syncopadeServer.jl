@@ -240,4 +240,6 @@ end
 # ---------------------------------------------------------------------
 # Runnable entrypoint (for VSCode "Run" / ▶)
 # ---------------------------------------------------------------------
-syncopade_server()
+if abspath(PROGRAM_FILE) == @__FILE__
+    syncopade_server()
+end

@@ -425,3 +425,70 @@ Positional-argument overload of `show_available_nodes`.
 function show_available_nodes(conductor_ip::String, conductor_port::Int)
     return show_available_nodes(conductor_ip; conductor_port=conductor_port)
 end
+
+"""
+    submit_conductor_task(
+        conductor_ip::String;
+        conductor_port::Int=9000,
+        coordinator_ip::String,
+        coordinator_port::Union{Nothing,Int}=nothing,
+        source::String,
+        module_name::String,
+        function_name::String,
+        args::Vector{String}=String[]
+    ) -> String
+
+Submit one task to Syncopade Conductor and receive a conductor `task_id`.
+
+# Protocol
+Client -> Conductor payload:
+- `SUBMIT|coord_ip|coord_port(optional)|source:module:function|arg1|arg2|...`
+
+The payload is sent as `payload|cc` with XOR checksum.
+
+Conductor -> Client payload:
+- `OK|QUEUED|task_id`
+
+# Returns
+- `String`: Queued conductor task id.
+"""
+function submit_conductor_task(
+    conductor_ip::String;
+    conductor_port::Int=9000,
+    coordinator_ip::String,
+    coordinator_port::Union{Nothing,Int}=nothing,
+    source::String,
+    module_name::String,
+    function_name::String,
+    args::Vector{String}=String[]
+)
+    func_spec = string(source, ":", module_name, ":", function_name)
+    payload_parts = String["SUBMIT", coordinator_ip]
+    if coordinator_port !== nothing
+        push!(payload_parts, string(coordinator_port))
+    end
+    push!(payload_parts, func_spec)
+    if !isempty(args)
+        append!(payload_parts, args)
+    end
+
+    payload = join(payload_parts, "|")
+    msg = add_checksum(payload)
+
+    sock = connect(conductor_ip, conductor_port)
+    println(sock, msg)
+    resp = readline(sock)
+    close(sock)
+
+    ok, resp_payload = verify_checksum(resp)
+    if !ok
+        error("Invalid checksum from conductor response: $resp")
+    end
+
+    parts = split(resp_payload, '|')
+    if length(parts) == 3 && parts[1] == "OK" && parts[2] == "QUEUED"
+        return parts[3]
+    else
+        error("Unexpected response from conductor: $resp_payload")
+    end
+end
