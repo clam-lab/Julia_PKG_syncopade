@@ -309,8 +309,8 @@ end
 #
 # Query Syncopade Conductor for available nodes
 # Protocol:
-#   Client -> Conductor : "LIST"
-#   Conductor -> Client : "NODES|ip:port|ip:port|..."
+#   Client -> Conductor : "LIST|cc"
+#   Conductor -> Client : "NODES|ip:port|ip:port|...|cc"
 
 """
     query_conductor_nodes(conductor_ip::String; conductor_port::Int=9000) -> String
@@ -319,20 +319,24 @@ Query the Syncopade Conductor for available nodes.
 
 # Protocol
 Client -> Conductor:
-- `LIST`
+- `LIST|cc`
 
 Conductor -> Client:
-- `NODES|ip:port|ip:port|...`
+- `NODES|ip:port|ip:port|...|cc`
 
 # Returns
 - `String`: Raw response line from the conductor.
 """
 function query_conductor_nodes(conductor_ip::String; conductor_port::Int=9000)
     sock = connect(conductor_ip, conductor_port)
-    println(sock, "LIST")
+    println(sock, add_checksum("LIST"))
     resp = readline(sock)
     close(sock)
-    return resp
+    ok, payload = verify_checksum(resp)
+    if !ok
+        error("Invalid checksum from conductor response: $resp")
+    end
+    return payload
 end
 
 """
@@ -350,7 +354,7 @@ end
 Parse a conductor response string into a list of `(ip, port)` tuples.
 
 # Input
-- `resp`: Expected to be `NODES|ip:port|ip:port|...`.
+- `resp`: Expected to be `NODES|ip:port|ip:port|...` or `NODES|...|cc`.
 
 # Returns
 - `Vector{Tuple{String,Int}}`: Parsed nodes; returns an empty vector on malformed input.
@@ -359,7 +363,11 @@ Parse a conductor response string into a list of `(ip, port)` tuples.
 - Any malformed `ip:port` entries are skipped.
 """
 function parse_conductor_nodes(resp::String)
-    parts = split(resp, '|')
+    # Accept both payload-only and checksum-attached response strings.
+    ok, payload = verify_checksum(resp)
+    raw = ok ? payload : resp
+
+    parts = split(raw, '|')
     if isempty(parts) || parts[1] != "NODES"
         return Tuple{String,Int}[]
     end
@@ -417,4 +425,3 @@ Positional-argument overload of `show_available_nodes`.
 function show_available_nodes(conductor_ip::String, conductor_port::Int)
     return show_available_nodes(conductor_ip; conductor_port=conductor_port)
 end
-
