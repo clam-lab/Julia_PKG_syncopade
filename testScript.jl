@@ -1,5 +1,7 @@
 module testScript4syncopade
 
+    using Random
+
     const OBJECTIVE_FILE = "/Volumes/syncopade_nfs/Julia_GeneralObjectiveFunction.jl"
     const _objective_loaded = Ref(false)
 
@@ -63,6 +65,39 @@ module testScript4syncopade
     function objective_test(mode::String, x_str::String)
         _ = mode
         return objective_from_string(x_str)
+    end
+
+    # Runs the same runtime loop as GeneralObjectiveFunction test/runtests.jl.
+    # Returns one multi-line string summary so callback can capture all results.
+    function objective_runtests_like()
+        _ensure_objective_loaded!()
+        mod = Base.invokelatest(getfield, @__MODULE__, :Julia_GeneralObjectiveFunction)
+        obj = Base.invokelatest(getfield, mod, :objective)
+        params_ctor = Base.invokelatest(getfield, mod, :ObjectiveParams)
+
+        x = randn(8)
+        n_values = [128, 512, 2048, 8192, 16000, 32000, 64000, 128000]
+        k_max = 500
+        tol = 1.0e-12
+
+        lines = String[]
+        for n in n_values
+            p = Base.invokelatest(params_ctor; n=n, k_max=k_max, tol=tol)
+
+            # Warm-up to avoid first-call compilation overhead in timing.
+            Base.invokelatest(obj, x; p=p)
+
+            f_ref = Ref(0.0)
+            t = @elapsed begin
+                f_ref[] = Base.invokelatest(obj, x; p=p)
+            end
+            f = f_ref[]
+            isfinite(f) || throw(ArgumentError("non-finite objective for n=$n: $f"))
+
+            push!(lines, "[runtime] n=$(n), k_max=$(k_max) -> elapsed=$(round(t; digits=6)) sec, f=$(f)")
+        end
+
+        return join(lines, "\n")
     end
 
     function test_syncopade(arg::String)
