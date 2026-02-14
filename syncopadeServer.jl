@@ -238,8 +238,10 @@ end
 
 
 # ---------------------------------------------------------------------
-# Runnable entrypoint (for VSCode "Run" / ▶)
+# Runnable entrypoint
 # ---------------------------------------------------------------------
-if abspath(PROGRAM_FILE) == @__FILE__
+function main()
     syncopade_server()
 end
+
+main()
