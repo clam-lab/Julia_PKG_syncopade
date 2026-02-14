@@ -242,6 +242,14 @@ end
 # ---------------------------------------------------------------------
 function main()
     syncopade_server()
+    println("Syncopade server is running. Type 'q' + Enter to quit.")
+    while true
+        if eof(stdin)
+            break
+        end
+        cmd = strip(readline(stdin))
+        lowercase(cmd) == "q" && break
+    end
 end
 
 main()
