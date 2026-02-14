@@ -313,7 +313,7 @@ function conductor_server()
         end
     end
 end
-if abspath(PROGRAM_FILE) == @__FILE__
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
     conductor_server()
     monitor_nodes(interval=1.0)
 end
