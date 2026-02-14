@@ -74,4 +74,10 @@ module testScript4syncopade
         return "ARG=" * arg
     end
 
+    function main()
+        test_syncopade()
+    end
+
+    main()
+
 end
