@@ -110,7 +110,7 @@ module testScript4syncopade
     end
 
     function main()
-        test_syncopade()
+        test_syncopade("local-test")
     end
 
     main()
