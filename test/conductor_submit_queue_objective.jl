@@ -22,7 +22,7 @@ include(joinpath(@__DIR__, "..", "syncopadeClient.jl"))
 conductor_ip = length(ARGS) >= 1 ? ARGS[1] : "192.168.100.96"
 conductor_port = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : 9096
 callback_port = length(ARGS) >= 3 ? parse(Int, ARGS[3]) : 9170
-num_tasks = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 10
+num_tasks = length(ARGS) >= 4 ? parse(Int, ARGS[4]) : 30
 timeout_sec = length(ARGS) >= 5 ? parse(Float64, ARGS[5]) : 180.0
 
 local_ip = string(getipaddr())
