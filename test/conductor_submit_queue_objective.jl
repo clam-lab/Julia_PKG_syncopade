@@ -1,4 +1,5 @@
 using Sockets
+using Random
 
 include(joinpath(@__DIR__, "..", "syncopadeClient.jl"))
 
@@ -30,6 +31,12 @@ source = length(ARGS) >= 6 ? ARGS[6] : "/Volumes/syncopade_nfs/Julia_GeneralObje
 module_name = length(ARGS) >= 7 ? ARGS[7] : "Julia_GeneralObjectiveFunction"
 function_name = length(ARGS) >= 8 ? ARGS[8] : "objective_from_string"
 fn_args = length(ARGS) >= 9 ? ARGS[9:end] : ["[0.1,0.2,0.3]"]
+random_x_mode = get(ENV, "SYNCOPADE_RANDOM_X", "0") == "1"
+random_x_dim = parse(Int, get(ENV, "SYNCOPADE_RANDOM_X_DIM", "3"))
+random_x_seed_str = get(ENV, "SYNCOPADE_RANDOM_X_SEED", "")
+if !isempty(random_x_seed_str)
+    Random.seed!(parse(Int, random_x_seed_str))
+end
 
 println("conductor = ", conductor_ip, ":", conductor_port)
 println("callback  = ", local_ip, ":", callback_port)
@@ -37,6 +44,7 @@ println("tasks     = ", num_tasks)
 println("timeout   = ", timeout_sec, " sec")
 println("target    = ", source, ":", module_name, ":", function_name)
 println("args      = ", fn_args)
+println("random_x  = ", random_x_mode ? "on (dim=$(random_x_dim))" : "off")
 
 recv_done = Ref(false)
 recv_count = Ref(0)
@@ -103,6 +111,14 @@ end
 
 task_ids = String[]
 for i in 1:num_tasks
+    task_args = fn_args
+    if random_x_mode
+        x = randn(random_x_dim)
+        x_arg = "[" * join(string.(x), ",") * "]"
+        task_args = [x_arg]
+        println("x[", i, "] = ", x_arg)
+    end
+
     task_id = submit_conductor_task(
         conductor_ip;
         conductor_port=conductor_port,
@@ -111,7 +127,7 @@ for i in 1:num_tasks
         source=source,
         module_name=module_name,
         function_name=function_name,
-        args=fn_args
+        args=task_args
     )
     push!(task_ids, task_id)
     println("submitted [", i, "/", num_tasks, "] task_id=", task_id)
