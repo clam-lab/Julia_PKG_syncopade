@@ -15,4 +15,41 @@ function mock_objective_product(x::AbstractVector, p::AbstractVector)
     return prod(x) * prod(p)
 end
 
+function _parse_vector_arg(v_str::String)::Vector{Float64}
+    s = strip(v_str)
+    if startswith(s, "[") && endswith(s, "]")
+        s = strip(s[2:end-1])
+    end
+    isempty(s) && throw(ArgumentError("vector string is empty"))
+
+    parts = split(s, ',')
+    v = Float64[]
+    for part in parts
+        token = strip(part)
+        isempty(token) && continue
+        push!(v, parse(Float64, token))
+    end
+    isempty(v) && throw(ArgumentError("failed to parse vector: $v_str"))
+    return v
+end
+
+"""
+    mock_objective_product_from_string(x_str, p_str) -> String
+
+Server-call entrypoint for Syncopade protocol:
+- input: two String arguments
+- output: String result
+"""
+function mock_objective_product_from_string(x_str::String, p_str::String)::String
+    x = _parse_vector_arg(x_str)
+    p = _parse_vector_arg(p_str)
+    value = mock_objective_product(x, p)
+    return string(value)
+end
+
+# Simple alias entrypoint for Syncopade tests.
+function test(x_str::String, p_str::String)::String
+    return mock_objective_product_from_string(x_str, p_str)
+end
+
 end
