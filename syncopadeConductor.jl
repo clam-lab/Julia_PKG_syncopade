@@ -274,7 +274,7 @@ function conductor_server()
         sock = accept(server)
         @async begin
             try
-                msg = strip(readline(sock))
+                msg = String(strip(readline(sock)))
                 ok, payload = verify_checksum(msg)
                 if !ok
                     println(sock, add_checksum("ERROR|BAD_CHECKSUM"))
