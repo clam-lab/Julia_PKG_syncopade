@@ -41,9 +41,13 @@ Server-call entrypoint for Syncopade protocol:
 - output: String result
 """
 function mock_objective_product_from_string(x_str::String, p_str::String)::String
+    println("[syncopadeBasicTestScript] entered mock_objective_product_from_string")
+    println("[syncopadeBasicTestScript] x_str=", x_str, " p_str=", p_str)
     x = _parse_vector_arg(x_str)
     p = _parse_vector_arg(p_str)
+    println("[syncopadeBasicTestScript] parsed lengths: x=", length(x), " p=", length(p))
     value = mock_objective_product(x, p)
+    println("[syncopadeBasicTestScript] computed value=", value)
     return string(value)
 end
 
