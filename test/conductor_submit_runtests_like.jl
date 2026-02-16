@@ -17,6 +17,7 @@ local_ip = string(getipaddr())
 println("conductor = ", conductor_ip, ":", conductor_port)
 println("callback  = ", local_ip, ":", callback_port)
 println("timeout   = ", timeout_sec, " sec")
+println("expected result = 30030")
 
 done = Ref(false)
 ok_ref = Ref(false)
@@ -37,10 +38,10 @@ task_id = submit_conductor_task(
     conductor_port=conductor_port,
     coordinator_ip=local_ip,
     coordinator_port=callback_port,
-    source="testScript",
-    module_name="testScript4syncopade",
-    function_name="objective_runtests_like",
-    args=String[]
+    source="/Volumes/syncopade_nfs/syncopadeBasicTestScript",
+    module_name="syncopadeBasicTestScript",
+    function_name="test",
+    args=["[2,3,5]", "[7,11,13]"]
 )
 
 println("submitted conductor task_id = ", task_id)
