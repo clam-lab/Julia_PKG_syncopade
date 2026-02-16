@@ -60,7 +60,6 @@ values_lock = ReentrantLock()
                 chk_ok, payload = verify_checksum(line)
                 if !chk_ok
                     bad_checksum_count[] += 1
-                    recv_count[] += 1
                     continue
                 end
 
@@ -126,16 +125,16 @@ if w === :timed_out
     )
 end
 
-vmin = NaN
-vmax = NaN
-vavg = NaN
-lock(values_lock) do
-    if !isempty(values)
-        vmin = minimum(values)
-        vmax = maximum(values)
-        vavg = sum(values) / length(values)
+stats = lock(values_lock) do
+    if isempty(values)
+        nothing
+    else
+        (minimum(values), maximum(values), sum(values) / length(values))
     end
 end
+vmin = stats === nothing ? NaN : stats[1]
+vmax = stats === nothing ? NaN : stats[2]
+vavg = stats === nothing ? NaN : stats[3]
 
 println("---- Objective Queue Summary ----")
 println("submitted      = ", length(task_ids))
