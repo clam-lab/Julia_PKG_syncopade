@@ -32,7 +32,7 @@ const NODE_BUSY = :busy
 const NODE_DOWN = :down
 
 const DEFAULT_POLL_INTERVAL = 2.0  # seconds
-const DEFAULT_STATUS_TIMEOUT = 1.0  # seconds (per node)
+const DEFAULT_STATUS_TIMEOUT = 0.2  # seconds (per node)
 const DEFAULT_MAX_RETRY = 3
 
 function task_label(task::ConductorTask)::String
@@ -311,6 +311,17 @@ function conductor_server()
                         enqueue_task!(task)
                         println("Queued ", task_label(task), " queue_len=", queue_len())
                         println(sock, add_checksum("OK|QUEUED|" * task.task_id))
+
+                        # Fast path: try dispatch immediately after enqueue
+                        # so we don't wait for the next monitor cycle.
+                        @async begin
+                            nodes = geneAvailableNodeList()
+                            for node in nodes
+                                state = probe_node(node; timeout=DEFAULT_STATUS_TIMEOUT)
+                                set_node_state!(node, state)
+                            end
+                            dispatch_queued_tasks(nodes; max_retry=DEFAULT_MAX_RETRY)
+                        end
                     else
                         println(sock, add_checksum("ERROR|UNKNOWN_COMMAND"))
                     end
