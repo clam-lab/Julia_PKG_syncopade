@@ -492,3 +492,105 @@ function submit_conductor_task(
         error("Unexpected response from conductor: $resp_payload")
     end
 end
+
+"""
+    submit_conductor_task_and_wait(
+        conductor_ip::String;
+        conductor_port::Int=9000,
+        coordinator_ip::String=string(getipaddr()),
+        coordinator_port::Int,
+        source::String,
+        module_name::String,
+        function_name::String,
+        args::Vector{String}=String[],
+        timeout::Float64=60.0
+    ) -> NamedTuple
+
+Submit one task to the conductor and wait for exactly one callback result on `coordinator_port`.
+
+# Returns
+- `(task_id, job_id, ok, payload)`:
+  - `task_id::String`: Conductor queue task id
+  - `job_id::String`: Worker job id from RESULT callback
+  - `ok::Bool`: `true` for RESULT OK, `false` for RESULT ERROR
+  - `payload::String`: Result value (OK) or `errType|errMsg` (ERROR)
+
+# Notes
+- The callback listener is started before SUBMIT to avoid race conditions.
+- Throws `error(...)` on timeout, checksum error, or malformed callback payload.
+"""
+function submit_conductor_task_and_wait(
+    conductor_ip::String;
+    conductor_port::Int=9000,
+    coordinator_ip::String=string(getipaddr()),
+    coordinator_port::Int,
+    source::String,
+    module_name::String,
+    function_name::String,
+    args::Vector{String}=String[],
+    timeout::Float64=60.0
+)
+    bind_ip = getipaddr()
+    server = listen(bind_ip, coordinator_port)
+
+    sock = nothing
+    try
+        accept_task = @async accept(server)
+
+        task_id = submit_conductor_task(
+            conductor_ip;
+            conductor_port=conductor_port,
+            coordinator_ip=coordinator_ip,
+            coordinator_port=coordinator_port,
+            source=source,
+            module_name=module_name,
+            function_name=function_name,
+            args=args
+        )
+
+        w_accept = Base.timedwait(() -> istaskdone(accept_task), timeout; pollint=0.01)
+        if w_accept === :timed_out
+            error("timeout waiting callback connection on $(string(bind_ip)):$(coordinator_port)")
+        end
+        sock = fetch(accept_task)
+
+        line_task = @async readline(sock)
+        w_line = Base.timedwait(() -> istaskdone(line_task), timeout; pollint=0.01)
+        if w_line === :timed_out
+            error("timeout waiting callback payload on $(string(bind_ip)):$(coordinator_port)")
+        end
+        line = fetch(line_task)
+
+        chk_ok, payload = verify_checksum(line)
+        if !chk_ok
+            error("Invalid checksum in callback: $line")
+        end
+
+        parts = split(payload, '|')
+        if length(parts) >= 4 && parts[1] == "RESULT"
+            job_id = parts[2]
+            status = parts[3]
+            if status == "OK"
+                value = join(parts[4:end], "|")
+                return (task_id=task_id, job_id=job_id, ok=true, payload=value)
+            elseif status == "ERROR" && length(parts) >= 5
+                errType = parts[4]
+                errMsg = join(parts[5:end], "|")
+                return (task_id=task_id, job_id=job_id, ok=false, payload=errType * "|" * errMsg)
+            end
+        end
+
+        error("Unexpected callback payload: $payload")
+    finally
+        if sock !== nothing
+            try
+                close(sock)
+            catch
+            end
+        end
+        try
+            close(server)
+        catch
+        end
+    end
+end

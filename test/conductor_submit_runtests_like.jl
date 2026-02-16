@@ -41,20 +41,7 @@ else
     println("expected  = (disabled: custom args)")
 end
 
-done = Ref(false)
-ok_ref = Ref(false)
-payload_ref = Ref("")
-
-function on_result(jobId::String, ok::Bool, payload::String)
-    println("RESULT jobId=", jobId, " ok=", ok, " payload=", payload)
-    ok_ref[] = ok
-    payload_ref[] = payload
-    done[] = true
-end
-
-syncopade_result_server_once(callback_port, on_result)
-
-task_id = submit_conductor_task(
+result = submit_conductor_task_and_wait(
     conductor_ip;
     conductor_port=conductor_port,
     coordinator_ip=local_ip,
@@ -62,26 +49,19 @@ task_id = submit_conductor_task(
     source=source,
     module_name=module_name,
     function_name=function_name,
-    args=args
+    args=args,
+    timeout=timeout_sec
 )
 
-println("submitted conductor task_id = ", task_id)
+println("submitted conductor task_id = ", result.task_id)
+println("RESULT jobId=", result.job_id, " ok=", result.ok, " payload=", result.payload)
 
-t0 = time()
-while !done[] && (time() - t0) < timeout_sec
-    sleep(0.1)
+if !result.ok
+    error("worker returned error: " * result.payload)
 end
 
-if !done[]
-    error("timeout waiting callback")
-end
-
-if !ok_ref[]
-    error("worker returned error: " * payload_ref[])
-end
-
-if expected !== nothing && payload_ref[] != expected
-    error("unexpected payload: " * payload_ref[] * " (expected " * expected * ")")
+if expected !== nothing && result.payload != expected
+    error("unexpected payload: " * result.payload * " (expected " * expected * ")")
 end
 
 println("conductor submit test passed")
