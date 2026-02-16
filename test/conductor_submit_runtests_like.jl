@@ -22,16 +22,47 @@ println("expected result = 30030")
 done = Ref(false)
 ok_ref = Ref(false)
 payload_ref = Ref("")
-
-function on_result(jobId::String, ok::Bool, payload::String)
-    println("RESULT jobId=", jobId, " ok=", ok)
-    println(payload)
-    ok_ref[] = ok
-    payload_ref[] = payload
-    done[] = true
+@async begin
+    server = listen(getipaddr(), callback_port)
+    println("debug result server bind address: ", string(getipaddr()), ":", callback_port)
+    sock = accept(server)
+    try
+        line = readline(sock)
+        println("raw callback line = ", line)
+        chk_ok, payload = verify_checksum(line)
+        println("callback checksum ok = ", chk_ok)
+        if chk_ok
+            parts = split(payload, '|')
+            if length(parts) >= 4 && parts[1] == "RESULT"
+                jobId = parts[2]
+                status = parts[3]
+                if status == "OK"
+                    value = join(parts[4:end], "|")
+                    println("RESULT jobId=", jobId, " ok=true")
+                    println(value)
+                    ok_ref[] = true
+                    payload_ref[] = value
+                    done[] = true
+                elseif status == "ERROR" && length(parts) >= 5
+                    errType = parts[4]
+                    errMsg = join(parts[5:end], "|")
+                    println("RESULT jobId=", jobId, " ok=false")
+                    println(errType * "|" * errMsg)
+                    ok_ref[] = false
+                    payload_ref[] = errType * "|" * errMsg
+                    done[] = true
+                else
+                    println("unexpected RESULT payload = ", payload)
+                end
+            else
+                println("unexpected callback payload = ", payload)
+            end
+        end
+    finally
+        close(sock)
+        close(server)
+    end
 end
-
-syncopade_result_server_once(callback_port, on_result)
 
 task_id = submit_conductor_task(
     conductor_ip;
