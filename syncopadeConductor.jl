@@ -35,6 +35,17 @@ const DEFAULT_POLL_INTERVAL = 2.0  # seconds
 const DEFAULT_STATUS_TIMEOUT = 1.0  # seconds (per node)
 const DEFAULT_MAX_RETRY = 3
 
+function task_label(task::ConductorTask)::String
+    argn = length(task.args)
+    return string(
+        "task=", task.task_id,
+        " retry=", task.retry_count,
+        " call=", task.source, ":", task.module_name, ":", task.function_name,
+        " args=", argn,
+        " callback=", task.coordinator_ip, ":", task.coordinator_port
+    )
+end
+
 function probe_node(node::NODES; timeout=DEFAULT_STATUS_TIMEOUT)
     # ネットワーク的に "down" のときは ARP/route/TCP のタイムアウトで数秒〜数十秒待たされることがある。
     # ここでは Conductor 側でタイムアウトを設けて、一定時間で :down とみなす。
@@ -189,13 +200,14 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
     )
 
     try
+        println("Dispatch start ", task_label(task), " worker=", node.name, "(", node.IP, ":", node.port, ")")
         jobId = syncopade_calc_request(client)
         set_node_state!(node, NODE_BUSY)
-        println("Dispatch OK task=", task.task_id, " worker=", node.name, " jobId=", jobId)
+        println("Dispatch OK ", task_label(task), " worker=", node.name, " jobId=", jobId)
         return true
     catch e
         set_node_state!(node, NODE_DOWN)
-        println("Dispatch failed task=", task.task_id, " worker=", node.name, " error=", e)
+        println("Dispatch failed ", task_label(task), " worker=", node.name, " error=", e)
         return false
     end
 end
@@ -208,6 +220,7 @@ function dispatch_queued_tasks(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY
         node = pick_idle_node_right_to_left(nodes)
         if node === nothing
             # keep LIFO order semantics by putting the latest task back on top
+            println("No idle worker. Requeue ", task_label(task))
             enqueue_task!(task)
             return
         end
@@ -293,9 +306,10 @@ function conductor_server()
                         end
                         println(sock, add_checksum("NODES|" * join(idle_nodes, "|")))
                     elseif cmd == "SUBMIT"
+                        println("SUBMIT payload = ", payload)
                         task = parse_submit_task(payload)
                         enqueue_task!(task)
-                        println("Queued task=", task.task_id, " retry=", task.retry_count, " queue_len=", queue_len())
+                        println("Queued ", task_label(task), " queue_len=", queue_len())
                         println(sock, add_checksum("OK|QUEUED|" * task.task_id))
                     else
                         println(sock, add_checksum("ERROR|UNKNOWN_COMMAND"))
