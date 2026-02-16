@@ -80,8 +80,12 @@ Accepted formats:
 - `"0.1,0.2,0.3"`
 """
 function objective_from_string(x_str::String; p::ObjectiveParams=ObjectiveParams())
+    println("[Julia_GeneralObjectiveFunction] start objective_from_string")
     x = _parse_vector_arg(x_str)
-    return objective(x; p=p)
+    println("[Julia_GeneralObjectiveFunction] parsed x length=", length(x), " n=", p.n, " k_max=", p.k_max)
+    f = objective(x; p=p)
+    println("[Julia_GeneralObjectiveFunction] finished objective_from_string f=", f)
+    return f
 end
 
 function _parse_vector_arg(x_str::String)::Vector{Float64}
