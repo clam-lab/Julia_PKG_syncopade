@@ -2,6 +2,7 @@ using Sockets
 using UUIDs
 
 const server_state = Ref(:idle)  # :idle or :busy
+const REQUIRED_MOUNT_ROOT = "/Volumes/syncopade_nfs"
 
 
 # 以下関数群 ############################################################
@@ -228,7 +229,18 @@ end
 # 型変換は呼び出される関数側で行う
 # 呼び出しの戻り値はそのまま返される．Stringを返すこと
 function call_func(file_name::String, module_name::String, func_name::String, args::Vector{String}=String[])
-    include(file_name * ".jl")
+    if startswith(file_name, REQUIRED_MOUNT_ROOT * "/")
+        if !isdir(REQUIRED_MOUNT_ROOT)
+            throw(ArgumentError("Required mount is missing: $(REQUIRED_MOUNT_ROOT)"))
+        end
+    end
+
+    script_path = file_name * ".jl"
+    if !isfile(script_path)
+        throw(ArgumentError("Source script not found: $(script_path)"))
+    end
+
+    include(script_path)
 
     mod = Base.invokelatest(getfield, Main, Symbol(module_name))
     f   = Base.invokelatest(getfield, mod,  Symbol(func_name))
