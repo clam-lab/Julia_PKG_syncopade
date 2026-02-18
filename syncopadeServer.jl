@@ -2,7 +2,27 @@ using Sockets
 using UUIDs
 
 const server_state = Ref(:idle)  # :idle or :busy
-const REQUIRED_MOUNT_ROOT = "/Volumes/syncopade_nfs"
+const DEFAULT_UNIX_MOUNT_ROOT = "/Volumes/syncopade_nfs"
+const DEFAULT_WINDOWS_MOUNT_ROOT = raw"Z:\syncopade_nfs"
+
+function configured_mount_root()::String
+    if Sys.iswindows()
+        return get(ENV, "SYNCOPADE_MOUNT_ROOT_WINDOWS", DEFAULT_WINDOWS_MOUNT_ROOT)
+    end
+    return get(ENV, "SYNCOPADE_MOUNT_ROOT_UNIX", DEFAULT_UNIX_MOUNT_ROOT)
+end
+
+function path_norm_compare(path::String)::String
+    p = normpath(path)
+    p = replace(p, '\\' => '/')
+    return Sys.iswindows() ? lowercase(p) : p
+end
+
+function is_under_root(path::String, root::String)::Bool
+    path_cmp = path_norm_compare(path)
+    root_cmp = path_norm_compare(root)
+    return path_cmp == root_cmp || startswith(path_cmp, root_cmp * "/")
+end
 
 
 # 以下関数群 ############################################################
@@ -229,9 +249,10 @@ end
 # 型変換は呼び出される関数側で行う
 # 呼び出しの戻り値はそのまま返される．Stringを返すこと
 function call_func(file_name::String, module_name::String, func_name::String, args::Vector{String}=String[])
-    if startswith(file_name, REQUIRED_MOUNT_ROOT * "/")
-        if !isdir(REQUIRED_MOUNT_ROOT)
-            throw(ArgumentError("Required mount is missing: $(REQUIRED_MOUNT_ROOT)"))
+    required_mount_root = configured_mount_root()
+    if is_under_root(file_name, required_mount_root)
+        if !isdir(required_mount_root)
+            throw(ArgumentError("Required mount is missing: $(required_mount_root)"))
         end
     end
 
