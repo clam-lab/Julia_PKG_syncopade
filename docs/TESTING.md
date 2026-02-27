@@ -55,3 +55,25 @@ Each example accepts optional positional arguments.
 - `01`: `server_ip server_port callback_port`
 - `02`: `conductor_ip conductor_port`
 - `03`: `conductor_ip conductor_port callback_port`
+
+## 6. Node Profile / LAN selection memo
+Node lists are now managed in `syncopadeNodeConfig.jl`.
+- Profile `lan12`: `192.168.12.*` nodes (default)
+- Profile `lan100`: `192.168.100.*` nodes
+
+Select network profile with `SYNCOPADE_NODE_PROFILE` when starting both server and conductor:
+
+```bash
+# default (lan12)
+julia syncopadeServer.jl
+julia syncopadeConductor.jl
+
+# use 192.168.100.* list
+SYNCOPADE_NODE_PROFILE=lan100 julia syncopadeServer.jl
+SYNCOPADE_NODE_PROFILE=lan100 julia syncopadeConductor.jl
+```
+
+Server behavior:
+- `syncopadeServer.jl` picks a bind target from the selected profile.
+- It tries profile entries in order and uses the first local IP that can be bound.
+- If none can be bound, it falls back to `getipaddr()` behavior.
