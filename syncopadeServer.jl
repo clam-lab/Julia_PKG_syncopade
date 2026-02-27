@@ -1,5 +1,6 @@
 using Sockets
 using UUIDs
+include("syncopadeNodeConfig.jl")
 
 const server_state = Ref(:idle)  # :idle or :busy
 const DEFAULT_UNIX_MOUNT_ROOT = "/Volumes/syncopade_nfs"
@@ -27,17 +28,57 @@ end
 
 # 以下関数群 ############################################################
 
+function default_server_port_from_ip(ip::IPAddr)::Int
+    parts = split(string(ip), '.')
+    if length(parts) == 4
+        last_octet = tryparse(Int, parts[end])
+        if last_octet !== nothing
+            return last_octet + 8000
+        end
+    end
+    return 8000
+end
+
+function is_bindable_local_ip(ip::AbstractString)::Bool
+    test_server = nothing
+    try
+        test_server = listen(IPv4(ip), 0)
+        return true
+    catch
+        return false
+    finally
+        if test_server !== nothing
+            close(test_server)
+        end
+    end
+end
+
+function resolve_server_bind_target(; requested_port::Union{Nothing,Int}=nothing)
+    entries = configured_node_entries()
+
+    for e in entries
+        if requested_port !== nothing && e.port != requested_port
+            continue
+        end
+        if is_bindable_local_ip(e.ip)
+            return (ip=IPv4(e.ip), port=e.port, source="profile:" * configured_node_profile(), node=e.name)
+        end
+    end
+
+    fallback_ip = getipaddr()
+    fallback_port = requested_port === nothing ? default_server_port_from_ip(fallback_ip) : requested_port
+    return (ip=fallback_ip, port=fallback_port, source="fallback:getipaddr", node="unknown")
+end
+
 # NOTE: getipaddr() は IPv4/IPv6 オブジェクトを返すため、string() に変換してから split する
 # syncopade_serverのラッパー関数
 # 引数がないバージョン．指定しないとIPアドレスの最下位の数字＋8000がポートになる
 function syncopade_server()
-    ip_parts = split(string(getipaddr()), '.')
-    last_octet = parse(Int, ip_parts[end])
-    port = last_octet + 8000
-
-    println("Starting syncopade server on port ", port, " ... ")
-    println("server IP address: ", string(getipaddr()))
-    syncopade_server(port)
+    target = resolve_server_bind_target()
+    println("Starting syncopade server on port ", target.port, " ... ")
+    println("server bind IP address: ", string(target.ip))
+    println("server bind source: ", target.source, " node=", target.node)
+    syncopade_server(target.ip, target.port)
 end
 
 
@@ -52,8 +93,11 @@ end
 # RESULT|jobId|ERROR|<errorType>|<errorMessage>|CHECKSUM
 # を送信する
 function syncopade_server(port::Int)
-    # Explicitly bind to detected local IP address to allow LAN access (not just localhost)
-    bind_ip = getipaddr()
+    target = resolve_server_bind_target(requested_port=port)
+    syncopade_server(target.ip, port)
+end
+
+function syncopade_server(bind_ip::IPAddr, port::Int)
     server = listen(bind_ip, port)
     println("bind address: ", bind_ip, ":", port)
     
