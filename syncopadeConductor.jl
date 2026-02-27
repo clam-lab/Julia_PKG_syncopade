@@ -1,4 +1,5 @@
 include("syncopadeClient.jl")
+include("syncopadeNodeConfig.jl")
 using Dates
 using Sockets
 using UUIDs
@@ -234,33 +235,12 @@ end
 
 # 利用可能な可能性のあるノードのリストを返す関数
 function geneAvailableNodeList()
-    nodes = NODES[] 
-    # push!(nodes, NODES("192.168.100.26", 8026, "C-3PX"))
-    # push!(nodes, NODES("192.168.100.30", 8030, "Chopper"))
-    # push!(nodes, NODES("192.168.100.37", 8037, "BD-1"))
-    # push!(nodes, NODES("192.168.100.38", 8038, "GNK_EG-6"))
-    # push!(nodes, NODES("192.168.100.48", 8048, "GONKY"))
-    # push!(nodes, NODES("192.168.100.73", 8073, "Hunter"))
-    # push!(nodes, NODES("192.168.100.74", 8074, "Tech"))
-    # push!(nodes, NODES("192.168.100.75", 8075, "Crosshair"))
-    # push!(nodes, NODES("192.168.100.76", 8076, "Wrecker"))
-    # push!(nodes, NODES("192.168.100.77", 8077, "Echo"))
-    # push!(nodes, NODES("192.168.100.78", 8078, "Omega"))
-    # push!(nodes, NODES("192.168.100.95", 8095, "D-O"))
-    
-    push!(nodes, NODES("192.168.12.2", 8002, "Chopper"))
-    push!(nodes, NODES("192.168.12.3", 8003, "ID-10"))
-    push!(nodes, NODES("192.168.12.4", 8004, "MSE-6"))
-    push!(nodes, NODES("192.168.12.5", 8005, "Crosshair"))
-    push!(nodes, NODES("192.168.12.6", 8006, "Wrecker"))
-    push!(nodes, NODES("192.168.12.7", 8007, "Echo"))
-    push!(nodes, NODES("192.168.12.8", 8008, "Hunter"))
-    push!(nodes, NODES("192.168.12.9", 8009, "Tech"))
-    push!(nodes, NODES("192.168.12.10", 8010, "Omega"))
-    push!(nodes, NODES("192.168.12.11", 8011, "GNK_EG-6"))
-    push!(nodes, NODES("192.168.12.12", 8012, "C-3PX"))
-
-    return nodes        
+    entries = configured_node_entries()
+    nodes = NODES[]
+    for e in entries
+        push!(nodes, NODES(e.ip, e.port, e.name))
+    end
+    return nodes
 end
 
 function conductor_port()
