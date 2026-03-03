@@ -25,6 +25,43 @@ function is_under_root(path::String, root::String)::Bool
     return path_cmp == root_cmp || startswith(path_cmp, root_cmp * "/")
 end
 
+function ensure_jl_extension(path::AbstractString)::String
+    p = String(path)
+    return endswith(lowercase(p), ".jl") ? p : p * ".jl"
+end
+
+function source_basename(path::AbstractString)::String
+    normalized = replace(path, '\\' => '/')
+    parts = split(normalized, '/')
+    return isempty(parts) ? String(path) : String(parts[end])
+end
+
+function resolve_source_script_path(file_name::String, mount_root::String)::String
+    source = strip(file_name)
+    isempty(source) && throw(ArgumentError("Empty source file name"))
+
+    has_sep = occursin('/', source) || occursin('\\', source)
+    candidates = String[]
+    if has_sep
+        push!(candidates, ensure_jl_extension(source))
+        push!(candidates, ensure_jl_extension(joinpath(mount_root, source_basename(source))))
+    else
+        push!(candidates, ensure_jl_extension(joinpath(mount_root, source)))
+        push!(candidates, ensure_jl_extension(source))
+    end
+
+    for script_path in unique(candidates)
+        if is_under_root(script_path, mount_root) && !isdir(mount_root)
+            throw(ArgumentError("Required mount is missing: $(mount_root)"))
+        end
+        if isfile(script_path)
+            return script_path
+        end
+    end
+
+    throw(ArgumentError("Source script not found. requested=$(file_name) candidates=$(join(candidates, ", "))"))
+end
+
 
 # 以下関数群 ############################################################
 
@@ -294,16 +331,7 @@ end
 # 呼び出しの戻り値はそのまま返される．Stringを返すこと
 function call_func(file_name::String, module_name::String, func_name::String, args::Vector{String}=String[])
     required_mount_root = configured_mount_root()
-    if is_under_root(file_name, required_mount_root)
-        if !isdir(required_mount_root)
-            throw(ArgumentError("Required mount is missing: $(required_mount_root)"))
-        end
-    end
-
-    script_path = file_name * ".jl"
-    if !isfile(script_path)
-        throw(ArgumentError("Source script not found: $(script_path)"))
-    end
+    script_path = resolve_source_script_path(file_name, required_mount_root)
 
     include(script_path)
 
