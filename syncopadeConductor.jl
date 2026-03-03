@@ -37,6 +37,9 @@ const DEFAULT_POLL_INTERVAL = 2.0  # seconds
 const DEFAULT_STATUS_TIMEOUT = 0.2  # seconds (per node)
 const DEFAULT_MAX_RETRY = 3
 const DEFAULT_CONDUCTOR_LOG_PATH = joinpath(@__DIR__, "logs", "conductor_events.csv")
+const DEFAULT_LOG_BATCH_SIZE = 64
+const DEFAULT_LOG_FLUSH_INTERVAL_SEC = 0.1
+const DEFAULT_LOG_CHANNEL_CAPACITY = 4096
 const CONDUCTOR_LOG_COLUMNS = (
     "timestamp",
     "event",
@@ -62,6 +65,9 @@ const CONDUCTOR_LOG_COLUMNS = (
     "error",
 )
 const conductor_log_lock = ReentrantLock()
+const conductor_log_channel = Ref{Union{Nothing,Channel{Union{Nothing,String}}}}(nothing)
+const conductor_log_task = Ref{Union{Nothing,Task}}(nothing)
+const conductor_log_atexit_registered = Ref(false)
 
 function conductor_log_path()::String
     return get(ENV, "SYNCOPADE_CONDUCTOR_LOG", DEFAULT_CONDUCTOR_LOG_PATH)
@@ -75,12 +81,95 @@ function csv_escape(v)::String
     return "\"" * s * "\""
 end
 
-function ensure_conductor_log_header!()
+function start_conductor_log_writer!()
     path = conductor_log_path()
     mkpath(dirname(path))
-    if !isfile(path) || filesize(path) == 0
-        open(path, "a") do io
-            println(io, join(CONDUCTOR_LOG_COLUMNS, ","))
+
+    needs_header = !isfile(path) || filesize(path) == 0
+    io = open(path, "a")
+    if needs_header
+        println(io, join(CONDUCTOR_LOG_COLUMNS, ","))
+        flush(io)
+    end
+
+    ch = Channel{Union{Nothing,String}}(DEFAULT_LOG_CHANNEL_CAPACITY)
+    task = @async begin
+        batch = String[]
+        while true
+            item = take!(ch)
+            stop_requested = item === nothing
+            if !stop_requested
+                push!(batch, item)
+            end
+
+            window_start = time()
+            while !stop_requested && length(batch) < DEFAULT_LOG_BATCH_SIZE
+                remaining = DEFAULT_LOG_FLUSH_INTERVAL_SEC - (time() - window_start)
+                if remaining <= 0
+                    break
+                end
+                w = Base.timedwait(() -> isready(ch), remaining; pollint=min(0.01, remaining))
+                if w === :timed_out
+                    break
+                end
+                while isready(ch) && length(batch) < DEFAULT_LOG_BATCH_SIZE
+                    next_item = take!(ch)
+                    if next_item === nothing
+                        stop_requested = true
+                        break
+                    end
+                    push!(batch, next_item)
+                end
+            end
+
+            if !isempty(batch)
+                write(io, join(batch, "\n"))
+                write(io, "\n")
+                flush(io)
+                empty!(batch)
+            end
+
+            if stop_requested
+                break
+            end
+        end
+        close(io)
+    end
+
+    conductor_log_channel[] = ch
+    conductor_log_task[] = task
+end
+
+function ensure_conductor_log_writer!()
+    lock(conductor_log_lock) do
+        if conductor_log_channel[] === nothing
+            start_conductor_log_writer!()
+            if !conductor_log_atexit_registered[]
+                atexit(stop_conductor_log_writer!)
+                conductor_log_atexit_registered[] = true
+            end
+        end
+    end
+end
+
+function stop_conductor_log_writer!()
+    task = nothing
+    lock(conductor_log_lock) do
+        ch = conductor_log_channel[]
+        if ch !== nothing
+            try
+                put!(ch, nothing)
+            catch
+            end
+        end
+        task = conductor_log_task[]
+        conductor_log_channel[] = nothing
+        conductor_log_task[] = nothing
+    end
+    if task !== nothing
+        try
+            wait(task)
+        catch
         end
     end
 end
@@ -111,12 +200,10 @@ function log_conductor_event(event::String; kwargs...)
         string(get(kwargs, :error, "")),
     ]
 
-    lock(conductor_log_lock) do
-        ensure_conductor_log_header!()
-        open(conductor_log_path(), "a") do io
-            println(io, join(csv_escape.(row), ","))
-        end
-    end
+    ensure_conductor_log_writer!()
+    ch = conductor_log_channel[]
+    ch === nothing && return
+    put!(ch, join(csv_escape.(row), ","))
 end
 
 function log_task_event(event::String, task::ConductorTask; kwargs...)
