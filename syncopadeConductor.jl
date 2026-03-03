@@ -348,6 +348,19 @@ function refresh_states_until_idle!(nodes::Vector{NODES}; timeout=DEFAULT_STATUS
     return false
 end
 
+function probe_nodes_parallel(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEOUT)::Vector{Symbol}
+    tasks = [@async probe_node(node; timeout=timeout) for node in nodes]
+    states = Vector{Symbol}(undef, length(nodes))
+    for i in eachindex(tasks)
+        states[i] = try
+            fetch(tasks[i])
+        catch
+            NODE_DOWN
+        end
+    end
+    return states
+end
+
 function pick_idle_node_right_to_left(nodes::Vector{NODES})::Union{Nothing,NODES}
     for node in reverse(nodes)
         if get_node_state(node) == NODE_IDLE
@@ -458,8 +471,8 @@ function monitor_nodes(; interval=DEFAULT_POLL_INTERVAL, max_retry=DEFAULT_MAX_R
     nodes = geneAvailableNodeList()
     while true
         println("---- Syncopade Conductor Status @ ", Dates.format(now(), "yyyy-mm-dd HH:MM:SS"), " ----")
-        for node in nodes
-            state = probe_node(node)
+        states = probe_nodes_parallel(nodes; timeout=DEFAULT_STATUS_TIMEOUT)
+        for (node, state) in zip(nodes, states)
             set_node_state!(node, state)
             println(rpad(node.name,10)," ", node.IP, ":", node.port, " => ", state)
         end
