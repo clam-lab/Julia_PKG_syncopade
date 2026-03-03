@@ -8,6 +8,7 @@ using UUIDs
 const node_states = Dict{Tuple{String,Int},Symbol}()
 const node_states_lock = ReentrantLock()
 const task_queue_lock = ReentrantLock()
+const dispatch_lock = ReentrantLock()
 
 struct NODES
     IP::String
@@ -336,18 +337,6 @@ function set_node_state!(node::NODES, state::Symbol)
     end
 end
 
-function refresh_states_until_idle!(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEOUT)::Bool
-    # Probe in the same priority order as dispatch selection.
-    for node in Iterators.reverse(nodes)
-        state = probe_node(node; timeout=timeout)
-        set_node_state!(node, state)
-        if state == NODE_IDLE
-            return true
-        end
-    end
-    return false
-end
-
 function probe_nodes_parallel(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEOUT)::Vector{Symbol}
     tasks = [@async probe_node(node; timeout=timeout) for node in nodes]
     states = Vector{Symbol}(undef, length(nodes))
@@ -359,6 +348,17 @@ function probe_nodes_parallel(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEO
         end
     end
     return states
+end
+
+function refresh_states_until_idle!(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEOUT)::Bool
+    # Probe all nodes in parallel to minimize submit-path lag.
+    states = probe_nodes_parallel(nodes; timeout=timeout)
+    any_idle = false
+    for (node, state) in zip(nodes, states)
+        set_node_state!(node, state)
+        any_idle = any_idle || (state == NODE_IDLE)
+    end
+    return any_idle
 end
 
 function pick_idle_node_right_to_left(nodes::Vector{NODES})::Union{Nothing,NODES}
@@ -449,6 +449,12 @@ function dispatch_queued_tasks(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY
     end
 end
 
+function run_dispatch_cycle!(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY)
+    lock(dispatch_lock) do
+        dispatch_queued_tasks(nodes; max_retry=max_retry)
+    end
+end
+
 # 利用可能な可能性のあるノードのリストを返す関数
 function geneAvailableNodeList()
     entries = configured_node_entries()
@@ -476,7 +482,7 @@ function monitor_nodes(; interval=DEFAULT_POLL_INTERVAL, max_retry=DEFAULT_MAX_R
             set_node_state!(node, state)
             println(rpad(node.name,10)," ", node.IP, ":", node.port, " => ", state)
         end
-        dispatch_queued_tasks(nodes; max_retry=max_retry)
+        run_dispatch_cycle!(nodes; max_retry=max_retry)
         println("queue length => ", queue_len())
         println()
         sleep(interval)
@@ -530,7 +536,7 @@ function conductor_server()
                         @async begin
                             nodes = geneAvailableNodeList()
                             refresh_states_until_idle!(nodes; timeout=DEFAULT_STATUS_TIMEOUT)
-                            dispatch_queued_tasks(nodes; max_retry=DEFAULT_MAX_RETRY)
+                            run_dispatch_cycle!(nodes; max_retry=DEFAULT_MAX_RETRY)
                         end
                     elseif cmd == "DONE"
                         handle_done_payload(payload)
