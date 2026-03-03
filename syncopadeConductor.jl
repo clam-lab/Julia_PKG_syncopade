@@ -36,6 +36,7 @@ const NODE_DOWN = :down
 const DEFAULT_POLL_INTERVAL = 2.0  # seconds
 const DEFAULT_STATUS_TIMEOUT = 0.2  # seconds (per node)
 const DEFAULT_MAX_RETRY = 3
+const DEFAULT_DISPATCH_TIMEOUT = 3.0  # seconds (worker start-ack timeout)
 const DEFAULT_CONDUCTOR_LOG_PATH = joinpath(@__DIR__, "logs", "conductor_events.csv")
 const DEFAULT_LOG_BATCH_SIZE = 64
 const DEFAULT_LOG_FLUSH_INTERVAL_SEC = 0.1
@@ -68,6 +69,7 @@ const conductor_log_lock = ReentrantLock()
 const conductor_log_channel = Ref{Union{Nothing,Channel{Union{Nothing,String}}}}(nothing)
 const conductor_log_task = Ref{Union{Nothing,Task}}(nothing)
 const conductor_log_atexit_registered = Ref(false)
+const conductor_log_drop_count = Ref(0)
 
 function conductor_log_path()::String
     return get(ENV, "SYNCOPADE_CONDUCTOR_LOG", DEFAULT_CONDUCTOR_LOG_PATH)
@@ -94,46 +96,54 @@ function start_conductor_log_writer!()
 
     ch = Channel{Union{Nothing,String}}(DEFAULT_LOG_CHANNEL_CAPACITY)
     task = @async begin
-        batch = String[]
-        while true
-            item = take!(ch)
-            stop_requested = item === nothing
-            if !stop_requested
-                push!(batch, item)
-            end
+        try
+            batch = String[]
+            while true
+                item = take!(ch)
+                stop_requested = item === nothing
+                if !stop_requested
+                    push!(batch, item)
+                end
 
-            window_start = time()
-            while !stop_requested && length(batch) < DEFAULT_LOG_BATCH_SIZE
-                remaining = DEFAULT_LOG_FLUSH_INTERVAL_SEC - (time() - window_start)
-                if remaining <= 0
-                    break
-                end
-                w = Base.timedwait(() -> isready(ch), remaining; pollint=min(0.01, remaining))
-                if w === :timed_out
-                    break
-                end
-                while isready(ch) && length(batch) < DEFAULT_LOG_BATCH_SIZE
-                    next_item = take!(ch)
-                    if next_item === nothing
-                        stop_requested = true
+                window_start = time()
+                while !stop_requested && length(batch) < DEFAULT_LOG_BATCH_SIZE
+                    remaining = DEFAULT_LOG_FLUSH_INTERVAL_SEC - (time() - window_start)
+                    if remaining <= 0
                         break
                     end
-                    push!(batch, next_item)
+                    w = Base.timedwait(() -> isready(ch), remaining; pollint=min(0.01, remaining))
+                    if w === :timed_out
+                        break
+                    end
+                    while isready(ch) && length(batch) < DEFAULT_LOG_BATCH_SIZE
+                        next_item = take!(ch)
+                        if next_item === nothing
+                            stop_requested = true
+                            break
+                        end
+                        push!(batch, next_item)
+                    end
+                end
+
+                if !isempty(batch)
+                    write(io, join(batch, "\n"))
+                    write(io, "\n")
+                    flush(io)
+                    empty!(batch)
+                end
+
+                if stop_requested
+                    break
                 end
             end
-
-            if !isempty(batch)
-                write(io, join(batch, "\n"))
-                write(io, "\n")
-                flush(io)
-                empty!(batch)
-            end
-
-            if stop_requested
-                break
+        catch e
+            println("Conductor log writer error: ", e)
+        finally
+            try
+                close(io)
+            catch
             end
         end
-        close(io)
     end
 
     conductor_log_channel[] = ch
@@ -142,6 +152,10 @@ end
 
 function ensure_conductor_log_writer!()
     lock(conductor_log_lock) do
+        if conductor_log_task[] !== nothing && istaskdone(conductor_log_task[])
+            conductor_log_channel[] = nothing
+            conductor_log_task[] = nothing
+        end
         if conductor_log_channel[] === nothing
             start_conductor_log_writer!()
             if !conductor_log_atexit_registered[]
@@ -174,6 +188,31 @@ function stop_conductor_log_writer!()
     end
 end
 
+function enqueue_log_line!(line::String)::Bool
+    ensure_conductor_log_writer!()
+    lock(conductor_log_lock) do
+        ch = conductor_log_channel[]
+        if ch === nothing
+            return false
+        end
+
+        if isfull(ch)
+            conductor_log_drop_count[] += 1
+            if conductor_log_drop_count[] % 100 == 1
+                println("🐖🐖🐖 Conductor log queue full; dropped=", conductor_log_drop_count[])
+            end
+            return false
+        end
+
+        try
+            put!(ch, line)
+            return true
+        catch
+            return false
+        end
+    end
+end
+
 function log_conductor_event(event::String; kwargs...)
     row = String[
         Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss"),
@@ -200,10 +239,7 @@ function log_conductor_event(event::String; kwargs...)
         string(get(kwargs, :error, "")),
     ]
 
-    ensure_conductor_log_writer!()
-    ch = conductor_log_channel[]
-    ch === nothing && return
-    put!(ch, join(csv_escape.(row), ","))
+    enqueue_log_line!(join(csv_escape.(row), ","))
 end
 
 function log_task_event(event::String, task::ConductorTask; kwargs...)
@@ -486,7 +522,12 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
             node_port=node.port,
             queue_len=queue_len()
         )
-        jobId = syncopade_calc_request(client)
+        dispatch_task = @async syncopade_calc_request(client)
+        w = Base.timedwait(() -> istaskdone(dispatch_task), DEFAULT_DISPATCH_TIMEOUT; pollint=0.01)
+        if w === :timed_out
+            throw(ArgumentError("dispatch timeout waiting worker start-ack > $(DEFAULT_DISPATCH_TIMEOUT)s"))
+        end
+        jobId = fetch(dispatch_task)
         set_node_state!(node, NODE_BUSY)
         println("Dispatch OK ", task_label(task), " worker=", node.name, " jobId=", jobId)
         log_task_event(
