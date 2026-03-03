@@ -6,9 +6,23 @@ include("syncopadeNodeConfig.jl")
 const server_state = Ref(:idle)  # :idle or :busy
 const DEFAULT_UNIX_MOUNT_ROOT = "/Volumes/syncopade_nfs"
 const DEFAULT_WINDOWS_MOUNT_ROOT = raw"\\192.168.100.96\syncopade_nfs"
+const DEFAULT_FUNCTION_CACHE_SIZE = 10
 const META_TASK_ID_PREFIX = "__syncopade_meta_task_id="
 const META_CONDUCTOR_IP_PREFIX = "__syncopade_meta_conductor_ip="
 const META_CONDUCTOR_PORT_PREFIX = "__syncopade_meta_conductor_port="
+const function_cache_lock = ReentrantLock()
+const include_lock = ReentrantLock()
+const function_cache = Dict{Tuple{String,String,String}, Function}()
+const function_cache_lru = Tuple{String,String,String}[]
+
+function configured_function_cache_size()::Int
+    raw = strip(get(ENV, "SYNCOPADE_FUNCTION_CACHE_SIZE", string(DEFAULT_FUNCTION_CACHE_SIZE)))
+    size = tryparse(Int, raw)
+    if size === nothing
+        return DEFAULT_FUNCTION_CACHE_SIZE
+    end
+    return max(size, 0)
+end
 
 function configured_mount_root()::String
     if Sys.iswindows()
@@ -64,6 +78,64 @@ function resolve_source_script_path(file_name::String, mount_root::String)::Stri
     end
 
     throw(ArgumentError("Source script not found. requested=$(file_name) candidates=$(join(candidates, ", "))"))
+end
+
+function cache_lookup_function(key::Tuple{String,String,String})::Union{Nothing,Function}
+    max_size = configured_function_cache_size()
+    max_size <= 0 && return nothing
+
+    lock(function_cache_lock) do
+        f = get(function_cache, key, nothing)
+        if f === nothing
+            return nothing
+        end
+
+        idx = findfirst(isequal(key), function_cache_lru)
+        if idx !== nothing
+            deleteat!(function_cache_lru, idx)
+        end
+        pushfirst!(function_cache_lru, key)
+        return f
+    end
+end
+
+function cache_store_function!(key::Tuple{String,String,String}, f::Function)::Function
+    max_size = configured_function_cache_size()
+    max_size <= 0 && return f
+
+    lock(function_cache_lock) do
+        existing = get(function_cache, key, nothing)
+        if existing !== nothing
+            idx = findfirst(isequal(key), function_cache_lru)
+            if idx !== nothing
+                deleteat!(function_cache_lru, idx)
+            end
+            pushfirst!(function_cache_lru, key)
+            return existing
+        end
+
+        function_cache[key] = f
+        idx = findfirst(isequal(key), function_cache_lru)
+        if idx !== nothing
+            deleteat!(function_cache_lru, idx)
+        end
+        pushfirst!(function_cache_lru, key)
+
+        while length(function_cache_lru) > max_size
+            evicted_key = pop!(function_cache_lru)
+            delete!(function_cache, evicted_key)
+        end
+
+        return f
+    end
+end
+
+function load_remote_function(script_path::String, module_name::String, func_name::String)::Function
+    lock(include_lock) do
+        include(script_path)
+        mod = Base.invokelatest(getfield, Main, Symbol(module_name))
+        return Base.invokelatest(getfield, mod, Symbol(func_name))
+    end
 end
 
 
@@ -448,11 +520,12 @@ end
 function call_func(file_name::String, module_name::String, func_name::String, args::Vector{String}=String[])
     required_mount_root = configured_mount_root()
     script_path = resolve_source_script_path(file_name, required_mount_root)
-
-    include(script_path)
-
-    mod = Base.invokelatest(getfield, Main, Symbol(module_name))
-    f   = Base.invokelatest(getfield, mod,  Symbol(func_name))
+    key = (script_path, module_name, func_name)
+    f = cache_lookup_function(key)
+    if f === nothing
+        loaded = load_remote_function(script_path, module_name, func_name)
+        f = cache_store_function!(key, loaded)
+    end
 
     return Base.invokelatest(f, args...) 
 end
