@@ -244,7 +244,7 @@ function geneAvailableNodeList()
 end
 
 function conductor_port()
-    ip = string(getipaddr())
+    ip = string(preferred_local_ip())
     parts = split(ip, ".")
     last = parse(Int, parts[end])
     return 9000 + last
@@ -271,9 +271,10 @@ end
 # - LIST
 # - SUBMIT|coordinator_ip|coordinator_port(optional)|source:module:function|arg1|arg2|...
 function conductor_server()
+    bind_ip = preferred_local_ip()
     port = conductor_port()
-    server = listen(getipaddr(), port)
-    println("Conductor server listening on ", string(getipaddr()), ":", port)
+    server = listen(bind_ip, port)
+    println("Conductor server listening on ", string(bind_ip), ":", port)
 
     @async while true
         sock = accept(server)

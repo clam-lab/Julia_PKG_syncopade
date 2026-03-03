@@ -1,6 +1,17 @@
 using Sockets
 using UUIDs
 
+const DEFAULT_WIRED_LAN_PREFIX = "192.168.12."
+
+function preferred_local_ip(; prefix::AbstractString=get(ENV, "SYNCOPADE_WIRED_PREFIX", DEFAULT_WIRED_LAN_PREFIX))::IPAddr
+    for ip in getipaddrs()
+        if ip isa IPv4 && startswith(string(ip), String(prefix))
+            return ip
+        end
+    end
+    return getipaddr()
+end
+
 # syncopade job request and callback endpoint struct
 """
     SyncopadeClient
@@ -173,7 +184,7 @@ end
 Start a result receiver server that listens forever and dispatches callbacks asynchronously.
 
 # Behavior
-- Binds to `getipaddr()` and the specified `port`.
+- Binds to `preferred_local_ip()` and the specified `port`.
 - For each incoming connection, reads one line, verifies checksum, and parses the payload.
 
 # Expected Payload Formats
@@ -190,7 +201,7 @@ Start a result receiver server that listens forever and dispatches callbacks asy
 - Errors inside the accept/parse loop are intentionally swallowed to keep the server alive.
 """
 function syncopade_result_server(port::Int, handler::Function)
-    bind_ip = getipaddr()
+    bind_ip = preferred_local_ip()
     server = listen(bind_ip, port)
     println("result server bind address: ", bind_ip, ":", port)
     @async while true
@@ -245,7 +256,7 @@ Start a one-shot result receiver: accepts exactly one connection, handles one RE
 - After handling a single message, both the client socket and server socket are closed.
 """
 function syncopade_result_server_once(port::Int, handler::Function)
-    bind_ip = getipaddr()
+    bind_ip = preferred_local_ip()
     server = listen(bind_ip, port)
     println("one-shot result server bind address: ", bind_ip, ":", port)
     @async begin
@@ -497,7 +508,7 @@ end
     submit_conductor_task_and_wait(
         conductor_ip::String;
         conductor_port::Int=9000,
-        coordinator_ip::String=string(getipaddr()),
+        coordinator_ip::String=string(preferred_local_ip()),
         coordinator_port::Int,
         source::String,
         module_name::String,
@@ -522,7 +533,7 @@ Submit one task to the conductor and wait for exactly one callback result on `co
 function submit_conductor_task_and_wait(
     conductor_ip::String;
     conductor_port::Int=9000,
-    coordinator_ip::String=string(getipaddr()),
+    coordinator_ip::String=string(preferred_local_ip()),
     coordinator_port::Int,
     source::String,
     module_name::String,
@@ -530,7 +541,7 @@ function submit_conductor_task_and_wait(
     args::Vector{String}=String[],
     timeout::Float64=60.0
 )
-    bind_ip = getipaddr()
+    bind_ip = preferred_local_ip()
     server = listen(bind_ip, coordinator_port)
 
     sock = nothing
