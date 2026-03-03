@@ -315,6 +315,26 @@ function query_server_status(server_ip::String, server_port::Int)
     return resp
 end
 
+function is_addr_in_use_error(e)::Bool
+    msg = lowercase(sprint(showerror, e))
+    return occursin("address already in use", msg) || occursin("eaddrinuse", msg)
+end
+
+function open_callback_listener(bind_ip::IPAddr, requested_port::Int)
+    try
+        server = listen(bind_ip, requested_port)
+        _, bound_port_u = getsockname(server)
+        return server, Int(bound_port_u), false
+    catch e
+        if requested_port > 0 && is_addr_in_use_error(e)
+            server = listen(bind_ip, 0)
+            _, bound_port_u = getsockname(server)
+            return server, Int(bound_port_u), true
+        end
+        rethrow(e)
+    end
+end
+
 #
 # --- Conductor query helpers (ADD ONLY) ---
 #
@@ -542,17 +562,23 @@ function submit_conductor_task_and_wait(
     timeout::Float64=60.0
 )
     bind_ip = preferred_local_ip()
-    server = listen(bind_ip, coordinator_port)
-
+    server = nothing
+    bound_port = coordinator_port
     sock = nothing
+
     try
+        server, bound_port, fallback_used = open_callback_listener(bind_ip, coordinator_port)
+        if fallback_used
+            println("callback port ", coordinator_port, " is in use; fallback to ", bound_port)
+        end
+
         accept_task = @async accept(server)
 
         task_id = submit_conductor_task(
             conductor_ip;
             conductor_port=conductor_port,
             coordinator_ip=coordinator_ip,
-            coordinator_port=coordinator_port,
+            coordinator_port=bound_port,
             source=source,
             module_name=module_name,
             function_name=function_name,
@@ -561,14 +587,14 @@ function submit_conductor_task_and_wait(
 
         w_accept = Base.timedwait(() -> istaskdone(accept_task), timeout; pollint=0.01)
         if w_accept === :timed_out
-            error("timeout waiting callback connection on $(string(bind_ip)):$(coordinator_port)")
+            error("timeout waiting callback connection on $(string(bind_ip)):$(bound_port)")
         end
         sock = fetch(accept_task)
 
         line_task = @async readline(sock)
         w_line = Base.timedwait(() -> istaskdone(line_task), timeout; pollint=0.01)
         if w_line === :timed_out
-            error("timeout waiting callback payload on $(string(bind_ip)):$(coordinator_port)")
+            error("timeout waiting callback payload on $(string(bind_ip)):$(bound_port)")
         end
         line = fetch(line_task)
 
@@ -599,9 +625,11 @@ function submit_conductor_task_and_wait(
             catch
             end
         end
-        try
-            close(server)
-        catch
+        if server !== nothing
+            try
+                close(server)
+            catch
+            end
         end
     end
 end
