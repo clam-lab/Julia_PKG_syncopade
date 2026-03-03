@@ -35,6 +35,94 @@ const NODE_DOWN = :down
 const DEFAULT_POLL_INTERVAL = 2.0  # seconds
 const DEFAULT_STATUS_TIMEOUT = 0.2  # seconds (per node)
 const DEFAULT_MAX_RETRY = 3
+const DEFAULT_CONDUCTOR_LOG_PATH = joinpath(@__DIR__, "logs", "conductor_events.csv")
+const CONDUCTOR_LOG_COLUMNS = (
+    "timestamp",
+    "event",
+    "task_id",
+    "retry",
+    "node_name",
+    "node_ip",
+    "node_port",
+    "job_id",
+    "queue_len",
+    "state_from",
+    "state_to",
+    "source",
+    "module_name",
+    "function_name",
+    "arg_count",
+    "coordinator_ip",
+    "coordinator_port",
+    "error",
+)
+const conductor_log_lock = ReentrantLock()
+
+function conductor_log_path()::String
+    return get(ENV, "SYNCOPADE_CONDUCTOR_LOG", DEFAULT_CONDUCTOR_LOG_PATH)
+end
+
+function csv_escape(v)::String
+    s = String(v)
+    s = replace(s, "\r\n" => "\n")
+    s = replace(s, "\r" => "\n")
+    s = replace(s, "\"" => "\"\"")
+    return "\"" * s * "\""
+end
+
+function ensure_conductor_log_header!()
+    path = conductor_log_path()
+    mkpath(dirname(path))
+    if !isfile(path) || filesize(path) == 0
+        open(path, "a") do io
+            println(io, join(CONDUCTOR_LOG_COLUMNS, ","))
+        end
+    end
+end
+
+function log_conductor_event(event::String; kwargs...)
+    row = String[
+        Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss"),
+        event,
+        string(get(kwargs, :task_id, "")),
+        string(get(kwargs, :retry, "")),
+        string(get(kwargs, :node_name, "")),
+        string(get(kwargs, :node_ip, "")),
+        string(get(kwargs, :node_port, "")),
+        string(get(kwargs, :job_id, "")),
+        string(get(kwargs, :queue_len, "")),
+        string(get(kwargs, :state_from, "")),
+        string(get(kwargs, :state_to, "")),
+        string(get(kwargs, :source, "")),
+        string(get(kwargs, :module_name, "")),
+        string(get(kwargs, :function_name, "")),
+        string(get(kwargs, :arg_count, "")),
+        string(get(kwargs, :coordinator_ip, "")),
+        string(get(kwargs, :coordinator_port, "")),
+        string(get(kwargs, :error, "")),
+    ]
+
+    lock(conductor_log_lock) do
+        ensure_conductor_log_header!()
+        open(conductor_log_path(), "a") do io
+            println(io, join(csv_escape.(row), ","))
+        end
+    end
+end
+
+function log_task_event(event::String, task::ConductorTask; kwargs...)
+    base = (
+        task_id=task.task_id,
+        retry=task.retry_count,
+        source=task.source,
+        module_name=task.module_name,
+        function_name=task.function_name,
+        arg_count=length(task.args),
+        coordinator_ip=task.coordinator_ip,
+        coordinator_port=task.coordinator_port,
+    )
+    log_conductor_event(event; base..., kwargs...)
+end
 
 function task_label(task::ConductorTask)::String
     argn = length(task.args)
@@ -151,6 +239,7 @@ function requeue_with_retry!(task::ConductorTask; max_retry=DEFAULT_MAX_RETRY)
     next_retry = task.retry_count + 1
     if next_retry > max_retry
         println("Drop task ", task.task_id, " after retries=", task.retry_count)
+        log_task_event("TASK_DROPPED", task; queue_len=queue_len(), error="max_retry_exceeded")
         return
     end
 
@@ -165,6 +254,7 @@ function requeue_with_retry!(task::ConductorTask; max_retry=DEFAULT_MAX_RETRY)
         next_retry
     )
     enqueue_task!(retried)
+    log_task_event("TASK_REQUEUED", retried; queue_len=queue_len())
 end
 
 function get_node_state(node::NODES)::Symbol
@@ -174,8 +264,23 @@ function get_node_state(node::NODES)::Symbol
 end
 
 function set_node_state!(node::NODES, state::Symbol)
+    prev_state = NODE_DOWN
+    changed = false
     lock(node_states_lock) do
+        prev_state = get(node_states, (node.IP, node.port), NODE_DOWN)
         node_states[(node.IP, node.port)] = state
+        changed = prev_state != state
+    end
+    if changed
+        log_conductor_event(
+            "NODE_STATE_CHANGED";
+            node_name=node.name,
+            node_ip=node.IP,
+            node_port=node.port,
+            state_from=string(prev_state),
+            state_to=string(state),
+            queue_len=queue_len()
+        )
     end
 end
 
@@ -202,13 +307,39 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
 
     try
         println("Dispatch start ", task_label(task), " worker=", node.name, "(", node.IP, ":", node.port, ")")
+        log_task_event(
+            "DISPATCH_START",
+            task;
+            node_name=node.name,
+            node_ip=node.IP,
+            node_port=node.port,
+            queue_len=queue_len()
+        )
         jobId = syncopade_calc_request(client)
         set_node_state!(node, NODE_BUSY)
         println("Dispatch OK ", task_label(task), " worker=", node.name, " jobId=", jobId)
+        log_task_event(
+            "DISPATCH_OK",
+            task;
+            node_name=node.name,
+            node_ip=node.IP,
+            node_port=node.port,
+            job_id=jobId,
+            queue_len=queue_len()
+        )
         return true
     catch e
         set_node_state!(node, NODE_DOWN)
         println("Dispatch failed ", task_label(task), " worker=", node.name, " error=", e)
+        log_task_event(
+            "DISPATCH_FAILED",
+            task;
+            node_name=node.name,
+            node_ip=node.IP,
+            node_port=node.port,
+            error=sprint(showerror, e),
+            queue_len=queue_len()
+        )
         return false
     end
 end
@@ -223,6 +354,7 @@ function dispatch_queued_tasks(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY
             # keep LIFO order semantics by putting the latest task back on top
             println("No idle worker. Requeue ", task_label(task))
             enqueue_task!(task)
+            log_task_event("NO_IDLE_REQUEUE", task; queue_len=queue_len())
             return
         end
 
@@ -275,6 +407,7 @@ function conductor_server()
     port = conductor_port()
     server = listen(bind_ip, port)
     println("Conductor server listening on ", string(bind_ip), ":", port)
+    log_conductor_event("CONDUCTOR_START"; node_name="conductor", node_ip=string(bind_ip), node_port=port)
 
     @async while true
         sock = accept(server)
@@ -302,7 +435,9 @@ function conductor_server()
                         println("SUBMIT payload = ", payload)
                         task = parse_submit_task(payload)
                         enqueue_task!(task)
-                        println("Queued ", task_label(task), " queue_len=", queue_len())
+                        qlen = queue_len()
+                        println("Queued ", task_label(task), " queue_len=", qlen)
+                        log_task_event("TASK_QUEUED", task; queue_len=qlen)
                         println(sock, add_checksum("OK|QUEUED|" * task.task_id))
 
                         # Fast path: try dispatch immediately after enqueue
