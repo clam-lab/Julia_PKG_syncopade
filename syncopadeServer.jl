@@ -4,7 +4,7 @@ include("syncopadeNodeConfig.jl")
 
 const server_state = Ref(:idle)  # :idle or :busy
 const DEFAULT_UNIX_MOUNT_ROOT = "/Volumes/syncopade_nfs"
-const DEFAULT_WINDOWS_MOUNT_ROOT = raw"Z:\syncopade_nfs"
+const DEFAULT_WINDOWS_MOUNT_ROOT = raw"\\192.168.100.96\syncopade_nfs"
 
 function configured_mount_root()::String
     if Sys.iswindows()
