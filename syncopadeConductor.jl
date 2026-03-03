@@ -54,6 +54,10 @@ const CONDUCTOR_LOG_COLUMNS = (
     "arg_count",
     "coordinator_ip",
     "coordinator_port",
+    "status",
+    "started_at",
+    "finished_at",
+    "callback_ok",
     "error",
 )
 const conductor_log_lock = ReentrantLock()
@@ -99,6 +103,10 @@ function log_conductor_event(event::String; kwargs...)
         string(get(kwargs, :arg_count, "")),
         string(get(kwargs, :coordinator_ip, "")),
         string(get(kwargs, :coordinator_port, "")),
+        string(get(kwargs, :status, "")),
+        string(get(kwargs, :started_at, "")),
+        string(get(kwargs, :finished_at, "")),
+        string(get(kwargs, :callback_ok, "")),
         string(get(kwargs, :error, "")),
     ]
 
@@ -122,6 +130,50 @@ function log_task_event(event::String, task::ConductorTask; kwargs...)
         coordinator_port=task.coordinator_port,
     )
     log_conductor_event(event; base..., kwargs...)
+end
+
+function find_node_by_endpoint(ip::AbstractString, port::Int)::NODES
+    ip_s = String(ip)
+    for e in configured_node_entries()
+        if e.ip == ip_s && e.port == port
+            return NODES(e.ip, e.port, e.name)
+        end
+    end
+    return NODES(ip_s, port, "unknown")
+end
+
+function handle_done_payload(payload::String)
+    parts = split(payload, '|')
+    if length(parts) < 10 || parts[1] != "DONE"
+        throw(ArgumentError("Invalid DONE format"))
+    end
+
+    task_id = parts[2]
+    job_id = parts[3]
+    worker_ip = parts[4]
+    worker_port = parse(Int, parts[5])
+    status = parts[6]
+    started_at = parts[7]
+    finished_at = parts[8]
+    callback_ok = parts[9]
+    error_msg = join(parts[10:end], "|")
+
+    node = find_node_by_endpoint(worker_ip, worker_port)
+    set_node_state!(node, NODE_IDLE)
+    log_conductor_event(
+        "TASK_DONE";
+        task_id=task_id,
+        node_name=node.name,
+        node_ip=node.IP,
+        node_port=node.port,
+        job_id=job_id,
+        queue_len=queue_len(),
+        status=status,
+        started_at=started_at,
+        finished_at=finished_at,
+        callback_ok=callback_ok,
+        error=error_msg
+    )
 end
 
 function task_label(task::ConductorTask)::String
@@ -284,6 +336,18 @@ function set_node_state!(node::NODES, state::Symbol)
     end
 end
 
+function refresh_states_until_idle!(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEOUT)::Bool
+    # Probe in the same priority order as dispatch selection.
+    for node in Iterators.reverse(nodes)
+        state = probe_node(node; timeout=timeout)
+        set_node_state!(node, state)
+        if state == NODE_IDLE
+            return true
+        end
+    end
+    return false
+end
+
 function pick_idle_node_right_to_left(nodes::Vector{NODES})::Union{Nothing,NODES}
     for node in reverse(nodes)
         if get_node_state(node) == NODE_IDLE
@@ -294,6 +358,13 @@ function pick_idle_node_right_to_left(nodes::Vector{NODES})::Union{Nothing,NODES
 end
 
 function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
+    conductor_ip = string(preferred_local_ip())
+    conductor_port_num = conductor_port()
+    wire_args = copy(task.args)
+    push!(wire_args, "__syncopade_meta_task_id=$(task.task_id)")
+    push!(wire_args, "__syncopade_meta_conductor_ip=$(conductor_ip)")
+    push!(wire_args, "__syncopade_meta_conductor_port=$(conductor_port_num)")
+
     client = SyncopadeClient(
         node.IP,
         node.port,
@@ -302,7 +373,7 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
         task.source,
         task.module_name,
         task.function_name,
-        task.args
+        wire_args
     )
 
     try
@@ -402,6 +473,7 @@ end
 # Conductor server commands (checksum required):
 # - LIST
 # - SUBMIT|coordinator_ip|coordinator_port(optional)|source:module:function|arg1|arg2|...
+# - DONE|task_id|job_id|worker_ip|worker_port|status|started_at|finished_at|callback_ok|error_message
 function conductor_server()
     bind_ip = preferred_local_ip()
     port = conductor_port()
@@ -444,12 +516,12 @@ function conductor_server()
                         # so we don't wait for the next monitor cycle.
                         @async begin
                             nodes = geneAvailableNodeList()
-                            for node in nodes
-                                state = probe_node(node; timeout=DEFAULT_STATUS_TIMEOUT)
-                                set_node_state!(node, state)
-                            end
+                            refresh_states_until_idle!(nodes; timeout=DEFAULT_STATUS_TIMEOUT)
                             dispatch_queued_tasks(nodes; max_retry=DEFAULT_MAX_RETRY)
                         end
+                    elseif cmd == "DONE"
+                        handle_done_payload(payload)
+                        println(sock, add_checksum("OK|DONE_ACK"))
                     else
                         println(sock, add_checksum("ERROR|UNKNOWN_COMMAND"))
                     end

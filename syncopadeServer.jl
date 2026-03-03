@@ -1,10 +1,14 @@
 using Sockets
 using UUIDs
+using Dates
 include("syncopadeNodeConfig.jl")
 
 const server_state = Ref(:idle)  # :idle or :busy
 const DEFAULT_UNIX_MOUNT_ROOT = "/Volumes/syncopade_nfs"
 const DEFAULT_WINDOWS_MOUNT_ROOT = raw"\\192.168.100.96\syncopade_nfs"
+const META_TASK_ID_PREFIX = "__syncopade_meta_task_id="
+const META_CONDUCTOR_IP_PREFIX = "__syncopade_meta_conductor_ip="
+const META_CONDUCTOR_PORT_PREFIX = "__syncopade_meta_conductor_port="
 
 function configured_mount_root()::String
     if Sys.iswindows()
@@ -122,6 +126,10 @@ end
 # syncopadeクライアントからのデータを受信する
 # メッセージのフォーマットは
 # clientIP|clientPort|file:module:func|arg1|arg2|...|CHECKSUM
+# NOTE: arg fields may include internal metadata keys:
+#   __syncopade_meta_task_id=
+#   __syncopade_meta_conductor_ip=
+#   __syncopade_meta_conductor_port=
 # CHECKSUMはpayload（最後の|より前の全て）に対するXORチェックサム（16進）
 # 即時応答は OK|STARTED|jobId でソケットはすぐ閉じる
 # 計算終了後，computeサーバーはclientIP:clientPortに接続し，
@@ -177,9 +185,15 @@ function syncopade_server(bind_ip::IPAddr, port::Int)
 
                     # 非同期で計算を実行し，コールバックを送信
                     @async begin
+                        started_at = Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss")
+                        finished_at = started_at
+                        exec_status = "ERROR"
+                        callback_ok = false
+                        error_message = ""
                         try
                             result = call_func(job.file_name, job.module_name, job.function_name, job.args)
-                            send_result(job, jobId, true; result=string(result))
+                            exec_status = "OK"
+                            callback_ok = send_result(job, jobId, true; result=string(result))
                         catch e
                             errType = if e isa LoadError
                                 "LOAD_ERROR"
@@ -193,8 +207,21 @@ function syncopade_server(bind_ip::IPAddr, port::Int)
                                 "RUNTIME_ERROR"
                             end
                             errMsg = sprint(showerror, e)
-                            send_result(job, jobId, false; errType=errType, errMsg=errMsg)
+                            error_message = errType * "|" * errMsg
+                            callback_ok = send_result(job, jobId, false; errType=errType, errMsg=errMsg)
                         finally
+                            finished_at = Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss")
+                            send_done_notification(
+                                job,
+                                jobId,
+                                string(bind_ip),
+                                port;
+                                status=exec_status,
+                                started_at=started_at,
+                                finished_at=finished_at,
+                                callback_ok=callback_ok,
+                                error_message=error_message
+                            )
                             server_state[] = :idle
                         end
                     end
@@ -254,6 +281,39 @@ struct SyncopadeJob
     module_name::String
     function_name::String
     args::Vector{String}
+    task_id::String
+    conductor_ip_addr::String
+    conductor_port::Int
+end
+
+function split_args_and_meta(args::AbstractVector{<:AbstractString})
+    user_args = String[]
+    task_id = ""
+    conductor_ip_addr = ""
+    conductor_port = 0
+
+    for a in args
+        arg = String(a)
+        if startswith(arg, META_TASK_ID_PREFIX)
+            task_id = arg[length(META_TASK_ID_PREFIX)+1:end]
+        elseif startswith(arg, META_CONDUCTOR_IP_PREFIX)
+            conductor_ip_addr = arg[length(META_CONDUCTOR_IP_PREFIX)+1:end]
+        elseif startswith(arg, META_CONDUCTOR_PORT_PREFIX)
+            p = tryparse(Int, arg[length(META_CONDUCTOR_PORT_PREFIX)+1:end])
+            if p !== nothing
+                conductor_port = p
+            end
+        else
+            push!(user_args, arg)
+        end
+    end
+
+    return (
+        args=user_args,
+        task_id=task_id,
+        conductor_ip_addr=conductor_ip_addr,
+        conductor_port=conductor_port
+    )
 end
 
 # payloadのフォーマット:
@@ -283,9 +343,20 @@ function convMSG2JOB(msg::String)::SyncopadeJob
     module_name = header_parts[2]
     function_name = header_parts[3]
 
-    args = length(parts) > 3 ? parts[4:end] : String[]
+    raw_args = length(parts) > 3 ? parts[4:end] : String[]
+    parsed = split_args_and_meta(raw_args)
 
-    return SyncopadeJob(client_ip_addr, client_port, file_name, module_name, function_name, args)
+    return SyncopadeJob(
+        client_ip_addr,
+        client_port,
+        file_name,
+        module_name,
+        function_name,
+        parsed.args,
+        parsed.task_id,
+        parsed.conductor_ip_addr,
+        parsed.conductor_port
+    )
 end
 
 # フィールド配列をpayload文字列に変換する
@@ -300,7 +371,7 @@ function checksum_hex(payload::String)::String
 end
 
 # 計算結果またはエラーをクライアントにコールバック送信する
-function send_result(job::SyncopadeJob, jobId::String, ok::Bool; result::String="", errType::String="", errMsg::String="")
+function send_result(job::SyncopadeJob, jobId::String, ok::Bool; result::String="", errType::String="", errMsg::String="")::Bool
     fields = String[]
     push!(fields, "RESULT")
     push!(fields, jobId)
@@ -320,8 +391,53 @@ function send_result(job::SyncopadeJob, jobId::String, ok::Bool; result::String=
         sock = connect(job.client_ip_addr, job.client_port)
         println(sock, msg)
         close(sock)
+        return true
     catch e
         println("Failed to send callback to $(job.client_ip_addr):$(job.client_port): ", e)
+        return false
+    end
+end
+
+function send_done_notification(
+    job::SyncopadeJob,
+    jobId::String,
+    worker_ip_addr::String,
+    worker_port::Int;
+    status::String,
+    started_at::String,
+    finished_at::String,
+    callback_ok::Bool,
+    error_message::String=""
+)::Bool
+    if isempty(job.task_id) || isempty(job.conductor_ip_addr) || job.conductor_port <= 0
+        return false
+    end
+
+    fields = String[
+        "DONE",
+        job.task_id,
+        jobId,
+        worker_ip_addr,
+        string(worker_port),
+        status,
+        started_at,
+        finished_at,
+        callback_ok ? "true" : "false",
+        error_message
+    ]
+    payload = build_payload(fields)
+    msg = payload * "|" * checksum_hex(payload)
+
+    try
+        sock = connect(job.conductor_ip_addr, job.conductor_port)
+        println(sock, msg)
+        ack = readline(sock)
+        close(sock)
+        ack_ok, _ = checksum(ack)
+        return ack_ok
+    catch e
+        println("Failed to send DONE to conductor $(job.conductor_ip_addr):$(job.conductor_port): ", e)
+        return false
     end
 end
 
