@@ -4,6 +4,9 @@ using Sockets
 
 include(joinpath(@__DIR__, "..", "syncopadeClient.jl"))
 
+const DEFAULT_CONDUCTOR_IP = "192.168.12.4"
+const DEFAULT_CONDUCTOR_PORT = 9004
+
 function last_octet(ip::String)::Int
     parts = split(ip, ".")
     if length(parts) != 4
@@ -14,8 +17,9 @@ end
 
 function usage()
     println("Usage: julia scripts/clear_conductor_cache_all.jl [conductor_ip] [conductor_port]")
-    println("  conductor_ip   default: local IP (getipaddr())")
-    println("  conductor_port default: 9000 + last octet of conductor_ip")
+    println("  conductor_ip   default: $(DEFAULT_CONDUCTOR_IP)")
+    println("  conductor_port default: $(DEFAULT_CONDUCTOR_PORT) when conductor_ip omitted")
+    println("                  if conductor_ip is given and conductor_port omitted: 9000 + last octet")
 end
 
 if any(a -> a == "-h" || a == "--help", ARGS)
@@ -23,8 +27,14 @@ if any(a -> a == "-h" || a == "--help", ARGS)
     exit(0)
 end
 
-conductor_ip = length(ARGS) >= 1 ? ARGS[1] : string(getipaddr())
-conductor_port = length(ARGS) >= 2 ? parse(Int, ARGS[2]) : (9000 + last_octet(conductor_ip))
+conductor_ip = length(ARGS) >= 1 ? ARGS[1] : DEFAULT_CONDUCTOR_IP
+conductor_port = if length(ARGS) >= 2
+    parse(Int, ARGS[2])
+elseif length(ARGS) == 1
+    9000 + last_octet(conductor_ip)
+else
+    DEFAULT_CONDUCTOR_PORT
+end
 
 println("conductor = ", conductor_ip, ":", conductor_port)
 
