@@ -35,6 +35,7 @@ const NODE_DOWN = :down
 
 const DEFAULT_POLL_INTERVAL = 2.0  # seconds
 const DEFAULT_STATUS_TIMEOUT = 0.2  # seconds (per node)
+const DEFAULT_CACHE_CLEAR_TIMEOUT = 1.0  # seconds (per node)
 const DEFAULT_MAX_RETRY = 3
 const DEFAULT_DISPATCH_TIMEOUT = 3.0  # seconds (worker start-ack timeout)
 const DEFAULT_CONDUCTOR_LOG_PATH = joinpath(@__DIR__, "logs", "conductor_events.csv")
@@ -338,6 +339,100 @@ function probe_node(node::NODES; timeout=DEFAULT_STATUS_TIMEOUT)
     end
 end
 
+function request_node_cache_clear(node::NODES)::Int
+    sock = connect(node.IP, node.port)
+    try
+        println(sock, add_checksum("CACHE_CLEAR"))
+        resp = readline(sock)
+        parts = split(chomp(resp), '|')
+        if length(parts) == 3 && parts[1] == "CACHE" && parts[2] == "CLEARED"
+            cleared = try
+                parse(Int, parts[3])
+            catch
+                throw(ArgumentError("Invalid CACHE_CLEAR count from $(node.IP):$(node.port): $(parts[3])"))
+            end
+            return max(cleared, 0)
+        end
+        throw(ArgumentError("Unexpected CACHE_CLEAR response from $(node.IP):$(node.port): $(resp)"))
+    finally
+        close(sock)
+    end
+end
+
+function clear_node_cache_with_timeout(node::NODES; timeout=DEFAULT_CACHE_CLEAR_TIMEOUT)
+    t = @async begin
+        return request_node_cache_clear(node)
+    end
+
+    w = Base.timedwait(() -> istaskdone(t), timeout; pollint=0.01)
+    if w === :timed_out
+        return (ok=false, cleared=0, error="timeout")
+    end
+
+    try
+        cleared = fetch(t)
+        return (ok=true, cleared=cleared, error="")
+    catch e
+        return (ok=false, cleared=0, error=sprint(showerror, e))
+    end
+end
+
+function clear_all_node_caches(nodes::Vector{NODES}; timeout=DEFAULT_CACHE_CLEAR_TIMEOUT)
+    tasks = [@async clear_node_cache_with_timeout(node; timeout=timeout) for node in nodes]
+
+    total_nodes = length(nodes)
+    success_nodes = 0
+    failed_nodes = 0
+    cleared_functions = 0
+
+    for (node, t) in zip(nodes, tasks)
+        result = try
+            fetch(t)
+        catch e
+            (ok=false, cleared=0, error=sprint(showerror, e))
+        end
+
+        if result.ok
+            success_nodes += 1
+            cleared_functions += result.cleared
+            set_node_state!(node, probe_node(node; timeout=DEFAULT_STATUS_TIMEOUT))
+            log_conductor_event(
+                "CACHE_CLEAR_NODE_OK";
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                status=string(result.cleared),
+                queue_len=queue_len()
+            )
+        else
+            failed_nodes += 1
+            set_node_state!(node, NODE_DOWN)
+            log_conductor_event(
+                "CACHE_CLEAR_NODE_FAILED";
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                error=result.error,
+                queue_len=queue_len()
+            )
+        end
+    end
+
+    log_conductor_event(
+        "CACHE_CLEAR_ALL_SUMMARY";
+        status=string(success_nodes, "/", total_nodes),
+        error=string("failed=", failed_nodes, " cleared=", cleared_functions),
+        queue_len=queue_len()
+    )
+
+    return (
+        total_nodes=total_nodes,
+        success_nodes=success_nodes,
+        failed_nodes=failed_nodes,
+        cleared_functions=cleared_functions
+    )
+end
+
 function default_callback_port(ip::AbstractString)::Int
     parts = split(String(ip), ".")
     if length(parts) != 4
@@ -621,6 +716,7 @@ end
 # - LIST
 # - SUBMIT|coordinator_ip|coordinator_port(optional)|source:module:function|arg1|arg2|...
 # - DONE|task_id|job_id|worker_ip|worker_port|status|started_at|finished_at|callback_ok|error_message
+# - CACHE_CLEAR_ALL
 function conductor_server()
     bind_ip = preferred_local_ip()
     port = conductor_port()
@@ -669,6 +765,21 @@ function conductor_server()
                     elseif cmd == "DONE"
                         handle_done_payload(payload)
                         println(sock, add_checksum("OK|DONE_ACK"))
+                    elseif cmd == "CACHE_CLEAR_ALL"
+                        nodes = geneAvailableNodeList()
+                        summary = clear_all_node_caches(nodes; timeout=DEFAULT_CACHE_CLEAR_TIMEOUT)
+                        resp_payload = join(
+                            String[
+                                "OK",
+                                "CACHE_CLEAR_ALL",
+                                string(summary.total_nodes),
+                                string(summary.success_nodes),
+                                string(summary.failed_nodes),
+                                string(summary.cleared_functions)
+                            ],
+                            "|"
+                        )
+                        println(sock, add_checksum(resp_payload))
                     else
                         println(sock, add_checksum("ERROR|UNKNOWN_COMMAND"))
                     end

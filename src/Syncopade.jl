@@ -14,6 +14,7 @@ export SyncopadeClient,
        query_conductor_nodes,
        parse_conductor_nodes,
        show_available_nodes,
+       clear_conductor_node_caches,
        submit_conductor_task,
        submit_conductor_task_and_wait
 

@@ -458,6 +458,64 @@ function show_available_nodes(conductor_ip::String, conductor_port::Int)
 end
 
 """
+    clear_conductor_node_caches(conductor_ip::String; conductor_port::Int=9000) -> NamedTuple
+
+Send `CACHE_CLEAR_ALL` command to the Syncopade Conductor and request cache clear on all configured nodes.
+
+# Protocol
+Client -> Conductor:
+- `CACHE_CLEAR_ALL|cc`
+
+Conductor -> Client payload:
+- `OK|CACHE_CLEAR_ALL|total_nodes|success_nodes|failed_nodes|cleared_functions`
+
+# Returns
+- NamedTuple:
+  - `total_nodes::Int`
+  - `success_nodes::Int`
+  - `failed_nodes::Int`
+  - `cleared_functions::Int`
+"""
+function clear_conductor_node_caches(conductor_ip::String; conductor_port::Int=9000)
+    sock = connect(conductor_ip, conductor_port)
+    try
+        println(sock, add_checksum("CACHE_CLEAR_ALL"))
+        resp = readline(sock)
+        ok, payload = verify_checksum(resp)
+        if !ok
+            error("Invalid checksum from conductor response: $resp")
+        end
+
+        parts = split(payload, '|')
+        if length(parts) == 6 && parts[1] == "OK" && parts[2] == "CACHE_CLEAR_ALL"
+            total_nodes = parse(Int, parts[3])
+            success_nodes = parse(Int, parts[4])
+            failed_nodes = parse(Int, parts[5])
+            cleared_functions = parse(Int, parts[6])
+            return (
+                total_nodes=max(total_nodes, 0),
+                success_nodes=max(success_nodes, 0),
+                failed_nodes=max(failed_nodes, 0),
+                cleared_functions=max(cleared_functions, 0)
+            )
+        end
+
+        error("Unexpected response from conductor: $payload")
+    finally
+        close(sock)
+    end
+end
+
+"""
+    clear_conductor_node_caches(conductor_ip::String, conductor_port::Int) -> NamedTuple
+
+Positional-argument overload of `clear_conductor_node_caches`.
+"""
+function clear_conductor_node_caches(conductor_ip::String, conductor_port::Int)
+    return clear_conductor_node_caches(conductor_ip; conductor_port=conductor_port)
+end
+
+"""
     submit_conductor_task(
         conductor_ip::String;
         conductor_port::Int=9000,
