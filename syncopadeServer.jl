@@ -15,6 +15,15 @@ const include_lock = ReentrantLock()
 const function_cache = Dict{Tuple{String,String,String}, Function}()
 const function_cache_lru = Tuple{String,String,String}[]
 
+function clear_function_cache!()::Int
+    lock(function_cache_lock) do
+        cleared = length(function_cache_lru)
+        empty!(function_cache)
+        empty!(function_cache_lru)
+        return cleared
+    end
+end
+
 function configured_function_cache_size()::Int
     raw = strip(get(ENV, "SYNCOPADE_FUNCTION_CACHE_SIZE", string(DEFAULT_FUNCTION_CACHE_SIZE)))
     size = tryparse(Int, raw)
@@ -204,6 +213,9 @@ end
 #   __syncopade_meta_conductor_port=
 # CHECKSUMはpayload（最後の|より前の全て）に対するXORチェックサム（16進）
 # 即時応答は OK|STARTED|jobId でソケットはすぐ閉じる
+# 制御コマンド:
+# STATUS|checksum      -> STATUS|<idle|busy>
+# CACHE_CLEAR|checksum -> CACHE|CLEARED|<count>
 # 計算終了後，computeサーバーはclientIP:clientPortに接続し，
 # RESULT|jobId|OK|<string(result)>|CHECKSUM
 # またはエラー時は
@@ -238,6 +250,13 @@ function syncopade_server(bind_ip::IPAddr, port::Int)
                     # Check for STATUS command
                     if msg == "STATUS"
                         println(sock, "STATUS|" * string(server_state[]))
+                        close(sock)
+                        return
+                    end
+
+                    if msg == "CACHE_CLEAR"
+                        cleared = clear_function_cache!()
+                        println(sock, "CACHE|CLEARED|" * string(cleared))
                         close(sock)
                         return
                     end
