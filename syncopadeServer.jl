@@ -4,7 +4,7 @@ using Dates
 include("syncopadeNodeConfig.jl")
 
 const server_state = Ref(:idle)  # :idle or :busy
-const DEFAULT_UNIX_MOUNT_ROOT = "/Volumes/syncopade_nfs"
+const DEFAULT_UNIX_MOUNT_ROOT = joinpath(homedir(), "syncopade_nfs")
 const DEFAULT_WINDOWS_MOUNT_ROOT = raw"\\192.168.100.96\syncopade_nfs"
 const DEFAULT_FUNCTION_CACHE_SIZE = 10
 const META_TASK_ID_PREFIX = "__syncopade_meta_task_id="
