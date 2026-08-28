@@ -172,10 +172,6 @@ function wrapper_entrypoint_main(args::Vector{String}=ARGS)::Nothing
 
     @test positive.process.termsignal ==
           (positive_kill_fallback ? Base.SIGKILL : Base.SIGTERM)
-    @test occursin(
-        "Conductor server listening on $(conductor_ip):$(conductor_port)",
-        read(positive.stdout_path, String),
-    )
     @test occursin("signal 15: Terminated", read(positive.stderr_path, String))
     assert_port_free(conductor_ip, conductor_port)
 

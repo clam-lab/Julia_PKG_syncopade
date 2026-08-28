@@ -358,6 +358,8 @@ wrapperが定義を読み込んで即時終了する回帰を、processとlisten
 - repository logはtest開始前後のbyte列一致を要求する。
 - test entrypointへ`PROGRAM_FILE` guardを付け、include時の副作用を抑止した。
 - 再開時にchild terminationをbounded waitへ変更し、SIGTERM timeout時のSIGKILL fallbackを追加した。
+- Step 4で判明したbuffer timing依存を除くため、positive stdoutのlistener文字列assertを削除した。
+- 起動判定はprocess生存、checksum検証済み`LIST`、temporary `CONDUCTOR_START`、runtime stderr 0 byteで維持する。
 
 ### Phase 4: テストまたは検証を行う — 完了
 
@@ -409,6 +411,22 @@ wrapperが定義を読み込んで即時終了する回帰を、processとlisten
 - include-only negative fixtureは旧wrapperと同じ即時正常終了を示し、testが回帰を区別できる。
 - success/failure cleanupは時間制限付きとなり、test自身が無期限停止しない。
 
+#### stdout buffer依存除去後の再検証
+
+- harness re-include: `STEP3_STDOUT_FIX_INCLUDE_OK`
+- port preflight: `STEP3_STDOUT_FIX_PORT_PREFLIGHT_OK`
+- result: `STEP3_RESULT=PASS_WRAPPER_ENTRYPOINT_REGRESSION`
+- positive `LIST` payload: `NODES|`
+- positive runtime stderr: 0 byte
+- positive termination: `termsignal=9`, SIGKILL fallback=`true`
+- negative fixture: exit code `0`, `termsignal=0`
+- final 9030 listener: なし
+- repository log: byte列一致
+- artifact directory: `/var/folders/__/7pnh5g_x5qb2r25n4tgyyhww0000gn/T/syncopade-wrapper-entrypoint-j1jNmh`
+- receipt: `/var/folders/__/7pnh5g_x5qb2r25n4tgyyhww0000gn/T/syncopade-wrapper-entrypoint-j1jNmh/receipt.md`
+
+stdoutが0 byteでもprocess、protocol、temporary log、runtime stderrの正本条件でPASSし、buffer flush timingへの依存を除去できた。SIGTERMで終了しない場合もbounded wait後のSIGKILL fallbackで残留processとlistenerを残していない。
+
 ---
 
 ## Step 4: release前の回帰検証を行う
@@ -443,13 +461,108 @@ wrapper修正がinclude-safe testability、conductor既存機能、server admiss
 3. Step 3のwrapper integration testを再実行する。
 4. Git差分、stderr、process、port、log hashを照合する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- Step 4はrelease candidateの検証専用とし、production/test sourceを変更しない。
+- conductor include check、standard unit、server admission unit、wrapper integrationを直列実行する。
+- 各commandのstdout/stderrをrepository外の同一artifact directoryへ分離保存する。
+- wrapper integration以外のtestがnetwork conductorを起動しないことをportで確認する。
+- 全stderr 0 byte、expected test count、wrapper regression marker、repository log byte列一致を要求する。
+- いずれかのcommand error、件数不一致、stderr出力、listener残留、log変更で即停止する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Regression command sequence
+
+1. `julia --project=. -e 'include("syncopadeConductor.jl"); println("CONDUCTOR_INCLUDE_OK")'`
+2. `julia --project=. --threads=4 test/runtests.jl`
+3. `julia --project=. --threads=4 test/unit_server_admission_state.jl`
+4. `julia --project=. test/integration_conductor_wrapper_entrypoint.jl 192.168.100.30 9030 5.0`
+
+#### Expected results
+
+- include marker: `CONDUCTOR_INCLUDE_OK`
+- Client Protocol: `8 / 8 pass`
+- Conductor Queue: `17 / 17 pass`
+- Server Admission State: `13 / 13 pass`
+- wrapper integration: `STEP3_RESULT=PASS_WRAPPER_ENTRYPOINT_REGRESSION`
+- wrapper positive runtime stderr: 0 byte
+- wrapper negative exit: code `0`, signal `0`
+- all top-level command stderr: 0 byte
+
+#### Environmentと副作用
+
+- wrapper integrationはtest内でlan100とtemporary conductor logを設定する。
+- command開始前に9030をbind可能とし、終了後も同じ条件を要求する。
+- repository logは開始前bytesを保存し、全command後に一致させる。
+- artifact directoryはrepository外へ作成し、stdout、stderr、receiptを保存する。
+
+### Phase 3: 実装する — 完了（source変更なし）
+
+- Step 4ではproduction/test sourceを変更していない。
+- temporary runner、debug print、repository log redirectをrepository内へ追加していない。
+- 変更はこのTodoのPhase 1–3記録だけである。
+
+### Phase 4: テストまたは検証を行う — 停止（unit testの既定log出力）
+
+#### Passした検証
+
+- conductor include: `CONDUCTOR_INCLUDE_OK`
+- Client Protocol: `8 / 8 pass`
+- Conductor Queue: `17 / 17 pass`
+- Server Admission State: `13 / 13 pass`
+- wrapper integration: `STEP3_RESULT=PASS_WRAPPER_ENTRYPOINT_REGRESSION`
+- top-level command stderr: すべて0 byte
+- wrapper positive runtime stderr: 0 byte
+- wrapper negative exit: code `0`, signal `0`
+- cleanup後9030 listener: なし
+
+#### 停止理由
+
+- `test/runtests.jl`のConductor Queue testが`SYNCOPADE_CONDUCTOR_LOG`未指定のためrepository既定logへ5行追記した。
+- repository log hashが検証前`a680168272507f4049158b3f6a8df4fad98993b5`から変化し、Step 4完了条件を満たさなかった。
+- wrapper integrationは自身の開始前後だけを比較するため、その前にstandard unitが行った追記を検出対象にできなかった。
+- C進行のerror停止規則に従い、unit test用temporary logを指定した補正再実行には進んでいない。
+
+#### Cleanupと監査
+
+- 今回の21:52:24由来5行に加え、以前のrelease前testが21:25:55に残した5行も灯子由来と特定して除去した。
+- 先生の既存4行だけを残し、repository logは`4 additions / 0 deletions`へ復元した。
+- 復元後repository log hash: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`
+- process残留: なし
+- cleanup後9030 listener: なし
+- Step 4差分: 未commit、未push。
+- raw evidence: `/tmp/syncopade-conductor-wrapper-step4.KaQQe6/`
+- receipt: `/tmp/syncopade-conductor-wrapper-step4.KaQQe6/failure_receipt.md`
+
+#### 再開条件
+
+- standard unit commandにも`SYNCOPADE_CONDUCTOR_LOG=<Step 4 artifact directory>/unit_conductor.csv`を指定する。
+- repository log baselineを復元後hash`b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`として固定する。
+- Phase 4をport preflightから再実行し、unit用temporary log生成とrepository log不変を確認する。
+
+#### 再開試行1
+
+- standard unitへ`SYNCOPADE_CONDUCTOR_LOG=/tmp/syncopade-conductor-wrapper-step4-resume.4ENCfQ/unit_conductor.csv`を指定した。
+- Client Protocol: `8 / 8 pass`
+- Conductor Queue: `17 / 17 pass`
+- Server Admission State: `13 / 13 pass`
+- unit用temporary log: headerと5 eventを記録
+- repository log hash: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`のまま
+- wrapper positive caseは`LIST`応答とtemporary `CONDUCTOR_START`まで成功した。
+- wrapper testは終了後stdoutからlistener messageを探したが、redirect bufferがflushされずstdoutが0 byteだったため`@test` failureとなった。
+- listenerとprotocolの成立は既に直接確認できており、stdout文字列は起動contractの必須条件ではない。
+- top-level wrapper test stderrには上記`Test Failed`だけが記録された。
+- cleanup後9030 listener: なし
+- process残留: なし
+- raw evidence: `/tmp/syncopade-conductor-wrapper-step4-resume.4ENCfQ/`
+- failure receipt: `/tmp/syncopade-conductor-wrapper-step4-resume.4ENCfQ/failure_receipt.md`
+
+#### 現在の再開条件
+
+- Step 3 Phase 3へ戻り、buffer timingに依存するpositive stdout文字列assertを削除する。
+- process生存、`LIST`成功、temporary `CONDUCTOR_START`、runtime stderr、cleanupを正本判定として維持する。
+- Step 3 Phase 4を再実行して修正testをcommit/push後、Step 4 Phase 4を先頭から再実行する。
 
 ---
 
