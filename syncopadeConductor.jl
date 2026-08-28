@@ -802,4 +802,6 @@ function main()
     monitor_nodes(interval=1.0)
 end
 
-main()
+if abspath(PROGRAM_FILE) == @__FILE__
+    main()
+end
