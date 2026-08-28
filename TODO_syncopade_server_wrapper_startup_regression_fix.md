@@ -449,7 +449,7 @@ unitだけでなく実wrapper 2本を同時起動し、serverがconductorへ`idl
 
 ---
 
-## Step 5: patch release `v0.1.3`を作成する
+## Step 5: patch release `v0.1.3`を作成する — 完了
 
 ### 目的
 
@@ -478,10 +478,85 @@ server wrapper startup回帰修正を、既存tagを変更せず新しいpatch r
 3. intended pathだけをstageしてrelease commitをpushする。
 4. annotated tagを作成・pushし、local/remote refsを照合する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- semantic versioning上のpatch releaseとして`0.1.2`から`0.1.3`へ更新する。
+- release source変更は`Project.toml`のversion 1行だけとし、wrapper/testの追加変更を混ぜない。
+- version変更後にStep 4と同じunit、個別wrapper、両wrapper同時起動を再実行する。
+- test log、stdout、stderr、joint runner、receiptはrepository外へ置く。
+- 検証済みrelease commitをremote `master`へpush後、annotated tag `v0.1.3`を作成・pushする。
+- 既存annotated tag `v0.1.2`とpeeled target `e67d6cb9fd37b89ca205b891fb83a226039503ad`は変更しない。
+- `logs/conductor_events.csv`は先生の既存差分として保持し、stage・commit・復元しない。
+- version、test、Git refs、log identityのいずれかが不一致ならrelease操作を停止する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Version contract
+
+- input: `Project.toml`の`version = "0.1.2"`。
+- output: `Project.toml`の`version = "0.1.3"`。
+- validation: `Pkg.project().version == v"0.1.3"`。
+- source side effect: 上記1行だけ。
+
+#### Release regression contract
+
+- Step 4のinclude、standard unit、server admission、個別wrapper、joint wrapperを全て再実行する。
+- expected: Client Protocol `8/8`、Conductor Queue `17/17`、Server Admission State `13/13`。
+- expected: conductor/server wrapper個別testとjoint `LIST` testがPASS。
+- expected: 全top-level stderr 0 byte、wrapper停止前runtime stderr 0 byte、終了後8030/9030 bind可能。
+- expected: repository log content SHA-1 `528443adeeff16bfcd482c552458584d7a080e99`、Git blob ID `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`、`4 additions / 0 deletions`が不変。
+
+#### Git release contract
+
+- release commit input: `Project.toml`とこのTodoだけをstageする。
+- branch output: local `HEAD == refs/remotes/origin/master`。
+- tag input: release commitとmessage `Syncopade v0.1.3 server wrapper startup fix`。
+- tag output: local/remote `v0.1.3`はannotated tagで、peeled targetがrelease commitと一致する。
+- immutable reference: local/remote `v0.1.2^{}`は`e67d6cb9fd37b89ca205b891fb83a226039503ad`のまま。
+- forbidden side effect: 既存tagの付け替え、`v0.1.3`のforce更新、repository logのstage/commit。
+
+### Phase 3: 実装する — 完了
+
+- `Project.toml`のversionを`0.1.2`から`0.1.3`へ更新した。
+- package name、UUID、dependency、source、test、scriptは変更していない。
+- annotated tagはPhase 4のrelease regressionとrelease commit/pushが成功するまで作成しない。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### Release candidate検証
+
+- result: `STEP5_RESULT=PASS_V0.1.3_RELEASE_CANDIDATE`。
+- version: `PROJECT_VERSION_OK=0.1.3`。
+- conductor/server include-only: PASS。
+- Client Protocol: `8 / 8 pass`。
+- Conductor Queue: `17 / 17 pass`。
+- Server Admission State: `13 / 13 pass`。
+- conductor wrapper regression: PASS。
+- server wrapper regression: PASS。
+- joint wrapper result: `JOINT_RESULT=PASS_CONDUCTOR_SERVER_WRAPPERS`。
+- joint server status: `STATUS|idle`。
+- joint final LIST: `NODES|192.168.100.30:8030`。
+- joint server exit: code `0`、signal `0`。
+- joint conductor termination: `SIGTERM`、SIGKILL fallback=`false`。
+- conductor/server停止前runtime stderr: `0 / 0 byte`。
+- top-level stderr: 全10 fileが0 byte。
+- cleanup: `STEP5_CLEANUP_PORTS_FREE`、process残留なし。
+- repository log content SHA-1: `528443adeeff16bfcd482c552458584d7a080e99`のまま。
+- repository log Git blob ID: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`のまま。
+- repository log差分: `4 additions / 0 deletions`のまま。
+- `v0.1.2` peeled target: `e67d6cb9fd37b89ca205b891fb83a226039503ad`のまま。
+- 検証時点でlocal/remote `v0.1.3`は未作成。
+- artifact: `/tmp/syncopade-server-wrapper-step5-release.gZZAQu/`。
+- release receipt: `/tmp/syncopade-server-wrapper-step5-release.gZZAQu/receipt.md`。
+
+#### Release refs検証
+
+- release commitは`Project.toml`とこのTodoだけを含む。
+- local/remote `master`はrelease commitで一致する。
+- local/remote `v0.1.3`はannotated tagで、peeled targetはrelease commitと一致する。
+- local/remote `v0.1.2`のpeeled targetは`e67d6cb9fd37b89ca205b891fb83a226039503ad`のまま維持する。
+- 実際のrelease commit、tag object、remote refsはrepository外receiptへ記録する。
+
+### Step 5結論
+
+`0.1.3`はserver wrapper startup回帰だけを含むpatch releaseである。version、既存unit、conductor/server個別wrapper、両wrapper同時起動、protocol、exit、cleanup、repository log不変を確認し、検証済みrelease commitへannotated tagを固定する。
