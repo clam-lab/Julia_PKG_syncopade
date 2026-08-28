@@ -443,7 +443,7 @@ Step 2の受付状態遷移を実際の計算要求handlerへ接続し、
 
 ---
 
-## Step 4: 正常終了後に次jobを再受付できることを確認する
+## Step 4: 正常終了後に次jobを再受付できることを確認する — 完了
 
 ### 目的
 
@@ -473,13 +473,121 @@ job lifecycleの正常終端と受付解放が対応することを確認する�
 4. A/Cの実行区間が重ならず、fixtureの最大active数が1であることを確認する。
 5. 最終statusとlistener cleanupを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- Step 3で確定した`test/integration_server_busy_rejection.jl`を拡張し、A受理・B拒否の全assertionを維持したままjob Cを追加する。
+- production sourceは変更せず、Step 3実装済みの`release_server!()`正常終端経路をblack-boxで検証する。
+- job C callback listenerはA/Bと同様にjob投入前にbindする。
+- A callbackと`STATUS|idle`を確認した後だけjob Cを投入する。
+- job Cは既存`syncopade_calc_request`で投入し、`OK|STARTED|jobId`の成功経路を使用する。
+- C callbackのjob ID、status、label、active数、実行区間を検証する。
+- AとCのfixture区間が重ならないこと、A/C双方の`max_active=1`を要求する。
+- B callback不在を確定した後はB listenerを明示closeし、job C検証中に不要なlistenerを残さない。
+- 既存CLI 1〜6の意味は変えず、job C callback portだけを末尾のoptional引数として追加する。
+- Step 4では正常終了経路だけを扱い、ERROR callback後の再受付はStep 5へ残す。
+- `syncopadeServer.jl`、client、conductor、fixtureは変更しない見込みとする。実装が必要になった場合はPhase 3へ進まず停止してTodo見直しを提案する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Harness CLI追加
+
+- 既存引数1〜6はStep 3仕様を維持する。
+- 7番目にjob C callback portを追加し、defaultを`9143`とする。
+- A/B/Cのcallback portはすべて異なる値を要求する。
+- 旧Step 3 commandが7番目を省略しても、default C portで同じ拡張testを実行する。
+
+#### Job C lifecycle
+
+- A callback成功後、B callback不在の観測windowを完了する。
+- B listenerをcancel/closeし、receiver taskが終了したことを確認する。
+- `wait_for_server_status(..., "STATUS|idle", timeout)`でA終端後のidleを確認する。
+- label `C`、Aと同じsleep seconds、callback port Cで`SyncopadeClient`を構築する。
+- `syncopade_calc_request(client_c)`の戻り値をjob C IDとする。
+- C callbackのjob IDが受付IDと一致し、statusがOKであることを要求する。
+- C payloadは`label=C`, `active_at_entry=1`, `max_active=1`, `started_ns < finished_ns`を要求する。
+- `probe_a.finished_ns <= probe_c.started_ns`を要求し、A/C区間が重ならないことを確認する。
+- C callback後の最終statusは`STATUS|idle`を要求する。
+
+#### Outputと合格条件
+
+- Step 3 assertion成功を`STEP3_RESULT=PASS_BUSY_REJECTED`で維持する。
+- Step 4合格を`STEP4_RESULT=PASS_NORMAL_RECOVERY`で出力する。
+- A/C job ID、A終端後status、C payload、区間重複判定、最終statusをstdoutへ残す。
+- A受理、B拒否、B callbackなし、A後idle、C受理、C callback OK、A/C非重複、最終idleがすべて成立した場合だけexit code `0`とする。
+
+#### Phase 4 process構成
+
+- server: `192.168.100.30:8030`
+- callback ports: A=`9141`, B=`9142`, C=`9143`
+- fixture sleep: `3.0 s`
+- timeout: `15.0 s`
+- 起動前後に`8030`, `9141`, `9142`, `9143`のlistenerを検査する。
+- server/harness raw stdout・stderrとreceiptはrepository外の一時directoryへ保存する。
+
+### Phase 3: 実装する — 完了
+
+- `test/integration_server_busy_rejection.jl`へjob C recovery検証を追加した。
+- 既存CLI 1〜6を維持し、7番目にC callback portを追加した。
+- A/B/C callback portの相互重複checkを追加した。
+- C listenerはA/Bと同様に投入前にbindする。
+- B callback不在の観測後にB listenerを明示closeし、receiver task終了を確認する。
+- A終端後の`STATUS|idle`確認後だけjob Cを投入する。
+- C callback ID/status/payload、A/C区間非重複、最終idleのassertionを追加した。
+- `STEP4_RESULT=PASS_NORMAL_RECOVERY`とC evidenceをstdoutへ追加した。
+- production source、client、conductor、fixtureは変更していない。
+- harness include check: `RECOVERY_HARNESS_INCLUDE_OK`, exit code `0`。
+- 対象fileの`git diff --check`はerrorなし。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### Regression check
+
+- command: `julia --project=. --threads=4 test/unit_server_admission_state.jl`
+- result: `13 / 13 pass`
+- exit code: `0`
+
+#### Integration environment
+
+- pre-Step-4 HEAD: `cb632970066361b2a60fbdc9e4d1c38cb9d1b856`
+- server PID/endpoint: `1436`, `192.168.100.30:8030`
+- callback IP: `192.168.100.30`
+- callback ports: A=`9141`, B=`9142`, C=`9143`
+- conductor: 未起動
+- 起動前にlocal IP保持と`8030`, `9141`, `9142`, `9143`の空きを確認した。
+
+#### Integration result
+
+- Step 3 regression: `STEP3_RESULT=PASS_BUSY_REJECTED`
+- Step 4 result: `STEP4_RESULT=PASS_NORMAL_RECOVERY`
+- harness exit code: `0`
+- server exit code: `0`
+- initial status: `STATUS|idle`
+- job A ID: `aa3d246f-287f-446d-b842-af2faf3cede5`
+- job B投入直前status: `STATUS|busy`
+- job B response: `ERROR|BUSY`
+- job B callback: 観測なし
+- job A終端後status: `STATUS|idle`
+- job C ID: `b1c7b3db-96ee-447e-a71d-0f9780774240`
+- job A `active_at_entry=1`, `max_active=1`
+- job C `active_at_entry=1`, `max_active=1`
+- job A interval: `716730861819125..716733863978750 ns`
+- job C interval: `716734876737208..716737879184333 ns`
+- A/C interval overlap: `false`
+- final status: `STATUS|idle`
+- server/harness stderr: ともに空
+- cleanup後`8030`, `9141`, `9142`, `9143`: listenerなし
+- repositoryの`logs/conductor_events.csv`: 既存4行dirtyのまま、Step 4由来の追記なし
+- receipt: `/tmp/syncopade-step4-recovery.fRkIRn/receipt.md`
+- raw logs: `/tmp/syncopade-step4-recovery.fRkIRn/`
+
+#### Step 4結論
+
+- 正常job Aの終端後にserverはidleへ復帰した。
+- BUSY拒否されたjob Bは、その後のjob C受付を妨げなかった。
+- job Cは新しいjob IDを得て正常callbackまで完了した。
+- A/Cは直列実行され、active job数は常に1だった。
+- job ERROR後のidle復帰と再受付は未検証であり、Step 5へ残した。
+- Step 4の完了条件をすべて満たした。
 
 ---
 

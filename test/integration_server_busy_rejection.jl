@@ -120,8 +120,10 @@ function main(args::Vector{String}=ARGS)
     callback_port_b = parse_int_arg(args, 4, 9142)
     sleep_seconds = parse_float_arg(args, 5, 3.0)
     timeout = parse_float_arg(args, 6, 15.0)
+    callback_port_c = parse_int_arg(args, 7, 9143)
 
-    callback_port_a != callback_port_b || error("callback ports must be distinct")
+    length(unique((callback_port_a, callback_port_b, callback_port_c))) == 3 ||
+        error("callback ports must be distinct")
     (isfinite(sleep_seconds) && sleep_seconds > 0) ||
         error("sleep_seconds must be finite and > 0")
     rejection_window = sleep_seconds + 1.0
@@ -139,6 +141,7 @@ function main(args::Vector{String}=ARGS)
 
     listener_a = listen(callback_ip_addr, callback_port_a)
     listener_b = listen(callback_ip_addr, callback_port_b)
+    listener_c = listen(callback_ip_addr, callback_port_c)
     receiver_a = @async receive_callback(listener_a)
     cancel_receiver_b = Ref(false)
     receiver_b = @async begin
@@ -149,6 +152,7 @@ function main(args::Vector{String}=ARGS)
             nothing
         end
     end
+    receiver_c = @async receive_callback(listener_c)
 
     try
         client_a = SyncopadeClient(
@@ -170,6 +174,16 @@ function main(args::Vector{String}=ARGS)
             PROBE_MODULE,
             PROBE_FUNCTION,
             ["B", string(sleep_seconds)],
+        )
+        client_c = SyncopadeClient(
+            server_ip,
+            server_port,
+            callback_ip,
+            callback_port_c,
+            PROBE_SOURCE,
+            PROBE_MODULE,
+            PROBE_FUNCTION,
+            ["C", string(sleep_seconds)],
         )
 
         submitted_a_ns = time_ns()
@@ -202,6 +216,12 @@ function main(args::Vector{String}=ARGS)
         end
         istaskdone(receiver_b) && error("job B unexpectedly produced a callback")
 
+        cancel_receiver_b[] = true
+        close_quietly(listener_b)
+        b_close_wait = Base.timedwait(() -> istaskdone(receiver_b), 1.0; pollint=0.01)
+        b_close_wait === :timed_out && error("job B callback receiver did not close")
+        fetch(receiver_b) === nothing || error("unexpected job B receiver result")
+
         probe_a = parse_probe_payload(result_a.payload)
         probe_a.label == "A" || error("unexpected job A label: $(probe_a.label)")
         probe_a.active_at_entry == 1 ||
@@ -209,28 +229,53 @@ function main(args::Vector{String}=ARGS)
         probe_a.max_active == 1 || error("job A max_active was $(probe_a.max_active)")
         probe_a.started_ns < probe_a.finished_ns || error("invalid job A interval")
 
+        status_after_a = wait_for_server_status(server_ip, server_port, "STATUS|idle", timeout)
+
+        submitted_c_ns = time_ns()
+        job_id_c = syncopade_calc_request(client_c)
+        result_c = wait_for_task(receiver_c, timeout, "job C callback")
+        result_c.job_id == job_id_c || error("job C callback ID mismatch")
+        result_c.ok || error("job C failed: $(result_c.payload)")
+
+        probe_c = parse_probe_payload(result_c.payload)
+        probe_c.label == "C" || error("unexpected job C label: $(probe_c.label)")
+        probe_c.active_at_entry == 1 ||
+            error("job C active_at_entry was $(probe_c.active_at_entry)")
+        probe_c.max_active == 1 || error("job C max_active was $(probe_c.max_active)")
+        probe_c.started_ns < probe_c.finished_ns || error("invalid job C interval")
+
+        intervals_overlap = probe_a.finished_ns > probe_c.started_ns
+        intervals_overlap && error("job A and C intervals overlapped")
+
         final_status = wait_for_server_status(server_ip, server_port, "STATUS|idle", timeout)
 
         println("STEP3_RESULT=PASS_BUSY_REJECTED")
+        println("STEP4_RESULT=PASS_NORMAL_RECOVERY")
         println("server_endpoint=$(server_ip):$(server_port)")
         println("callback_ip=$(callback_ip)")
         println("initial_status=$(initial_status)")
         println("status_before_b=$(status_before_b)")
         println("job_id_a=$(job_id_a)")
+        println("job_id_c=$(job_id_c)")
         println("job_b_response=$(response_b)")
         println("submitted_a_ns=$(submitted_a_ns)")
         println("submitted_b_ns=$(submitted_b_ns)")
         println("rejected_b_ns=$(rejected_b_ns)")
+        println("submitted_c_ns=$(submitted_c_ns)")
         println("callback_b_observed=false")
         println("probe_a=$(result_a.payload)")
+        println("status_after_a=$(status_after_a)")
+        println("probe_c=$(result_c.payload)")
+        println("a_c_interval_overlap=$(intervals_overlap)")
         println("final_status=$(final_status)")
         return nothing
     finally
         cancel_receiver_b[] = true
         close_quietly(listener_a)
         close_quietly(listener_b)
+        close_quietly(listener_c)
         Base.timedwait(
-            () -> istaskdone(receiver_a) && istaskdone(receiver_b),
+            () -> istaskdone(receiver_a) && istaskdone(receiver_b) && istaskdone(receiver_c),
             1.0;
             pollint=0.01,
         )
