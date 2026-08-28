@@ -1,0 +1,298 @@
+# Syncopade conductor wrapper起動回帰の改定 Todo
+
+## 目的
+
+`v0.1.1`で`syncopadeConductor.jl`をinclude-safeにした結果、
+`scripts/run_conductor.jl`が定義をincludeするだけで正常終了し、conductorを起動しなくなった回帰を修正する。
+
+conductor本体のinclude-safe contractは維持し、実行用wrapperが`main()`を明示的に1回だけ呼ぶ構造へ直す。
+修正版は既存tagを動かさず、patch release `v0.1.2`として公開する。
+
+## 現在確認できている事実
+
+- `v0.1.1` / commit `c976174507a9c122b4b62a7059b96156e3ab4db2`がcurrent releaseである。
+- `07dab014cbeb05b545aebc31e111063b74af1f61`で`syncopadeConductor.jl`末尾へ`PROGRAM_FILE` guardを追加した。
+- `julia syncopadeConductor.jl`ではguardが真となり、従来どおり`main()`を呼ぶ。
+- `scripts/run_conductor.jl`は`syncopadeConductor.jl`をincludeするだけで、include後に`main()`を呼んでいない。
+- そのためwrapperはerrorを出さずexit code `0`で終了し、conductor listenerを作らない。
+- `test/unit_conductor_queue.jl`はinclude時にconductorを起動しない現在のcontractによって正常終了できる。
+- repositoryの`logs/conductor_events.csv`には先生の既存dirty差分がある。改定作業ではbyte単位で維持し、stageしない。
+
+## 修正境界
+
+### 変更対象
+
+- `scripts/run_conductor.jl`
+- `docs/TESTING.md`
+- conductor wrapperのprocess-level regression test
+- `Project.toml`（release Stepだけ）
+- このTodoの実施記録
+
+### 変更しない対象
+
+- `syncopadeConductor.jl`の`PROGRAM_FILE` guard
+- conductorのqueue、dispatch、retry、monitor、logging protocol
+- server/clientの受付・通信protocol
+- `v0.1.1` tagとその指示commit
+- `logs/conductor_events.csv`
+
+## 進行規則
+
+- Todo作成はStep 1 Phase 1とは扱わない。
+- B進行では先生の1回のStep指示に対してPhase 1→2→3→4を順番に実行し、Step完了後に停止する。
+- 一度に実行するのは1 Step、各Step内でも1 Phaseずつ順番を守る。
+- error、test failure、想定外のlistener、repository logへの追記があれば即停止する。
+- Stepの追加・分割・順序変更・完了条件変更が必要なら、作業を進めずTodo全体の見直しを先生へ提案する。
+- 各Step完了時は対象差分だけをcommit/pushし、`logs/conductor_events.csv`を除外する。
+- `v0.1.1` tagは移動・削除せず、release成功時だけannotated tag `v0.1.2`を新規作成する。
+
+---
+
+## Step 1: wrapper起動回帰を再現し、launcher contractを固定する — 完了
+
+### 目的
+
+修正前`v0.1.1`でwrapperが即時終了する経路を、直接実行とinclude実行の違いに対応づけて記録する。
+
+### 対象ファイル
+
+- `scripts/run_conductor.jl`（読取のみ）
+- `syncopadeConductor.jl`（読取のみ）
+- `syncopadeClient.jl`（bind IP解決の読取のみ）
+- このTodo
+
+### 完了条件
+
+- wrapperが`include`後に実行文を持たないことをsource上で確認する。
+- wrapper processが短時間でexit code `0`となり、期待portにlistenerを残さないことを再現する。
+- `syncopadeConductor.jl`直接実行では`PROGRAM_FILE` guardが真になることを確認する。
+- 正本contractを「本体includeは定義のみ、直接実行とwrapper実行は`main()`を1回呼ぶ」と固定する。
+- repository logに追記せず、processとlistenerをすべてcleanupする。
+
+### 検証方法
+
+1. `scripts/run_conductor.jl`と本体末尾のcall graphを照合する。
+2. `SYNCOPADE_NODE_PROFILE=lan100`, `SYNCOPADE_WIRED_PREFIX=192.168.100.`を指定する。
+3. `SYNCOPADE_CONDUCTOR_LOG`をrepository外の一時fileへ向ける。
+4. wrapperをchild processとして起動し、短時間で終了することと`192.168.100.30:9030`がlistenしないことを確認する。
+5. 実行前後で`logs/conductor_events.csv`のhashが一致することを確認する。
+
+### Phase 1: 実装方針をまとめる — 完了
+
+- Step 1ではproduction sourceを変更せず、`v0.1.1`のwrapper起動経路をそのまま観測する。
+- source上で`wrapper -> include(syncopadeConductor.jl) -> PROGRAM_FILE guard=false -> main未呼出し`の経路を固定する。
+- wrapperはchild processとして起動し、短時間でexit code `0`となることを回帰症状として記録する。
+- lan100 profileとrepository外の一時logを使用し、実network上の既存conductorとrepository logを分離する。
+- 起動前後に`192.168.100.30:9030`の空き、child process終了、repository log hashを確認する。
+- wrapperが想定外に継続、listener生成、stderr出力、repository log変更を起こした場合は停止する。
+
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
+
+#### Reproduction process
+
+- command: `julia --project=. scripts/run_conductor.jl`
+- environment:
+  - `SYNCOPADE_NODE_PROFILE=lan100`
+  - `SYNCOPADE_WIRED_PREFIX=192.168.100.`
+  - `SYNCOPADE_CONDUCTOR_LOG=<repository外の一時file>`
+- stdin: なし
+- expected pre-fix exit: 2秒以内、exit code `0`
+- expected stdout/stderr: ともに空
+- expected listener: `192.168.100.30:9030`を生成しない
+- expected temporary log: file自体を生成しない
+
+#### Contract判定
+
+- `scripts/run_conductor.jl`の実行中、include先の`PROGRAM_FILE`はwrapper pathであり、`syncopadeConductor.jl`の`@__FILE__`とは一致しない。
+- したがって本体guardは`main()`を呼ばず、wrapper側に明示callがない現状ではtop-level評価後に正常終了する。
+- 修正後contractは、本体includeでは起動せず、wrapper top-levelが`main()`を1回だけ所有することとする。
+
+#### 副作用境界
+
+- Step 1はsource、Git index、tag、remote refを変更しない。
+- process、stdout、stderr、temporary log、receiptはrepository外に置く。
+- repositoryの`logs/conductor_events.csv`は検証前後で同一hashを要求する。
+
+### Phase 3: 実装する — 完了（source変更なし）
+
+- Step 1は修正前evidenceの取得が目的なので、production/test sourceは変更していない。
+- `scripts/run_conductor.jl`へ暫定call、sleep、debug logなどを追加していない。
+- 変更はこのTodoのPhase 1–3記録だけである。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+- baseline: commit `c976174507a9c122b4b62a7059b96156e3ab4db2`, tag `v0.1.1`
+- result: `STEP1_RESULT=PASS_REPRODUCED_IMMEDIATE_EXIT`
+- wrapper exit: 2秒以内、exit code `0`
+- wrapper stdout/stderr: ともに0 byte
+- `192.168.100.30:9030` listener: 生成なし
+- temporary conductor log: 生成なし
+- repository log hash: 検証前後とも`a680168272507f4049158b3f6a8df4fad98993b5`
+- source確認: wrapperは本体include後に実行文を持たず、本体guardはinclude時に`main()`を呼ばない。
+- raw evidence: `/tmp/syncopade-conductor-wrapper-step1.CudKF7/`
+- receipt: `/tmp/syncopade-conductor-wrapper-step1.CudKF7/receipt.md`
+
+#### Step 1結論
+
+- `v0.1.1`の即時終了はerrorではなく、wrapperが`main()`のownershipを持たないために発生する正常終了である。
+- 修正後も本体include-safe contractを維持し、wrapperだけが明示的に`main()`を1回呼ぶ。
+
+---
+
+## Step 2: wrapperからconductorを明示起動する
+
+### 目的
+
+include-safeな本体を維持したまま、公式wrapperから`main()`を明示的に1回呼び、従来の起動動作を回復する。
+
+### 対象ファイル
+
+- `scripts/run_conductor.jl`
+- `docs/TESTING.md`
+- このTodo
+
+### 完了条件
+
+- wrapperが本体include直後に`main()`を1回だけ呼ぶ。
+- `syncopadeConductor.jl`のguardと`main()`本体は変更しない。
+- docsに直接実行、wrapper実行、include-onlyの3 contractを明記する。
+- wrapper processが期待portをlistenし、`LIST` requestへ有効なchecksum応答を返す。
+- 明示終了後にprocess、listener、temporary log writerが残らない。
+
+### 検証方法
+
+1. lan100環境とrepository外の一時logを指定してwrapperを起動する。
+2. child processが即時終了せず、`192.168.100.30:9030`をlistenすることを確認する。
+3. `query_conductor_nodes("192.168.100.30"; conductor_port=9030)`が有効な`NODES`応答を返すことを確認する。
+4. child processを明示終了し、exit状態とlistener消滅を確認する。
+5. standard unit testとrepository log hashを確認する。
+
+### Phase 1: 実装方針をまとめる — 未着手
+
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+
+### Phase 3: 実装する — 未着手
+
+### Phase 4: テストまたは検証を行う — 未着手
+
+---
+
+## Step 3: wrapper起動contractの自動回帰testを追加する
+
+### 目的
+
+wrapperが定義を読み込んで即時終了する回帰を、processとlistenerの両方で将来検出できるようにする。
+
+### 対象ファイル
+
+- 新規process-level integration test
+- 必要な場合のみtest用helper
+- `docs/TESTING.md`
+- このTodo
+
+### 完了条件
+
+- testがrepositoryのJulia executableとwrapper pathを明示してchild processを起動する。
+- test専用環境変数とrepository外の一時logを使用する。
+- process生存、expected listener、`LIST`応答を独立に検証する。
+- success、failureの両経路でchild processとlistenerをcleanupする。
+- stderr、exit状態、temporary log pathをevidenceとして残す。
+- test自身のincludeではnetwork接続やchild process起動を行わない。
+
+### 検証方法
+
+1. integration testをincludeし、副作用がないことを確認する。
+2. lan100でintegration testを直接実行する。
+3. wrapperが起動しないnegative fixtureまたは同等の局所検証で、testが回帰を検出できることを確認する。
+4. success時に`LIST`応答、cleanup後のport解放、repository log hash一致を確認する。
+
+### Phase 1: 実装方針をまとめる — 未着手
+
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+
+### Phase 3: 実装する — 未着手
+
+### Phase 4: テストまたは検証を行う — 未着手
+
+---
+
+## Step 4: release前の回帰検証を行う
+
+### 目的
+
+wrapper修正がinclude-safe testability、conductor既存機能、server admission stateを壊していないことをrelease前に確認する。
+
+### 対象ファイル
+
+- `test/runtests.jl`
+- `test/unit_client_protocol.jl`
+- `test/unit_conductor_queue.jl`
+- `test/unit_server_admission_state.jl`
+- Step 3で追加したintegration test
+- このTodo
+
+### 完了条件
+
+- conductor include checkが短時間で終了し、listenerを作らない。
+- Client Protocol testが全件passする。
+- Conductor Queue testが全件passする。
+- Server Admission State testが全件passする。
+- wrapper process integrationがpassする。
+- stderrが空で、全process・listenerがcleanupされる。
+- repository log hashが検証前後で一致する。
+
+### 検証方法
+
+1. `julia --project=. --threads=4 test/runtests.jl`を実行する。
+2. `julia --project=. --threads=4 test/unit_server_admission_state.jl`を実行する。
+3. Step 3のwrapper integration testを再実行する。
+4. Git差分、stderr、process、port、log hashを照合する。
+
+### Phase 1: 実装方針をまとめる — 未着手
+
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+
+### Phase 3: 実装する — 未着手
+
+### Phase 4: テストまたは検証を行う — 未着手
+
+---
+
+## Step 5: patch release `v0.1.2`を作成する
+
+### 目的
+
+wrapper起動回帰を修正した検証済みcommitを、既存tagを変更せず新しいpatch releaseとして固定する。
+
+### 対象ファイル
+
+- `Project.toml`
+- このTodo
+- Git commit / annotated tag / remote refs
+
+### 完了条件
+
+- `Project.toml`のversionが`0.1.2`となる。
+- release前検証がversion変更後にもpassする。
+- release commitがremote `master`へpushされる。
+- annotated tag `v0.1.2`がrelease commitを指す。
+- local/remote master、tag、peeled tag targetが一致する。
+- `v0.1.1`は元のcommitを指したまま変化しない。
+- `logs/conductor_events.csv`はstageもcommitもしない。
+
+### 検証方法
+
+1. `Pkg.project().version == v"0.1.2"`を確認する。
+2. Step 4の標準unitとwrapper integrationを再実行する。
+3. intended pathだけをstageし、cached diffとtest receiptを照合する。
+4. release commitをpushする。
+5. annotated tag `v0.1.2`を作成・pushし、`git ls-remote`とpeeled targetを照合する。
+6. `v0.1.1`のlocal/remote targetが変更されていないことを確認する。
+
+### Phase 1: 実装方針をまとめる — 未着手
+
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+
+### Phase 3: 実装する — 未着手
+
+### Phase 4: テストまたは検証を行う — 未着手
