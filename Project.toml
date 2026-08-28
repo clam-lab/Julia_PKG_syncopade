@@ -1,6 +1,6 @@
 name = "Syncopade"
 uuid = "bb3c44b9-9aed-4a53-8423-3fcd43ed07da"
-version = "0.1.1"
+version = "0.1.2"
 
 [deps]
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"

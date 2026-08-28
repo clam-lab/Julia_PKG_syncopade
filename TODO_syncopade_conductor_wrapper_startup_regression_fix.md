@@ -610,7 +610,7 @@ wrapper修正はinclude-safe contract、既存protocol/queue、server admission 
 
 ---
 
-## Step 5: patch release `v0.1.2`を作成する
+## Step 5: patch release `v0.1.2`を作成する — 完了
 
 ### 目的
 
@@ -641,10 +641,82 @@ wrapper起動回帰を修正した検証済みcommitを、既存tagを変更せ�
 5. annotated tag `v0.1.2`を作成・pushし、`git ls-remote`とpeeled targetを照合する。
 6. `v0.1.1`のlocal/remote targetが変更されていないことを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- semantic versioning上のpatch releaseとして`0.1.1`から`0.1.2`へ更新する。
+- release source変更は`Project.toml`のversion 1行だけとし、wrapper/testの追加変更を混ぜない。
+- version変更後にStep 4と同じinclude、standard unit、server admission、wrapper integrationを全て再実行する。
+- standard unitのconductor logはrepository外artifact directoryへ明示的にredirectする。
+- 検証済みrelease commitをremote `master`へpushしてからannotated tag `v0.1.2`を作成・pushする。
+- 既存annotated tag `v0.1.1`とtarget commit `c976174507a9c122b4b62a7059b96156e3ab4db2`は変更しない。
+- `logs/conductor_events.csv`は先生の既存差分として保持し、stage・commit・復元を行わない。
+- version test、回帰test、Git refs、log identityのいずれかが不一致ならrelease操作を停止する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Version contract
+
+- input: `Project.toml`の`version = "0.1.1"`
+- output: `Project.toml`の`version = "0.1.2"`
+- validation: `Pkg.project().version == v"0.1.2"`
+- source side effect: 上記1行だけ
+
+#### Release regression contract
+
+- command sequenceはStep 4の4 commandとversion check、port pre/postflightで構成する。
+- standard unitへ`SYNCOPADE_CONDUCTOR_LOG=<artifact directory>/unit_conductor.csv`を渡す。
+- expected: Client Protocol `8/8`、Conductor Queue `17/17`、Server Admission State `13/13`、wrapper regression PASS。
+- expected: 全top-level stderr 0 byte、wrapper runtime stderr 0 byte、終了後9030 bind可能。
+- expected: repository log content SHA-1 `528443adeeff16bfcd482c552458584d7a080e99`、Git blob ID `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`、`4 additions / 0 deletions`が不変。
+
+#### Git release contract
+
+- release commit input: `Project.toml`とこのTodoだけをstageする。
+- branch output: local `HEAD == refs/remotes/origin/master`。
+- tag input: release commitとmessage `Syncopade v0.1.2 conductor wrapper startup fix`。
+- tag output: local/remote `v0.1.2`はannotated tagで、peeled targetがrelease commitと一致する。
+- immutable reference: local/remote `v0.1.1^{}`は`c976174507a9c122b4b62a7059b96156e3ab4db2`のまま。
+- forbidden side effect: `v0.1.1`の付け替え、`v0.1.2`のforce更新、repository logのstage/commit。
+
+### Phase 3: 実装する — 完了
+
+- `Project.toml`のversionを`0.1.1`から`0.1.2`へ更新した。
+- package name、UUID、dependency、source、test、scriptは変更していない。
+- annotated tagはPhase 4のrelease regressionとrelease commit/pushが成功するまで作成しない。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### Release candidate検証
+
+- result: `STEP5_RESULT=PASS_RELEASE_CANDIDATE`
+- version: `PROJECT_VERSION_OK=0.1.2`
+- port preflight: `STEP5_PORT_PREFLIGHT_OK`
+- conductor include: `CONDUCTOR_INCLUDE_OK`
+- Client Protocol: `8 / 8 pass`
+- Conductor Queue: `17 / 17 pass`
+- Server Admission State: `13 / 13 pass`
+- wrapper integration: `STEP3_RESULT=PASS_WRAPPER_ENTRYPOINT_REGRESSION`
+- wrapper `LIST` payload: `NODES|`
+- wrapper positive runtime stderr: 0 byte
+- wrapper negative fixture: exit code `0`, `termsignal=0`
+- top-level command stderr: 全7 fileが0 byte
+- cleanup後9030 listener: なし
+- repository log content SHA-1: `528443adeeff16bfcd482c552458584d7a080e99`のまま
+- repository log Git blob ID: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`のまま
+- repository log差分: `4 additions / 0 deletions`のまま
+- `v0.1.1` peeled target: `c976174507a9c122b4b62a7059b96156e3ab4db2`のまま
+- 検証時点でlocal/remote `v0.1.2`は未作成
+- artifact directory: `/tmp/syncopade-conductor-wrapper-step5-release.lsk9AK/`
+- receipt: `/tmp/syncopade-conductor-wrapper-step5-release.lsk9AK/receipt.md`
+
+#### Release refs検証
+
+- release commitは`Project.toml`とこのTodoだけを含む。
+- local/remote `master`はrelease commitで一致する。
+- local/remote `v0.1.2`はannotated tagで、peeled targetはrelease commitと一致する。
+- local/remote `v0.1.1`のpeeled targetは`c976174507a9c122b4b62a7059b96156e3ab4db2`のまま維持する。
+- 実際のrelease commit、tag object、remote refsはrepository外receiptへ記録する。
+
+#### Step 5結論
+
+`0.1.2`はconductor wrapper startup回帰だけを含むpatch releaseである。release candidateのversion、既存unit、wrapper process/protocol contract、cleanup、repository log不変を確認し、検証済みrelease commitへannotated tagを固定する。
