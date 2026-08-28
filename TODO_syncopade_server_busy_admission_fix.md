@@ -591,7 +591,7 @@ job lifecycleの正常終端と受付解放が対応することを確認する�
 
 ---
 
-## Step 5: job異常終了後にも受付を解放できることを確認する
+## Step 5: job異常終了後にも受付を解放できることを確認する — 完了
 
 ### 目的
 
@@ -622,10 +622,148 @@ job実行が例外終了した場合にもserverが`busy`へ残留せず、
 5. server/client stderrとcallback欠落がないことを確認する。
 6. Step 1/2のstandalone testとStep 3/4/5のmanual integration testを再実行する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- Step 5専用のintegration testを追加し、Step 3/4の通信helperと正常job fixtureを再利用する。
+- 例外終了job Dを一定時間`busy`に保つため、既存fixture moduleへ明示的に例外を送出する最小関数だけを追加する。
+- D実行中に正常job Rを投入し、raw応答`ERROR|BUSY`とcallback不在を確認する。
+- Dの`RESULT ERROR` callback受信後に`STATUS|idle`を確認し、その後の正常job Eの受付と`RESULT OK`を確認する。
+- concurrency evidenceはfixture moduleの既存counterを共有し、DとEの各entryでactive job数が1、観測最大値が1であることを確認する。
+- 現在のserverはjob taskの`finally`で`release_server!()`を呼び、callback失敗とDONE通知失敗も関数内で捕捉するため、Phase 1時点ではproduction source変更を予定しない。
+- Step 5でproduction source変更の必要が判明した場合は、その場で停止してTodo全体の見直しを先生へ提案する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### 例外fixture
+
+- file: `test/fixtures/server_busy_probe.jl`
+- function: `failing_probe(label::String, sleep_seconds::String)::String`
+- 入力検証は既存`busy_probe`と同じく、`label`の`,`/`=`を禁止し、sleepは有限かつ正値を要求する。
+- module共有counterをlock下でincrementし、`active_at_entry`、`max_active`、`started_ns`を記録する。
+- 指定時間sleep後、`intentional failure: `に続く既存probe形式のevidenceを含む`ErrorException`を必ず送出する。
+- `finally`でactive countをdecrementし、負値にならないことを検査する。
+- 戻り値型はserver呼出しinterfaceに合わせて`String`とするが、正常returnはしない。
+
+#### Error recovery integration harness
+
+- file: `test/integration_server_error_recovery.jl`
+- Step 3/4 harnessをincludeし、通信、callback、status、正常payload解析helperを再利用する。
+- entrypoint名は`error_recovery_main`とし、`PROGRAM_FILE` guardによりincludeだけではnetwork接続しない。
+- CLI入力:
+  1. server IP（default `192.168.100.30`）
+  2. server port（default `8030`）
+  3. job D callback port（default `9151`）
+  4. rejected job R callback port（default `9152`）
+  5. job E callback port（default `9153`）
+  6. job sleep seconds（default `3.0`）
+  7. timeout seconds（default `15.0`）
+- callback IPは`preferred_local_ip()`で取得し、server IPと一致しなければ投入前に停止する。
+- D/R/Eのlistenerを投入前にbindし、3 portの重複を禁止する。
+- Dは`failing_probe`、R/Eは既存`busy_probe`を呼ぶ。
+- D受付後に`STATUS|busy`を確認し、Rをraw投入して応答が厳密に`ERROR|BUSY`であることを要求する。
+- D callbackは受付時job IDとの一致、`RESULT ERROR`、error type `RUNTIME_ERROR`、構造化されたD evidenceを要求する。
+- R listenerは拒否後`job sleep + 1 s`以上保持し、callbackがないことを確認して明示closeする。
+- D終端後に`STATUS|idle`を確認してからEを投入し、job ID一致、`RESULT OK`、正常payloadを要求する。
+- D/Eのevidenceはともに`label`一致、`active_at_entry=1`、`max_active=1`、正の実行区間を要求する。
+- 最後に`STATUS|idle`と全callback taskの終了を確認し、全listenerを`finally`でもcloseする。
+
+#### Phase 4 process構成
+
+- server mount root: repositoryの`test/fixtures`
+- server environment: `SYNCOPADE_NODE_PROFILE=lan100`, `SYNCOPADE_WIRED_PREFIX=192.168.100.`
+- conductorは起動しない。
+- 1本のserver processに対してStep 3/4 harnessを先に再実行し、その後Step 5 harnessを実行する。
+- server/client stdout・stderrとreceiptはrepository外の一時directoryへ保存する。
+- `8030`, `9141`–`9143`, `9151`–`9153`は起動前に空きを確認し、終了後にlistener消滅を確認する。
+
+### Phase 3: 実装する — 完了
+
+- `test/fixtures/server_busy_probe.jl`へ`failing_probe`を追加した。
+- `failing_probe`は既存module counterを共有し、sleep後にconcurrency evidenceを含む意図的な例外を送出し、`finally`でactive countを戻す。
+- `test/integration_server_error_recovery.jl`を追加した。
+- harnessはDのERROR、実行中RのBUSY拒否とcallback不在、D後のidle、Eの正常受付、D/Eの排他evidence、最終idleを検証する。
+- 再開時にfailure evidenceを`String`へ明示変換し、既存`parse_probe_payload(::String)`との型境界を揃えた。
+- `syncopadeServer.jl`、client、conductor、Step 3/4 harnessは変更していない。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 完了したprecheck
+
+- server include check: `STEP1_SERVER_INCLUDE_OK`
+- admission state unit test: `13 / 13 pass`
+- local lan100 IP: `192.168.100.30`
+- 起動前port check: `8030`, `9141`–`9143`, `9151`–`9153`は空き。
+- serverは`192.168.100.30:8030`へ正常bindした。
+
+#### 停止理由
+
+- Step 3/4回帰harness起動時にlan100用環境変数を渡さなかったため、`preferred_local_ip()`が`192.168.12.2`を選択した。
+- harnessは投入前guardで`callback IP 192.168.12.2 does not match server IP 192.168.100.30`を検出し、jobを1件も投入せず停止した。
+- これはStep 5 sourceのtest failureではなく、harness processの起動条件ミスである。
+- B進行のerror停止規則に従い、環境変数を補正した再実行には進んでいない。
+- serverは正常終了させ、終了後port checkで`8030`, `9141`–`9143`, `9151`–`9153`がすべて解放済みであることを確認した。
+- repositoryの`logs/conductor_events.csv`にはStep 5由来の追記を行っていない。
+- raw logs: `/tmp/syncopade-step5-error-recovery.SA697K/`
+
+#### 再開条件
+
+- Step 3/4およびStep 5 harness processにも`SYNCOPADE_NODE_PROFILE=lan100`, `SYNCOPADE_WIRED_PREFIX=192.168.100.`を渡し、Phase 4を先頭から再実行する。
+
+#### 再開試行1
+
+- server、Step 3/4 harness、Step 5 harnessの全processへlan100環境変数を渡した。
+- server include check: `STEP1_SERVER_INCLUDE_OK`
+- admission state unit test: `13 / 13 pass`
+- Step 3 regression: `STEP3_RESULT=PASS_BUSY_REJECTED`
+- Step 4 regression: `STEP4_RESULT=PASS_NORMAL_RECOVERY`
+- Step 3/4 server/harness stderr: 空
+- Step 5ではjob DのERROR callback受信後、evidence解析で停止した。
+- error: `MethodError: no method matching parse_probe_payload(::SubString{String})`
+- 原因: `parse_failure_payload`がprefix除去後の`SubString{String}`を、`String`限定の既存helperへそのまま渡している。
+- 最小修正案: `parse_probe_payload(String(evidence))`として型を明示的に揃える。
+- B進行のtest failure停止規則に従い、修正と再実行には進んでいない。
+- serverはexit code `0`で終了した。
+- cleanup後の`8030`, `9141`–`9143`, `9151`–`9153`: listenerなし。
+- raw logs: `/tmp/syncopade-step5-error-recovery-resume.5oGnzK/`
+
+#### 再開試行1後の再開条件
+
+- Phase 3へ戻り、`parse_failure_payload`の型変換を上記最小差分で修正する。
+- harness include checkと差分check後、Phase 4をprecheckから再実行する。
+
+#### 再開試行2・最終検証
+
+- failure parser check: `STEP5_FAILURE_PARSER_OK`
+- server include check: `STEP1_SERVER_INCLUDE_OK`
+- admission state unit test: `13 / 13 pass`
+- 起動前port check: `8030`, `9141`–`9143`, `9151`–`9153`は空き。
+- server endpoint: `192.168.100.30:8030`
+- callback IP: `192.168.100.30`
+- conductor: 未起動
+- Step 3 regression: `STEP3_RESULT=PASS_BUSY_REJECTED`
+- Step 4 regression: `STEP4_RESULT=PASS_NORMAL_RECOVERY`
+- job A ID: `5d9dec58-71ef-4d9a-af27-1c09960306f9`
+- job B response: `ERROR|BUSY`、callback観測なし。
+- job C ID: `76091539-18e1-4250-8d2d-6ab3f784bcb1`
+- A/Cの`active_at_entry=1`, `max_active=1`、interval overlap=`false`。
+- Step 5 result: `STEP5_RESULT=PASS_ERROR_RECOVERY`
+- job D ID: `1bfbbdd8-d358-42a9-8fc8-5ca773b2926f`
+- job D callback: `RUNTIME_ERROR|intentional failure`、受付job IDと一致。
+- job R response: `ERROR|BUSY`、callback観測なし。
+- job D終端後status: `STATUS|idle`
+- job E ID: `0d5f71d3-82b9-41b1-bd39-253404af7efb`
+- D/Eの`active_at_entry=1`, `max_active=1`、interval overlap=`false`。
+- 最終status: `STATUS|idle`
+- server、Step 3/4 harness、Step 5 harness stderr: すべて空。
+- server exit code: `0`
+- cleanup後の`8030`, `9141`–`9143`, `9151`–`9153`: listenerなし。
+- repositoryの`logs/conductor_events.csv`: 既存4行dirtyのまま、Step 5由来の追記なし。
+- raw logs: `/tmp/syncopade-step5-error-recovery-final.padWZs/`
+- receipt: `/tmp/syncopade-step5-error-recovery-final.padWZs/receipt.md`
+
+#### Step 5結論
+
+- 異常終了job Dの実行中は別job Rを受理せず、job IDもcallbackも発生させなかった。
+- DのERROR callback後にserverはidleへ復帰し、正常job Eを新規受理できた。
+- error経路と回復後の正常経路はいずれもactive job数1を維持した。
+- Step 5の完了条件をすべて満たした。
