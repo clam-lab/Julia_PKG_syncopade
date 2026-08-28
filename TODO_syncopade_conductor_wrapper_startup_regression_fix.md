@@ -266,7 +266,7 @@ include-safeな本体を維持したまま、公式wrapperから`main()`を明�
 
 ---
 
-## Step 3: wrapper起動contractの自動回帰testを追加する
+## Step 3: wrapper起動contractの自動回帰testを追加する — 完了
 
 ### 目的
 
@@ -295,13 +295,119 @@ wrapperが定義を読み込んで即時終了する回帰を、processとlisten
 3. wrapperが起動しないnegative fixtureまたは同等の局所検証で、testが回帰を検出できることを確認する。
 4. success時に`LIST`応答、cleanup後のport解放、repository log hash一致を確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- 新規`test/integration_conductor_wrapper_entrypoint.jl`へprocess-level検証を実装する。
+- test file自体は`PROGRAM_FILE` guardを持ち、include時にchild processやlistenerを生成しない。
+- `Base.julia_cmd()`、`addenv`、`run(...; wait=false)`でrepository wrapperをchild起動する。
+- readinessはchild生存、9030 listener、checksum検証済み`LIST`応答の3条件で判定する。
+- stdout/stderr、conductor log、negative fixtureは`mktempdir()`配下だけへ作成する。
+- positive caseは修正済みwrapper、negative caseは本体をincludeするだけの一時scriptを使う。
+- negative caseがexit code `0`かつlistenerなしとなることで、testが旧wrapper回帰を識別できることを確認する。
+- 全process handle、file handle、listenerを`finally`でcleanupし、repository log bytesの前後一致を要求する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Test entrypoint
+
+- file: `test/integration_conductor_wrapper_entrypoint.jl`
+- function: `wrapper_entrypoint_main(args::Vector{String}=ARGS)::Nothing`
+- CLI入力:
+  1. conductor IP（default `192.168.100.30`）
+  2. conductor port（default `9030`）
+  3. readiness/exit timeout seconds（default `5.0`）
+- callbackやjob投入は行わず、`LIST` control requestだけを使用する。
+
+#### Child launch helper
+
+- input: script path、endpoint、timeout、case label、temporary directory
+- command: `Base.julia_cmd()`へrepository projectとscript pathを渡す。
+- environment: lan100 profile、wired prefix、case専用temporary conductor log
+- output: process handle、stdout path、stderr path、log path
+- runtime stderrはpositive readiness確定前に0 byteを要求する。
+
+#### Positive判定
+
+- timeout内に`query_conductor_nodes`がchecksum検証済み`NODES` payloadを返す。
+- response後もchildが生存している。
+- temporary logに`CONDUCTOR_START`が記録される。
+- cleanupはまず`SIGTERM`を使用し、bounded wait内に終了しなければ`SIGKILL`へ昇格する。
+- 最終`termsignal`はfallback未使用時`15`、使用時`9`を要求し、process終了とport解放を必須とする。
+- SIGTERM後のJulia signal traceはruntime errorとは分離してevidenceへ残す。
+
+#### Negative判定
+
+- 一時scriptは`syncopadeConductor.jl`をincludeするだけで`main()`を呼ばない。
+- timeout内にexit code `0`, `termsignal == 0`で終了する。
+- stdout/stderr、temporary conductor logを生成せず、portを占有しない。
+
+#### Cleanupと副作用
+
+- signal送信後はbounded waitを使用し、例外時も生存childへ`SIGKILL`を送る。
+- wait結果にかかわらず全IOを`finally`でcloseする。
+- 起動前と全case終了後にportを一度bindして解放済みを確認する。
+- repository logはbyte列をtest開始前後で比較する。
+- test artifactsはrepository外の`mktempdir(cleanup=false)`へ残し、pathをstdoutへ出す。
+
+### Phase 3: 実装する — 完了
+
+- `test/integration_conductor_wrapper_entrypoint.jl`を追加した。
+- positive caseはrepository wrapperをchild起動し、生存、`LIST`応答、runtime stderr、temporary logを検証する。
+- negative caseは本体includeだけの一時scriptを生成し、exit code `0`、listenerなしを検証する。
+- success cleanupは`SIGTERM`、failure cleanupは`SIGKILL`を使用し、いずれもwaitとIO closeを行う。
+- repository logはtest開始前後のbyte列一致を要求する。
+- test entrypointへ`PROGRAM_FILE` guardを付け、include時の副作用を抑止した。
+- 再開時にchild terminationをbounded waitへ変更し、SIGTERM timeout時のSIGKILL fallbackを追加した。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 確認できた事実
+
+- harness include check: `STEP3_HARNESS_INCLUDE_OK`
+- artifact directory: `/var/folders/__/7pnh5g_x5qb2r25n4tgyyhww0000gn/T/syncopade-wrapper-entrypoint-HfZySQ`
+- positive wrapperは`192.168.100.30:9030`をlistenし、一時logへ`CONDUCTOR_START`を記録した。
+- repository log hashは`a680168272507f4049158b3f6a8df4fad98993b5`のまま維持された。
+
+#### 停止理由
+
+- harnessがpositive childへ`SIGTERM`を送信した後、childはsignal 15 traceをstderrへ出したが終了しなかった。
+- `terminate_child!`の無期限`wait(process)`がreturnせず、test全体が30秒を超えて停止した。
+- wrapper起動contractではなく、harnessのchild terminationを無期限waitにした設計errorである。
+- C進行のerror停止規則に従い、bounded waitとSIGKILL fallbackへの修正再試行には進んでいない。
+
+#### Cleanup
+
+- test shell、harness、positive childを同一process group `8586`として`SIGKILL`で終了した。
+- cleanup後の`192.168.100.30:9030`: listenerなし。
+- repository log: 追記なし。
+- Step 3差分: 未commit、未push。
+- failure receipt: `/tmp/syncopade-conductor-wrapper-step3-failure-receipt.md`
+
+#### 再開条件
+
+- `terminate_child!`を「指定signal送信→bounded wait→timeout時SIGKILL→bounded wait」へ変更する。
+- positive通常cleanupでもprocess終了を時間制限付きで保証し、Phase 4をpreflightから再実行する。
+
+#### 再開試行・最終検証
+
+- harness re-include: `STEP3_HARNESS_REINCLUDE_OK`
+- result: `STEP3_RESULT=PASS_WRAPPER_ENTRYPOINT_REGRESSION`
+- positive `LIST` payload: `NODES|`
+- positive runtime stderr: 0 byte
+- positive termination: `SIGTERM`, `termsignal=15`, SIGKILL fallback=`false`
+- negative fixture: exit code `0`, `termsignal=0`
+- negative stdout/stderr: 0 byte
+- negative temporary conductor log: 生成なし
+- final 9030 listener: なし
+- repository log: byte列一致
+- artifact directory: `/var/folders/__/7pnh5g_x5qb2r25n4tgyyhww0000gn/T/syncopade-wrapper-entrypoint-s9gmKH`
+- receipt: `/var/folders/__/7pnh5g_x5qb2r25n4tgyyhww0000gn/T/syncopade-wrapper-entrypoint-s9gmKH/receipt.md`
+
+#### Step 3結論
+
+- 修正済みwrapperはprocess生存、listener、protocolの3条件を満たす。
+- include-only negative fixtureは旧wrapperと同じ即時正常終了を示し、testが回帰を区別できる。
+- success/failure cleanupは時間制限付きとなり、test自身が無期限停止しない。
 
 ---
 
