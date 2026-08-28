@@ -302,7 +302,7 @@ include-safeなserver本体を維持したまま、公式wrapper直接実行時�
 
 ---
 
-## Step 4: conductorとserverの両wrapperを使ったrelease前回帰を行う
+## Step 4: conductorとserverの両wrapperを使ったrelease前回帰を行う — 完了
 
 ### 目的
 
@@ -326,13 +326,126 @@ unitだけでなく実wrapper 2本を同時起動し、serverがconductorへ`idl
 3. 両wrapperを同時起動し、`LIST`応答を検証する。
 4. 8030/9030、process、log identity、Git差分を照合する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- Step 4はrelease candidateの検証専用とし、production/test sourceを変更しない。
+- conductor include、standard unit、server admission unit、conductor wrapper test、server wrapper testを直列実行する。
+- standard unitのconductor logはrepository外へredirectする。
+- 最後にrepository外joint runnerでconductor/server両wrapperを同時起動する。
+- joint runnerはserverを`q`で正常終了し、conductorをbounded signal cleanupする。
+- `LIST` payload、全top-level stderr、exit status、8030/9030解放、repository log不変を完了条件とする。
+- command error、件数不一致、unexpected stderr、listener/process残留、log変更で即停止する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Regression command sequence
+
+1. conductor/server本体のinclude-only check。
+2. `SYNCOPADE_CONDUCTOR_LOG=<artifact>/unit_conductor.csv julia --project=. --threads=4 test/runtests.jl`。
+3. `julia --project=. --threads=4 test/unit_server_admission_state.jl`。
+4. `julia --project=. test/integration_conductor_wrapper_entrypoint.jl 192.168.100.30 9030 5.0`。
+5. `julia --project=. test/integration_server_wrapper_entrypoint.jl 192.168.100.30 8030 5.0`。
+6. repository外joint runnerで両wrapperを同時起動する。
+
+#### Expected results
+
+- Client Protocol: `8 / 8 pass`。
+- Conductor Queue: `17 / 17 pass`。
+- Server Admission State: `13 / 13 pass`。
+- conductor wrapper: `PASS_WRAPPER_ENTRYPOINT_REGRESSION`。
+- server wrapper: `PASS_SERVER_WRAPPER_ENTRYPOINT_REGRESSION`。
+- joint result: `PASS_CONDUCTOR_SERVER_WRAPPERS`。
+- joint `LIST` payloadは`192.168.100.30:8030`を含む。
+- joint server exit code/signal: `0 / 0`。
+- joint conductor termination: `SIGTERM`またはbounded `SIGKILL` fallback。
+- 各wrapperの停止前runtime stderr: 0 byte。
+- 全top-level command stderr: 0 byte。
+
+#### Environmentと副作用
+
+- profileは`lan100`、wired prefixは`192.168.100.`。
+- conductor log、stdout、stderr、joint runner、receiptはrepository外artifact directoryへ置く。
+- command前後に8030/9030をbind可能とする。
+- repository logはcontent SHA-1、Git blob ID、byte列を開始前後で一致させる。
+
+### Phase 3: 実装する — 完了（repository source変更なし）
+
+- production/test sourceは変更していない。
+- repository外`/tmp/syncopade-server-wrapper-step4.Mrr5X1/joint_wrapper_runner.jl`を作成した。
+- joint runnerはconductor wrapperを起動し、protocol readinessを確認後にserver wrapperを起動する。
+- serverの`STATUS|idle`とconductor `LIST`内の`192.168.100.30:8030`を要求する。
+- serverは`q`で正常終了し、conductorはbounded `SIGTERM`/`SIGKILL`でcleanupする。
+- 停止前runtime stderr、exit/signal、8030/9030、repository log byte列を検証する。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### Passした回帰
+
+- conductor/server include-only: `CONDUCTOR_INCLUDE_OK` / `SERVER_INCLUDE_OK`。
+- Client Protocol: `8 / 8 pass`。
+- Conductor Queue: `17 / 17 pass`。
+- Server Admission State: `13 / 13 pass`。
+- conductor wrapper: `STEP3_RESULT=PASS_WRAPPER_ENTRYPOINT_REGRESSION`。
+- server wrapper: `STEP3_RESULT=PASS_SERVER_WRAPPER_ENTRYPOINT_REGRESSION`。
+- 上記top-level stderr: 全て0 byte。
+- standard unit log: repository外へ生成。
+- repository log identityと`4 additions / 0 deletions`: 不変。
+
+#### Joint runnerで確認できた事実
+
+- conductor wrapperは`192.168.100.30:9030`で継続起動した。
+- server wrapperは`192.168.100.30:8030`で継続起動した。
+- conductor stdoutは`Chopper 192.168.100.30:8030 => down`から`idle`への遷移を表示した。
+- `LIST` payloadは`192.168.100.30:8030`を含んだ。
+- 両wrapperの停止前runtime stderrは0 byteだった。
+- serverは`q`でexit code `0`、signal `0`となった。
+- conductorはbounded `SIGTERM` cleanupで終了した。
+- cleanup後8030/9030 listener、Syncopade process: なし。
+
+#### 停止理由
+
+- joint runnerがtemporary conductor logへ`NODE_STATE_CHANGED`が記録されることを追加で要求した。
+- temporary logには`CONDUCTOR_START`だけがあり、`NODE_STATE_CHANGED`はなかった。
+- stdoutの`idle`表示とchecksum検証済み`LIST` entryによりnode認識contractは成立している。
+- temporary logへのnode transition記録はこのStepの完了条件・Phase 2仕様には含めておらず、joint runnerの過剰assertである。
+- runnerは`ERROR: conductor log lacks node state change`でexit code `1`となった。
+- C進行のerror停止規則により、過剰assert削除後の再実行には進んでいない。
+
+#### 再開条件
+
+- repository外joint runnerから`NODE_STATE_CHANGED` temporary log assertだけを削除する。
+- `CONDUCTOR_START`、stdout `idle`、`LIST` endpoint、runtime stderr、exit/cleanup、repository log不変を維持する。
+- Phase 4をport preflightから全command再実行する。
+- artifact: `/tmp/syncopade-server-wrapper-step4.Mrr5X1/`。
+- failure receipt: `/tmp/syncopade-server-wrapper-step4.Mrr5X1/failure_receipt.md`。
+
+#### 再開試行・最終検証
+
+- joint runnerのtemporary log確認を仕様どおり`CONDUCTOR_START`へ修正した。
+- result: `STEP4_RESULT=PASS_SERVER_WRAPPER_RELEASE_REGRESSION`。
+- include-only: conductor/serverともPASS。
+- Client Protocol: `8 / 8 pass`。
+- Conductor Queue: `17 / 17 pass`。
+- Server Admission State: `13 / 13 pass`。
+- conductor wrapper regression: PASS。
+- server wrapper regression: PASS。
+- joint result: `JOINT_RESULT=PASS_CONDUCTOR_SERVER_WRAPPERS`。
+- initial LIST: `NODES|`。
+- server status: `STATUS|idle`。
+- final LIST: `NODES|192.168.100.30:8030`。
+- joint server exit: code `0`、signal `0`。
+- joint conductor termination: `SIGTERM`、SIGKILL fallback=`false`。
+- conductor/server停止前runtime stderr: `0 / 0 byte`。
+- top-level stderr: 全9 fileが0 byte。
+- cleanup: `STEP4_RESUME_CLEANUP_PORTS_FREE`、process残留なし。
+- repository log content SHA-1: `528443adeeff16bfcd482c552458584d7a080e99`のまま。
+- repository log Git blob ID: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`のまま。
+- repository log差分: `4 additions / 0 deletions`のまま。
+- success receipt: `/tmp/syncopade-server-wrapper-step4.Mrr5X1/success_receipt.md`。
+
+### Step 4結論
+
+修正済みserver wrapperは単体だけでなく、実conductor wrapperとの同時起動でも`idle` nodeとして認識される。checksum検証済み`LIST`にserver endpointが現れ、正常終了、bounded cleanup、port解放、repository log不変までrelease前条件を満たした。
 
 ---
 
