@@ -429,7 +429,7 @@ stdoutが0 byteでもprocess、protocol、temporary log、runtime stderrの正�
 
 ---
 
-## Step 4: release前の回帰検証を行う
+## Step 4: release前の回帰検証を行う — 完了
 
 ### 目的
 
@@ -503,7 +503,7 @@ wrapper修正がinclude-safe testability、conductor既存機能、server admiss
 - temporary runner、debug print、repository log redirectをrepository内へ追加していない。
 - 変更はこのTodoのPhase 1–3記録だけである。
 
-### Phase 4: テストまたは検証を行う — 停止（unit testの既定log出力）
+### Phase 4: テストまたは検証を行う — 完了
 
 #### Passした検証
 
@@ -528,7 +528,8 @@ wrapper修正がinclude-safe testability、conductor既存機能、server admiss
 
 - 今回の21:52:24由来5行に加え、以前のrelease前testが21:25:55に残した5行も灯子由来と特定して除去した。
 - 先生の既存4行だけを残し、repository logは`4 additions / 0 deletions`へ復元した。
-- 復元後repository log hash: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`
+- 復元後repository log Git blob ID: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`
+- 復元後repository log content SHA-1: `528443adeeff16bfcd482c552458584d7a080e99`
 - process残留: なし
 - cleanup後9030 listener: なし
 - Step 4差分: 未commit、未push。
@@ -538,7 +539,7 @@ wrapper修正がinclude-safe testability、conductor既存機能、server admiss
 #### 再開条件
 
 - standard unit commandにも`SYNCOPADE_CONDUCTOR_LOG=<Step 4 artifact directory>/unit_conductor.csv`を指定する。
-- repository log baselineを復元後hash`b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`として固定する。
+- repository log baselineを復元後Git blob ID `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`、content SHA-1 `528443adeeff16bfcd482c552458584d7a080e99`として固定する。
 - Phase 4をport preflightから再実行し、unit用temporary log生成とrepository log不変を確認する。
 
 #### 再開試行1
@@ -548,7 +549,7 @@ wrapper修正がinclude-safe testability、conductor既存機能、server admiss
 - Conductor Queue: `17 / 17 pass`
 - Server Admission State: `13 / 13 pass`
 - unit用temporary log: headerと5 eventを記録
-- repository log hash: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`のまま
+- repository log Git blob ID: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`のまま
 - wrapper positive caseは`LIST`応答とtemporary `CONDUCTOR_START`まで成功した。
 - wrapper testは終了後stdoutからlistener messageを探したが、redirect bufferがflushされずstdoutが0 byteだったため`@test` failureとなった。
 - listenerとprotocolの成立は既に直接確認できており、stdout文字列は起動contractの必須条件ではない。
@@ -563,6 +564,49 @@ wrapper修正がinclude-safe testability、conductor既存機能、server admiss
 - Step 3 Phase 3へ戻り、buffer timingに依存するpositive stdout文字列assertを削除する。
 - process生存、`LIST`成功、temporary `CONDUCTOR_START`、runtime stderr、cleanupを正本判定として維持する。
 - Step 3 Phase 4を再実行して修正testをcommit/push後、Step 4 Phase 4を先頭から再実行する。
+
+#### 再開試行2 — preflight停止
+
+- artifact directory: `/tmp/syncopade-conductor-wrapper-step4-final.C6uvLO/`
+- test command実行前のrepository log照合で停止した。
+- 固定値`b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`はcontent SHA-1ではなくGit blob IDだった。
+- `shasum`が返す現在のcontent SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`である。
+- repository log差分は従来どおり`4 additions / 0 deletions`で、内容変更や新規追記はない。
+- include、unit、admission、wrapper integrationは1本も実行していない。
+- process起動、9030 listener、repository log追記はいずれも発生していない。
+- failure receipt: `/tmp/syncopade-conductor-wrapper-step4-final.C6uvLO/failure_receipt.md`
+
+#### 現在の再開条件
+
+- Git blob IDとcontent SHA-1を区別し、preflightではcontent SHA-1 `528443adeeff16bfcd482c552458584d7a080e99`を照合する。
+- `4 additions / 0 deletions`も併用し、先生の既存4行以外が変わっていないことを確認する。
+- C進行のerror停止規則により、先生の再開指示まではStep 4 Phase 4を再実行しない。
+
+#### 再開試行3 — 最終検証
+
+- result: `STEP4_RESULT=PASS_RELEASE_REGRESSION`
+- port preflight: `STEP4_PORT_PREFLIGHT_OK`
+- conductor include: `CONDUCTOR_INCLUDE_OK`
+- Client Protocol: `8 / 8 pass`
+- Conductor Queue: `17 / 17 pass`
+- Server Admission State: `13 / 13 pass`
+- wrapper integration: `STEP3_RESULT=PASS_WRAPPER_ENTRYPOINT_REGRESSION`
+- wrapper `LIST` payload: `NODES|`
+- wrapper positive runtime stderr: 0 byte
+- wrapper positive termination: `SIGTERM`, `termsignal=15`, SIGKILL fallback=`false`
+- wrapper negative fixture: exit code `0`, `termsignal=0`
+- top-level command stderr: 全6 fileが0 byte
+- unit用temporary log: `TASK_REQUEUED`を含むheader + 5 events
+- cleanup後9030 listener: なし
+- repository log content SHA-1: `528443adeeff16bfcd482c552458584d7a080e99`のまま
+- repository log Git blob ID: `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`のまま
+- repository log差分: `4 additions / 0 deletions`のまま
+- artifact directory: `/tmp/syncopade-conductor-wrapper-step4-pass.kVJTkU/`
+- receipt: `/tmp/syncopade-conductor-wrapper-step4-pass.kVJTkU/receipt.md`
+
+#### Step 4結論
+
+wrapper修正はinclude-safe contract、既存protocol/queue、server admission stateを壊していない。wrapper起動回帰testもprocess、protocol、temporary log、runtime stderr、negative include-only fixture、cleanupの全条件を満たした。repository既定logへtest由来の追記はない。
 
 ---
 
