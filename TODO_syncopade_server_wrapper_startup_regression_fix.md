@@ -200,7 +200,7 @@ include-safeなserver本体を維持したまま、公式wrapper直接実行時�
 
 ---
 
-## Step 3: server wrapper entrypointの自動回帰testを追加する
+## Step 3: server wrapper entrypointの自動回帰testを追加する — 完了
 
 ### 目的
 
@@ -226,13 +226,79 @@ include-safeなserver本体を維持したまま、公式wrapper直接実行時�
 3. response、exit code、signal、stdout/stderr、cleanupを検証する。
 4. test単体を再実行して再現性を確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- server wrapperをrepository外artifactへstdout/stderr redirectしてchild起動する。
+- Julia Baseの`open(command, "w", stdout)`を使い、child stdinをparentから書込可能なpipeとして保持する。
+- positive caseはprocess生存、8030 listen、`STATUS|idle`、runtime stderr 0 byteを確認する。
+- positive cleanupはstdinへ`q\n`を書き、`flush`/`closewrite`後にbounded waitでexit code `0`を要求する。
+- negative caseは本体をincludeするだけの一時scriptを起動し、自然にexit code `0`で終了することを確認する。
+- exception時だけ`SIGKILL`とbounded waitを使用し、8030 listener/processを必ず除去する。
+- test file自体へ`PROGRAM_FILE` guardを付け、include-only時の副作用を防ぐ。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### `launch_child(script_path, case_label, artifact_dir)`
+
+- input: 実行script、case名、artifact directory。
+- environment: `SYNCOPADE_NODE_PROFILE=lan100`、`SYNCOPADE_WIRED_PREFIX=192.168.100.`。
+- output: writable stdinを持つprocess、stdout/stderr IO/path。
+- side effect: repository外artifact fileだけを作成する。
+
+#### `wait_for_server_status(process, ip, port, timeout)`
+
+- processが先にexitした場合は即errorとする。
+- timeout内に`query_server_status(ip, port) == "STATUS|idle"`となればresponseを返す。
+- connect errorはreadiness待ちとして記録し、timeoutまで再試行する。
+
+#### `stop_with_q!(child, timeout)`
+
+- child stdinへ`q\n`を書き、flush後にwrite sideをcloseする。
+- timeout内の自然終了、exit code `0`、termination signal `0`を要求する。
+- wait後にstdout/stderr IOをcloseする。
+
+#### Failure cleanup
+
+- exception時に生存childへ`SIGKILL`を送り、bounded waitする。
+- 全IOを`finally`でcloseする。
+- test開始前、各case後、test終了後に8030をbind可能とする。
+
+#### Expected evidence
+
+- positive: `STATUS|idle`、runtime stderr 0 byte、normal exit、startup stdoutあり。
+- negative: exit code `0`、signal `0`、stdout/stderr 0 byte、listenerなし。
+- final marker: `STEP3_RESULT=PASS_SERVER_WRAPPER_ENTRYPOINT_REGRESSION`。
+
+### Phase 3: 実装する — 完了
+
+- `test/integration_server_wrapper_entrypoint.jl`を追加した。
+- positive caseはwritable stdin付きで公式wrapperを起動し、生存、`STATUS|idle`、runtime stderrを検証する。
+- positive caseはstdinへ`q`を送り、exit code `0`、signal `0`、startup stdout、port解放を検証する。
+- negative caseは本体include-only scriptの自然終了、出力なし、listenerなしを検証する。
+- failure cleanupはstdin close、bounded `SIGKILL`、wait、全IO closeを行う。
+- repository logはtest開始前後のbyte列一致を要求する。
+- test entrypointへ`PROGRAM_FILE` guardを付け、include時の副作用を抑止した。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+- harness include-only: `STEP3_HARNESS_INCLUDE_OK`。
+- 8030 preflight: `STEP3_PORT_PREFLIGHT_OK`。
+- testを2回連続実行し、両方で`STEP3_RESULT=PASS_SERVER_WRAPPER_ENTRYPOINT_REGRESSION`。
+- positive status: `STATUS|idle`。
+- positive runtime stderr: 0 byte。
+- positive exit: code `0`、signal `0`。
+- positive stdout: bind target、profile/node、quit案内を記録。
+- negative exit: code `0`、signal `0`。
+- negative stdout/stderr: 0 byte。
+- 各実行後8030 listener/process: なし。
+- repository log identityと`4 additions / 0 deletions`: 不変。
+- first artifact: `/var/folders/__/7pnh5g_x5qb2r25n4tgyyhww0000gn/T/syncopade-server-wrapper-RMsbmr/`。
+- repeat artifact: `/var/folders/__/7pnh5g_x5qb2r25n4tgyyhww0000gn/T/syncopade-server-wrapper-QGdzza/`。
+- receipt: `/var/folders/__/7pnh5g_x5qb2r25n4tgyyhww0000gn/T/syncopade-server-wrapper-QGdzza/receipt.md`。
+
+### Step 3結論
+
+自動testは公式wrapperの継続起動と本体include-onlyの即時正常終了を区別できる。正常系をsignal停止せず`q`で終了させ、stdin contract、protocol、exit status、port cleanupまで回帰条件として固定した。
 
 ---
 
