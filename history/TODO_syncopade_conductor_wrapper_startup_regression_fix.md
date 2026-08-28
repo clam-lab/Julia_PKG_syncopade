@@ -1,5 +1,7 @@
 # Syncopade conductor wrapper起動回帰の改定 Todo
 
+> `v0.1.2` release完了後、2026-08-28に`history/`へ退避。
+
 ## 目的
 
 `v0.1.1`で`syncopadeConductor.jl`をinclude-safeにした結果、
