@@ -4,6 +4,7 @@ using Dates
 include("syncopadeNodeConfig.jl")
 
 const server_state = Ref(:idle)  # :idle or :busy
+const server_state_lock = ReentrantLock()
 const DEFAULT_UNIX_MOUNT_ROOT = "/Volumes/syncopade_nfs"
 const DEFAULT_WINDOWS_MOUNT_ROOT = raw"\\192.168.100.96\syncopade_nfs"
 const DEFAULT_FUNCTION_CACHE_SIZE = 10
@@ -14,6 +15,27 @@ const function_cache_lock = ReentrantLock()
 const include_lock = ReentrantLock()
 const function_cache = Dict{Tuple{String,String,String}, Function}()
 const function_cache_lru = Tuple{String,String,String}[]
+
+function get_server_state()::Symbol
+    lock(server_state_lock) do
+        return server_state[]
+    end
+end
+
+function try_reserve_server!()::Bool
+    lock(server_state_lock) do
+        server_state[] == :idle || return false
+        server_state[] = :busy
+        return true
+    end
+end
+
+function release_server!()::Nothing
+    lock(server_state_lock) do
+        server_state[] = :idle
+    end
+    return nothing
+end
 
 function clear_function_cache!()::Int
     lock(function_cache_lock) do
@@ -249,7 +271,7 @@ function syncopade_server(bind_ip::IPAddr, port::Int)
 
                     # Check for STATUS command
                     if msg == "STATUS"
-                        println(sock, "STATUS|" * string(server_state[]))
+                        println(sock, "STATUS|" * string(get_server_state()))
                         close(sock)
                         return
                     end
@@ -272,7 +294,7 @@ function syncopade_server(bind_ip::IPAddr, port::Int)
                     close(sock)
 
                     # Set server state to busy
-                    server_state[] = :busy
+                    try_reserve_server!()
 
                     # 非同期で計算を実行し，コールバックを送信
                     @async begin
@@ -313,7 +335,7 @@ function syncopade_server(bind_ip::IPAddr, port::Int)
                                 callback_ok=callback_ok,
                                 error_message=error_message
                             )
-                            server_state[] = :idle
+                            release_server!()
                         end
                     end
                 catch e

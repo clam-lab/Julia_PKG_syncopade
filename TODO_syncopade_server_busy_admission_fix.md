@@ -163,7 +163,7 @@ client側の既存挙動との境界は、該当StepのPhase 2で固定する。
 
 ---
 
-## Step 2: server受付状態遷移をatomicにする
+## Step 2: server受付状態遷移をatomicにする — 完了
 
 ### 目的
 
@@ -191,13 +191,96 @@ socket、job実行、callbackから独立した最小の受付状態遷移を定
 3. test終了時に状態を`idle`へ解放できることを確認する。
 4. server portにlistenerが存在しないことを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- `server_state[]`の直接accessは、初期化を除くとSTATUS読取り、job受付後のbusy書込み、job終端時のidle書込みの3箇所だけと確認した。
+- `server_state_lock::ReentrantLock`を追加し、状態読取り、予約、解放を小さなhelperへ集約する。
+- 予約helperはlock内で`idle`だけを`busy`へ変更し、成功可否を`Bool`で返すcheck-and-setとする。
+- 解放helperは、Step 2時点では既存の重複実行挙動を壊さないようidempotentに`idle`へ戻す。
+- STATUS応答、受付後のbusy遷移、job終端時のidle遷移は、すべてhelper経由に置換して直接accessをなくす。
+- Step 2ではwire応答を変更しない。受付handlerは従来どおり先に`OK|STARTED`を返し、その後で予約helperを呼ぶ。
+- 予約helperが`false`を返してもStep 2では拒否分岐へ入れず、既存の受理挙動を維持する。戻り値を受付判断へ接続するのはStep 3とする。
+- standalone unit testを追加し、networkなしで逐次状態遷移と4個の競合予約を検査する。
+- `syncopadeClient.jl`、`syncopadeConductor.jl`、wire protocolは変更しない。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Global synchronization
+
+- `server_state_lock::ReentrantLock`
+- 保護対象: `server_state[]`の初期化後の全読取り・全書込み
+- lock保持中にnetwork I/O、callback、function実行、sleepを行わない。
+
+#### `get_server_state()::Symbol`
+
+- 入力: なし
+- 出力: lock取得時点の`:idle`または`:busy`
+- 副作用: なし
+- 例外: lock取得自体の失敗以外は想定しない。
+
+#### `try_reserve_server!()::Bool`
+
+- 入力: なし
+- 初期状態が`:idle`の場合、同じlock区間で`:busy`へ変更して`true`を返す。
+- 初期状態が`:busy`の場合、状態を変更せず`false`を返す。
+- checkとstate更新の間でlockを解放しない。
+- job ID生成、socket応答、function実行、callbackは行わない。
+
+#### `release_server!()::Nothing`
+
+- 入力: なし
+- lock内で状態を`:idle`へ変更する。
+- `:idle`で呼ばれた場合もerrorにせず`:idle`を維持する。
+- network I/O、callback、DONE通知は行わない。
+
+#### 既存handlerへのStep 2接続
+
+- STATUS応答は`get_server_state()`を使用する。
+- 従来の受付後`server_state[] = :busy`を`try_reserve_server!()`呼出しへ置換する。
+- Step 2では予約戻り値を拒否判断に使わず、wire応答とjob実行数を変えない。
+- job終端時の`server_state[] = :idle`を`release_server!()`へ置換する。
+
+#### Standalone unit test
+
+- file: `test/unit_server_admission_state.jl`
+- 実行: `julia --project=. --threads=4 test/unit_server_admission_state.jl`
+- 逐次検査:
+  初期idle、最初の予約成功、2回目失敗、busy維持、解放、再予約成功、最終解放。
+- 競合検査:
+  idle状態から4個の`Threads.@spawn`で予約し、`true`が1件、`false`が3件、最終状態がbusyであることを要求する。
+- `try/finally`でtest終了時に`release_server!()`を呼び、成功・失敗時ともidleへ戻す。
+- testはserver fileをincludeするが、Step 1 guardによりlistenerを起動しない。
+
+### Phase 3: 実装する — 完了
+
+- `syncopadeServer.jl`へ`server_state_lock`と3 helperを追加した。
+  - `get_server_state()::Symbol`
+  - `try_reserve_server!()::Bool`
+  - `release_server!()::Nothing`
+- STATUS、受付後busy遷移、job終端idle遷移をhelper経由へ置換した。
+- 初期化を除く`server_state[]`の直接accessは3 helper内部だけになった。
+- Step 2のscopeどおり、`OK|STARTED`応答順序とjob受理数は変更していない。
+- `test/unit_server_admission_state.jl`を追加した。
+- unit testは逐次遷移、再予約、4個の競合予約、最終idle cleanupを検査する。
+- 対象fileの`git diff --check`はerrorなし。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+- command: `julia --project=. --threads=4 test/unit_server_admission_state.jl`
+- Julia thread数: `4`
+- test result: `13 / 13 pass`
+- 検証済み項目:
+  - 初期状態`idle`
+  - 最初の予約だけ成功
+  - `busy`中の2回目予約は失敗し、状態を維持
+  - 解放後の再予約成功
+  - 4個の競合予約に対して`true=1`, `false=3`
+  - 競合予約後の状態`busy`
+  - `finally` cleanup後の状態`idle`
+- test前後の`8030/tcp`: listenerなし
+- test exit code: `0`
+- Step 2では意図どおりwire応答を変更しておらず、BUSY拒否の実接続検証はStep 3へ残す。
+- Step 2の完了条件をすべて満たした。
 
 ---
 
