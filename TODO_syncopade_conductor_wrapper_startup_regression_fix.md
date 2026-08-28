@@ -139,7 +139,7 @@ conductor本体のinclude-safe contractは維持し、実行用wrapperが`main()
 
 ---
 
-## Step 2: wrapperからconductorを明示起動する
+## Step 2: wrapperからconductorを明示起動する — 完了
 
 ### 目的
 
@@ -167,13 +167,102 @@ include-safeな本体を維持したまま、公式wrapperから`main()`を明�
 4. child processを明示終了し、exit状態とlistener消滅を確認する。
 5. standard unit testとrepository log hashを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- `scripts/run_conductor.jl`は本体include直後に既存`main()`を明示的に1回呼ぶ。
+- `syncopadeConductor.jl`の`PROGRAM_FILE` guardと`main()`本体は変更しない。
+- wrapperに独自のbind、monitor loop、argument parsing、retry処理を複製しない。
+- `docs/TESTING.md`へ直接実行、wrapper実行、library includeのownershipを明記する。
+- Phase 4ではlan100と一時logを使い、process生存、9030 listener、`LIST`応答、cleanupを手動integrationで確認する。
+- repository logのhashが変化した場合、または既存network endpointと競合した場合は停止する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Wrapper entrypoint
+
+- file: `scripts/run_conductor.jl`
+- top-level sequence:
+  1. `syncopadeConductor.jl`を絶対pathでincludeする。
+  2. includeによって定義された`main()::Any`を1回呼ぶ。
+- CLI引数: 追加しない。
+- 正常時戻り: `main()`のmonitor loopが継続するため、外部終了要求までreturnしない。
+- 例外: bind失敗、profile不正など既存`main()`以下の例外を握り潰さずprocess errorとする。
+
+#### Process-level validation interface
+
+- environment:
+  - `SYNCOPADE_NODE_PROFILE=lan100`
+  - `SYNCOPADE_WIRED_PREFIX=192.168.100.`
+  - `SYNCOPADE_CONDUCTOR_LOG=<repository外の一時file>`
+- expected endpoint: `192.168.100.30:9030`
+- readiness: child process生存かつendpointへのTCP接続成功
+- protocol probe: `query_conductor_nodes("192.168.100.30"; conductor_port=9030)`
+- expected response: checksum検証可能な`NODES` payload
+- shutdown: 検証processからchildへ`SIGTERM`を送り、process終了と9030 listener消滅を確認する。
+
+#### 副作用
+
+- conductorはlan100 profileのnodeへ既存`STATUS` probeを行う。
+- `CONDUCTOR_START`等のlogは一時fileだけへ書き、repository logへ書かない。
+- wrapper終了後にchild process、listener、log writer taskを残さない。
+
+### Phase 3: 実装する — 完了
+
+- `scripts/run_conductor.jl`のinclude直後に`main()`を1回追加した。
+- `syncopadeConductor.jl`のguard、`main()`本体、queue、monitor、loggingは変更していない。
+- `docs/TESTING.md`へ直接実行、wrapper実行、include-onlyのcontractを追記した。
+- lan100のwrapper起動例をdocsへ追加した。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 確認できた事実
+
+- wrapper child PID `8250`は即時終了せず、stdoutへ`Conductor server listening on 192.168.100.30:9030`を出力した。
+- 一時conductor logが生成され、repository log hashは`a680168272507f4049158b3f6a8df4fad98993b5`のまま維持された。
+- wrapper修正によってconductor processが起動するところまでは観測できた。
+
+#### 停止理由
+
+- readiness確認用Julia one-linerでglobal loop内の`payload`代入がsoft-scope扱いとなった。
+- warning後もouter `payload`が`nothing`のまま残り、`conductor readiness timeout: nothing`を送出した。
+- wrapperまたはconductorのerrorではなく、検証command側の実装errorである。
+- C進行のerror停止規則に従い、`let` blockまたは関数化による補正再実行には進んでいない。
+
+#### Cleanup
+
+- childへ`SIGTERM`を送り、exit status `143`で終了した。
+- cleanup後の`192.168.100.30:9030`: listenerなし。
+- repository log: 追記なし。
+- Step 2差分: 未commit、未push。
+- raw evidence: `/tmp/syncopade-conductor-wrapper-step2.62M0XV/`
+- receipt: `/tmp/syncopade-conductor-wrapper-step2.62M0XV/failure_receipt.md`
+
+#### 再開条件
+
+- readiness probeをglobal soft scopeのない関数または`let` blockへ閉じ込める。
+- Phase 4をport preflightから再実行し、`LIST`応答、stderr評価、cleanupまで完了する。
+
+#### 再開試行・最終検証
+
+- readiness probeをlocal scopeを持つ`wait_for_list()`関数へ閉じ込めた。
+- result: `STEP2_RESULT=PASS_WRAPPER_EXPLICIT_START`
+- child PID: `8411`
+- listener: `192.168.100.30:9030`
+- protocol response: `NODES|`（checksum検証済みpayload）
+- child process: protocol検証中も生存
+- runtime stderr: 0 byte
+- temporary log: `CONDUCTOR_START`を記録
+- shutdown: `SIGTERM`、exit status `143`
+- shutdown後stderr: Juliaの期待された`signal 15: Terminated` traceのみ
+- cleanup後9030 listener: なし
+- repository log hash: `a680168272507f4049158b3f6a8df4fad98993b5`のまま
+- raw evidence: `/tmp/syncopade-conductor-wrapper-step2-resume.asC24P/`
+- receipt: `/tmp/syncopade-conductor-wrapper-step2-resume.asC24P/receipt.md`
+
+#### Step 2結論
+
+- wrapperは本体include後に`main()`を明示呼出しし、conductorを正常起動できる。
+- 本体のinclude-safe contractを戻さず、直接実行とwrapper実行の両ownershipを分離できた。
 
 ---
 

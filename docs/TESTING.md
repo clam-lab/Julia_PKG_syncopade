@@ -30,6 +30,8 @@ julia syncopadeServer.jl
 Terminal B:
 ```bash
 julia syncopadeConductor.jl
+# Equivalent wrapper entrypoint:
+julia scripts/run_conductor.jl
 ```
 
 Terminal C:
@@ -41,6 +43,14 @@ Expected behavior:
 - Conductor logs queued and dispatched task.
 - Server executes `testScript4syncopade.test_syncopade`.
 - Terminal C receives callback and prints `integration_single_pc passed`.
+
+Conductor entrypoint contract:
+- Direct execution of `syncopadeConductor.jl` starts `main()` through its
+  `PROGRAM_FILE` guard.
+- Direct execution of `scripts/run_conductor.jl` includes the conductor
+  definitions and then calls `main()` explicitly.
+- Including `syncopadeConductor.jl` from tests or another Julia file only loads
+  definitions; callers that want to start the conductor must call `main()`.
 
 ## 5. Example scripts
 If you want command examples first (instead of tests):
@@ -71,6 +81,7 @@ julia syncopadeConductor.jl
 # use 192.168.100.* list
 SYNCOPADE_NODE_PROFILE=lan100 julia syncopadeServer.jl
 SYNCOPADE_NODE_PROFILE=lan100 julia syncopadeConductor.jl
+SYNCOPADE_NODE_PROFILE=lan100 julia scripts/run_conductor.jl
 ```
 
 Server behavior:
