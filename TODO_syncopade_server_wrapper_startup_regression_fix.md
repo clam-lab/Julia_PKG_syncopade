@@ -93,7 +93,7 @@ server coreのlisten/runtimeではなく、公式wrapperのentrypoint contract�
 
 ---
 
-## Step 2: server wrapperから`main()`を明示呼出ししてcontractを文書化する
+## Step 2: server wrapperから`main()`を明示呼出ししてcontractを文書化する — 完了
 
 ### 目的
 
@@ -119,13 +119,84 @@ include-safeなserver本体を維持したまま、公式wrapper直接実行時�
 3. `STATUS`応答とprocess生存を確認する。
 4. `q`送信後のexit code、stderr、port解放を確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- `scripts/run_server.jl`は本体include直後に`main()`を明示的に1回呼ぶ。
+- `syncopadeServer.jl`の`PROGRAM_FILE` guard、`main()`、runtime処理は変更しない。
+- direct source実行、wrapper実行、include-onlyの3 contractを`docs/TESTING.md`へ明記する。
+- 検証はlan100の実wrapper processで行い、stdinをterminalとして保持する。
+- `STATUS|idle`、`q`によるexit code `0`、8030解放を完了条件とする。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Wrapper contract
+
+- entrypoint: `julia --project=. scripts/run_server.jl`
+- input: positional argumentなし。profile selectionは既存`SYNCOPADE_NODE_PROFILE`を使用する。
+- action: `syncopadeServer.jl`をinclude後、`main()`を1回呼ぶ。
+- output: bind IP/port/sourceとquit案内をstdoutへ出す。
+- runtime: stdinの`q`またはEOFまでprocessを維持する。
+- normal exit: `q`入力後にexit code `0`、termination signal `0`。
+
+#### lan100 verification contract
+
+- bind target: `192.168.100.30:8030`、node `Chopper`。
+- process: startup timeout後も生存する。
+- protocol: checksum付き`STATUS` requestへ`STATUS|idle`を返す。
+- cleanup: stdinへ`q\n`を送りbounded waitで終了させる。
+- side effect: 8030 listenerを起動中だけ保持し、終了後に解放する。
+- forbidden side effect: repository log書込、conductor起動、本体include-only時のserver起動。
+
+### Phase 3: 実装する — 完了
+
+- `scripts/run_server.jl`が本体include後に`main()`を明示呼出しするよう変更した。
+- `docs/TESTING.md`へdirect source、wrapper、include-onlyのserver entrypoint contractを追加した。
+- lan100 command例へ`scripts/run_server.jl`を追加した。
+- `syncopadeServer.jl`本体、server runtime、protocol、node profileは変更していない。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### Passした確認
+
+- 8030 port preflight: `STEP2_PORT_PREFLIGHT_OK`
+- server本体include-only: `SERVER_INCLUDE_OK`、listener副作用なし。
+- wrapperは`192.168.100.30:8030`で継続起動した。
+- bind source: `profile:lan100 node=Chopper`。
+- `lsof`でJulia PID `13886`の8030 LISTENを確認した。
+- stdinへ`q`を送り、wrapperはexit code `0`で正常終了した。
+- cleanup後8030 listener/process: なし。
+- repository log identityと`4 additions / 0 deletions`: 不変。
+
+#### 停止理由
+
+- `STATUS` request生成ワンライナーのglobal soft scope内でchecksum変数`c`を更新した。
+- Juliaがassignmentをlocalと解釈し、`UndefVarError: c not defined in local scope`でquery processがexitした。
+- server wrapper、listener、server protocolのerrorではなく、検証commandの実装ミスである。
+- C進行のerror停止規則により、function scopeへ直したqueryの再試行には進んでいない。
+
+#### 再開条件
+
+- checksum生成を`let`またはfunction scopeへ置き、soft-scope ambiguityを除去する。
+- Phase 4を8030 preflightから再実行し、`STATUS|idle`、`q` exit code `0`、port解放を連続確認する。
+- receipt: `/tmp/syncopade-server-wrapper-step2-softscope-failure.md`
+
+#### 再開試行・最終検証
+
+- resume preflight: `STEP2_RESUME_PREFLIGHT_OK`
+- wrapper startup: `192.168.100.30:8030`で継続起動。
+- bind source: `profile:lan100 node=Chopper`。
+- listener process: Julia PID `14466`。
+- checksum生成をfunction scopeへ移し、soft-scope ambiguityを除去した。
+- protocol response: `STEP2_STATUS_RESPONSE=STATUS|idle`。
+- stdinへ`q`を送り、wrapperはexit code `0`で正常終了した。
+- cleanup: `STEP2_CLEANUP_PORT_FREE`、process残留なし。
+- repository log identityと`4 additions / 0 deletions`: 不変。
+- result: `STEP2_RESULT=PASS_SERVER_WRAPPER_FIX`。
+- success receipt: `/tmp/syncopade-server-wrapper-step2-pass.md`
+
+#### Step 2結論
+
+公式server wrapperは本体のinclude-safe contractを壊さず、terminal直接実行時にserver runtimeを開始する。lan100でprocess生存、8030 listen、`STATUS|idle`、`q`正常終了、port解放を確認した。
 
 ---
 

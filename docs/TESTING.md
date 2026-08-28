@@ -52,6 +52,14 @@ Conductor entrypoint contract:
 - Including `syncopadeConductor.jl` from tests or another Julia file only loads
   definitions; callers that want to start the conductor must call `main()`.
 
+Server entrypoint contract:
+- Direct execution of `syncopadeServer.jl` starts `main()` through its
+  `PROGRAM_FILE` guard.
+- Direct execution of `scripts/run_server.jl` includes the server definitions
+  and then calls `main()` explicitly.
+- Including `syncopadeServer.jl` from tests or another Julia file only loads
+  definitions; callers that want to start the server must call `main()`.
+
 ## 5. Example scripts
 If you want command examples first (instead of tests):
 
@@ -80,6 +88,7 @@ julia syncopadeConductor.jl
 
 # use 192.168.100.* list
 SYNCOPADE_NODE_PROFILE=lan100 julia syncopadeServer.jl
+SYNCOPADE_NODE_PROFILE=lan100 julia scripts/run_server.jl
 SYNCOPADE_NODE_PROFILE=lan100 julia syncopadeConductor.jl
 SYNCOPADE_NODE_PROFILE=lan100 julia scripts/run_conductor.jl
 ```
