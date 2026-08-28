@@ -235,6 +235,7 @@ end
 #   __syncopade_meta_conductor_port=
 # CHECKSUMはpayload（最後の|より前の全て）に対するXORチェックサム（16進）
 # 即時応答は OK|STARTED|jobId でソケットはすぐ閉じる
+# server busy時は ERROR|BUSY を返し、job IDを発行しない
 # 制御コマンド:
 # STATUS|checksum      -> STATUS|<idle|busy>
 # CACHE_CLEAR|checksum -> CACHE|CLEARED|<count>
@@ -257,6 +258,7 @@ function syncopade_server(bind_ip::IPAddr, port::Int)
             # クライアントからの接続を待つ
             sock = accept(server)
             @async begin
+                reservation_owned = false
                 try
                     # クライアントからのメッセージを受信
                     row_msg = readline(sock)
@@ -286,15 +288,20 @@ function syncopade_server(bind_ip::IPAddr, port::Int)
                     # メッセージを解析してジョブ情報を得る
                     job = convMSG2JOB(msg)
 
+                    # Reserve the single execution slot before issuing a job ID.
+                    if !try_reserve_server!()
+                        println(sock, "ERROR|BUSY")
+                        close(sock)
+                        return
+                    end
+                    reservation_owned = true
+
                     # ジョブIDを生成
                     jobId = string(uuid4())
 
                     # 即時応答を返しソケットを閉じる
                     println(sock, "OK|STARTED|" * jobId)
                     close(sock)
-
-                    # Set server state to busy
-                    try_reserve_server!()
 
                     # 非同期で計算を実行し，コールバックを送信
                     @async begin
@@ -338,7 +345,9 @@ function syncopade_server(bind_ip::IPAddr, port::Int)
                             release_server!()
                         end
                     end
+                    reservation_owned = false
                 catch e
+                    reservation_owned && release_server!()
                     # 受信処理での致命的エラーはログ出力して終了
                     println("Error handling connection: ", e)
                     try

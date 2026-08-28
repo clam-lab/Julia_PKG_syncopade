@@ -284,7 +284,7 @@ socket、job実行、callbackから独立した最小の受付状態遷移を定
 
 ---
 
-## Step 3: busy中の2件目をwire protocolで明示拒否する
+## Step 3: busy中の2件目をwire protocolで明示拒否する — 完了
 
 ### 目的
 
@@ -319,13 +319,127 @@ Step 2の受付状態遷移を実際の計算要求handlerへ接続し、
 6. raw server/client stdout・stderrと実験receiptをrepository外へ保存する。
 7. cleanup後にserver/callback listenerが残らないことを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- `convMSG2JOB`で要求形式を検証した後、job ID生成と成功応答より前に`try_reserve_server!()`を呼ぶ。
+- 予約成功時だけjob IDを生成し、従来の`OK|STARTED|jobId`を返してjob taskを開始する。
+- 予約失敗時は明示的なBUSY拒否応答を返し、そのconnection handlerを終了する。
+- 拒否経路ではjob ID生成、function call、RESULT callback、DONE通知を行わない。
+- socket応答またはjob task生成が失敗した場合に予約が残留しないよう、connection handler側で予約ownershipを追跡し、job taskへhandoffする前の例外では解放する。
+- job taskへhandoffした後の正常・異常終端解放は既存`finally`とStep 4/5の検証範囲に残す。
+- `syncopadeClient.syncopade_calc_request`はBUSY応答を既存どおりunexpected response errorとして扱えるため、Step 3では変更しない。
+- BUSY wire応答そのものを検証するため、job Bだけはintegration harnessからraw requestを送る。
+- 修正前再現用`test/integration_server_busy_acceptance.jl`は履歴evidenceとして変更せず、新しいrejection harnessを追加する。
+- 新harnessはA/Bそれぞれのcallback listenerを自前で保持し、A callback受信までB callbackが到着しないことを確認後、全listenerを明示closeする。
+- Step 3ではA終了後のjob C再受付を行わず、Step 4の独立検証として残す。
+- conductorは起動せず、`syncopadeConductor.jl`と既存logは変更しない。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Server受付protocol
+
+- 正常受付応答: 既存どおり`OK|STARTED|<job-id>`
+- capacity不足応答: `ERROR|BUSY`
+- いずれも既存start-ackと同じくchecksumを付けない1行応答とする。
+- `ERROR|BUSY`はjob IDを含まない。
+- BUSY拒否後はsocketをcloseし、connection handlerをreturnする。
+- `STATUS`、`CACHE_CLEAR`、checksum errorの既存分岐は変更しない。
+
+#### 予約ownership
+
+- well-formed jobをparseした後、`try_reserve_server!()`成功時だけconnection handlerが予約を所有する。
+- job task生成前のsocket/job setup errorではconnection handlerが`release_server!()`を呼ぶ。
+- job taskを正常に生成した時点でownershipをtaskへhandoffする。
+- BUSY拒否時は予約を取得していないため解放処理を行わない。
+
+#### Integration harness
+
+- file: `test/integration_server_busy_rejection.jl`
+- CLI入力:
+  1. server IP（default `192.168.100.30`）
+  2. server port（default `8030`）
+  3. job A callback port（default `9141`）
+  4. job B callback port（default `9142`）
+  5. job sleep seconds（default `3.0`）
+  6. timeout seconds（default `15.0`）
+- callback IPは`preferred_local_ip()`から取得し、server IPと一致しなければjob投入前に停止する。
+- A/B両方のcallback listenerをjob投入前にbindする。
+- job Aは既存`syncopade_calc_request`で投入し、job IDを得る。
+- `STATUS|busy`確認後、job Bは既存request encodingとchecksumを使うraw helperで投入する。
+- job Bのraw応答は厳密に`ERROR|BUSY`と一致させる。
+- A callbackはchecksum、job ID、status、payloadを検証する。
+- B callback listenerは拒否後も`job sleep + 1 s`以上開き、callbackが1件も到着しないことを確認する。
+- A payloadは`label=A`, `active_at_entry=1`, `max_active=1`, `started_ns < finished_ns`を要求する。
+- A callback後の最終statusはcleanup確認として`STATUS|idle`を要求するが、job Cの再投入はStep 4へ残す。
+- harnessは`PROGRAM_FILE` guardを持ち、includeだけではnetwork接続しない。
+
+#### Phase 4 process構成
+
+- server mount root: repositoryの`test/fixtures`
+- server environment:
+  `SYNCOPADE_NODE_PROFILE=lan100`, `SYNCOPADE_WIRED_PREFIX=192.168.100.`
+- conductorは起動しない。
+- server/client stdout・stderrとreceiptはrepository外の一時directoryへ保存する。
+- `8030`, `9141`, `9142`は起動前に空きを確認し、終了後にlistener消滅を確認する。
+
+### Phase 3: 実装する — 完了
+
+- `syncopadeServer.jl`のjob parse直後にatomic予約分岐を接続した。
+- 予約失敗時は`ERROR|BUSY`を返してconnection handlerを終了する。
+- job ID生成と`OK|STARTED`応答は予約成功後だけ行う。
+- connection handlerへ`reservation_owned`を追加し、job task生成前の例外では予約を解放する。
+- job task生成後は既存taskの`finally`へ予約ownershipをhandoffする。
+- `syncopadeClient.jl`と`syncopadeConductor.jl`は変更していない。
+- 修正前evidenceの`test/integration_server_busy_acceptance.jl`は変更していない。
+- `test/integration_server_busy_rejection.jl`を追加した。
+- harnessはA/B listener、raw B request、BUSY応答、B callback不在、Aのactive数、最終statusを検証する。
+- harnessのinclude check: `REJECTION_HARNESS_INCLUDE_OK`, exit code `0`。
+- 対象fileの`git diff --check`はerrorなし。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### Regression check
+
+- command: `julia --project=. --threads=4 test/unit_server_admission_state.jl`
+- result: `13 / 13 pass`
+- exit code: `0`
+
+#### Integration environment
+
+- pre-Step-3 HEAD: `4226be21f3ead88d4cb92670c7c80b23c5a550ab`
+- server PID/endpoint: `560`, `192.168.100.30:8030`
+- callback IP: `192.168.100.30`
+- callback ports: A=`9141`, B=`9142`
+- conductor: 未起動
+- 起動前にlocal IP保持と`8030`, `9141`, `9142`の空きを確認した。
+
+#### Integration result
+
+- harness result: `STEP3_RESULT=PASS_BUSY_REJECTED`
+- harness exit code: `0`
+- server exit code: `0`
+- initial status: `STATUS|idle`
+- job A ID: `452a0b47-2995-4f70-a374-1579b970df73`
+- job B投入直前status: `STATUS|busy`
+- job B raw response: `ERROR|BUSY`
+- job B job ID: 発行なし
+- job B callback: 観測なし
+- job A `active_at_entry=1`
+- job A `max_active=1`
+- job A interval: `716362158220125..716365159218500 ns`
+- final status: `STATUS|idle`
+- server/harness stderr: ともに空
+- cleanup後`8030`, `9141`, `9142`: listenerなし
+- repositoryの`logs/conductor_events.csv`: 既存4行dirtyのまま、Step 3由来の追記なし
+- receipt: `/tmp/syncopade-step3-rejection.bFLHjE/receipt.md`
+- raw logs: `/tmp/syncopade-step3-rejection.bFLHjE/`
+
+#### Step 3結論
+
+- busy中の2件目は成功応答とjob IDを得ず、wire上で明示拒否された。
+- 拒否jobのcallbackとfunction実行evidenceはなく、受理jobのactive数は1を維持した。
+- 正常終了後のjob C再受付は未検証であり、Step 4へ残した。
+- Step 3の完了条件をすべて満たした。
 
 ---
 
