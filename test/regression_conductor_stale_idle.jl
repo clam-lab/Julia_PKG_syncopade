@@ -28,7 +28,7 @@ function wait_for_history_count(worker::ControlledWorker, count::Int; timeout::F
     return worker_history(worker)
 end
 
-@testset "Reproduce stale idle rollback" begin
+@testset "Ignore stale idle observation" begin
     worker = start_controlled_worker()
     node = NODES(string(worker.ip), worker.port, "controlled-worker")
     refresh_task = nothing
@@ -46,12 +46,14 @@ end
 
         set_node_state!(node, NODE_BUSY)
         @test get_node_state(node) == NODE_BUSY
+        busy_state = get_node_runtime_state(node)
         busy_confirmed_ns = time_ns()
         @test !istaskdone(refresh_task)
 
         respond_status!(worker, "STATUS|idle")
-        @test wait_for_completion(refresh_task, 2.0, "stale STATUS refresh")
-        @test get_node_state(node) == NODE_IDLE
+        @test !wait_for_completion(refresh_task, 2.0, "stale STATUS refresh")
+        @test get_node_state(node) == NODE_BUSY
+        @test get_node_runtime_state(node) == busy_state
 
         history = wait_for_history_count(worker, 2)
         request_entries = filter(entry -> entry.event == :request, history)
@@ -67,13 +69,33 @@ end
 
         stop_conductor_log_writer!()
         log_text = read(ENV["SYNCOPADE_CONDUCTOR_LOG"], String)
-        down_idle = findfirst("\"down\",\"idle\"", log_text)
-        idle_busy = findfirst("\"idle\",\"busy\"", log_text)
-        busy_idle = findfirst("\"busy\",\"idle\"", log_text)
+        state_lines = filter(
+            line -> occursin("\"NODE_STATE_CHANGED\"", line),
+            split(log_text, '\n')
+        )
+        state_text = join(state_lines, '\n')
+        down_idle = findfirst("\"down\",\"idle\"", state_text)
+        idle_busy = findfirst("\"idle\",\"busy\"", state_text)
+        busy_idle = findfirst("\"busy\",\"idle\"", state_text)
         @test down_idle !== nothing
         @test idle_busy !== nothing
-        @test busy_idle !== nothing
-        @test first(down_idle) < first(idle_busy) < first(busy_idle)
+        @test busy_idle === nothing
+        @test first(down_idle) < first(idle_busy)
+
+        ignored_lines = filter(
+            line -> occursin("\"NODE_OBSERVATION_IGNORED\"", line),
+            split(log_text, '\n')
+        )
+        @test length(ignored_lines) == 1
+        ignored_line = only(ignored_lines)
+        @test occursin("\"busy\",\"idle\"", ignored_line)
+        @test occursin("\"refresh\"", ignored_line)
+        @test occursin("reason=generation_changed", ignored_line)
+        @test occursin(
+            "expected_generation=$(busy_state.generation - UInt64(1))",
+            ignored_line
+        )
+        @test occursin("current_generation=$(busy_state.generation)", ignored_line)
     finally
         stop_conductor_log_writer!()
         stop_controlled_worker!(worker)
@@ -83,5 +105,5 @@ end
     end
 end
 
-println("STEP2_RESULT=PASS_REPRODUCED_STALE_IDLE")
+println("STEP2_RESULT=PASS_STALE_IDLE_IGNORED")
 println("STEP2_ARTIFACT_DIR=", artifact_dir)

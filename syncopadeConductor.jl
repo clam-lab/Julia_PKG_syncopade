@@ -38,6 +38,12 @@ struct NodeRuntimeState
     job_id::String
 end
 
+struct NodeObservation
+    node::NODES
+    state::Symbol
+    expected_generation::UInt64
+end
+
 const node_states = Dict{Tuple{String,Int},NodeRuntimeState}()
 const task_queue = ConductorTask[]
 
@@ -386,6 +392,7 @@ function clear_node_cache_with_timeout(node::NODES; timeout=DEFAULT_CACHE_CLEAR_
 end
 
 function clear_all_node_caches(nodes::Vector{NODES}; timeout=DEFAULT_CACHE_CLEAR_TIMEOUT)
+    start_generations = [get_node_runtime_state(node).generation for node in nodes]
     tasks = [@async clear_node_cache_with_timeout(node; timeout=timeout) for node in nodes]
 
     total_nodes = length(nodes)
@@ -393,7 +400,7 @@ function clear_all_node_caches(nodes::Vector{NODES}; timeout=DEFAULT_CACHE_CLEAR
     failed_nodes = 0
     cleared_functions = 0
 
-    for (node, t) in zip(nodes, tasks)
+    for (node, t, start_generation) in zip(nodes, tasks, start_generations)
         result = try
             fetch(t)
         catch e
@@ -403,7 +410,8 @@ function clear_all_node_caches(nodes::Vector{NODES}; timeout=DEFAULT_CACHE_CLEAR
         if result.ok
             success_nodes += 1
             cleared_functions += result.cleared
-            set_node_state!(node, probe_node(node; timeout=DEFAULT_STATUS_TIMEOUT))
+            observation = probe_node_observation(node; timeout=DEFAULT_STATUS_TIMEOUT)
+            apply_node_observation!(observation; source=:cache_status)
             log_conductor_event(
                 "CACHE_CLEAR_NODE_OK";
                 node_name=node.name,
@@ -414,7 +422,8 @@ function clear_all_node_caches(nodes::Vector{NODES}; timeout=DEFAULT_CACHE_CLEAR
             )
         else
             failed_nodes += 1
-            set_node_state!(node, NODE_DOWN)
+            observation = NodeObservation(node, NODE_DOWN, start_generation)
+            apply_node_observation!(observation; source=:cache_clear)
             log_conductor_event(
                 "CACHE_CLEAR_NODE_FAILED";
                 node_name=node.name,
@@ -700,28 +709,69 @@ function release_node_assignment!(
     return released
 end
 
-function probe_nodes_parallel(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEOUT)::Vector{Symbol}
-    tasks = [@async probe_node(node; timeout=timeout) for node in nodes]
-    states = Vector{Symbol}(undef, length(nodes))
-    for i in eachindex(tasks)
-        states[i] = try
-            fetch(tasks[i])
-        catch
-            NODE_DOWN
-        end
+function probe_node_observation(
+    node::NODES;
+    timeout=DEFAULT_STATUS_TIMEOUT
+)::NodeObservation
+    snapshot = get_node_runtime_state(node)
+    state = try
+        probe_node(node; timeout=timeout)
+    catch
+        NODE_DOWN
     end
-    return states
+    return NodeObservation(node, state, snapshot.generation)
+end
+
+function probe_nodes_parallel(
+    nodes::Vector{NODES};
+    timeout=DEFAULT_STATUS_TIMEOUT
+)::Vector{NodeObservation}
+    tasks = [@async probe_node_observation(node; timeout=timeout) for node in nodes]
+    observations = Vector{NodeObservation}(undef, length(nodes))
+    for i in eachindex(tasks)
+        observations[i] = fetch(tasks[i])
+    end
+    return observations
+end
+
+function apply_node_observation!(observation::NodeObservation; source::Symbol)::Bool
+    applied = apply_observed_node_state!(
+        observation.node,
+        observation.state,
+        observation.expected_generation
+    )
+    applied && return true
+
+    current = get_node_runtime_state(observation.node)
+    reason = current.generation == observation.expected_generation ?
+        "active_assignment" : "generation_changed"
+    log_conductor_event(
+        "NODE_OBSERVATION_IGNORED";
+        task_id=current.task_id,
+        node_name=observation.node.name,
+        node_ip=observation.node.IP,
+        node_port=observation.node.port,
+        job_id=current.job_id,
+        queue_len=queue_len(),
+        state_from=string(current.state),
+        state_to=string(observation.state),
+        status=string(source),
+        error=string(
+            "reason=", reason,
+            " expected_generation=", observation.expected_generation,
+            " current_generation=", current.generation
+        )
+    )
+    return false
 end
 
 function refresh_states_until_idle!(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEOUT)::Bool
     # Probe all nodes in parallel to minimize submit-path lag.
-    states = probe_nodes_parallel(nodes; timeout=timeout)
-    any_idle = false
-    for (node, state) in zip(nodes, states)
-        set_node_state!(node, state)
-        any_idle = any_idle || (state == NODE_IDLE)
+    observations = probe_nodes_parallel(nodes; timeout=timeout)
+    for observation in observations
+        apply_node_observation!(observation; source=:refresh)
     end
-    return any_idle
+    return any(node -> get_node_state(node) == NODE_IDLE, nodes)
 end
 
 function pick_idle_node_right_to_left(nodes::Vector{NODES})::Union{Nothing,NODES}
@@ -845,10 +895,13 @@ function monitor_nodes(; interval=DEFAULT_POLL_INTERVAL, max_retry=DEFAULT_MAX_R
     nodes = geneAvailableNodeList()
     while true
         println("---- Syncopade Conductor Status @ ", Dates.format(now(), "yyyy-mm-dd HH:MM:SS"), " ----")
-        states = probe_nodes_parallel(nodes; timeout=DEFAULT_STATUS_TIMEOUT)
-        for (node, state) in zip(nodes, states)
-            set_node_state!(node, state)
-            println(rpad(node.name,10)," ", node.IP, ":", node.port, " => ", state)
+        observations = probe_nodes_parallel(nodes; timeout=DEFAULT_STATUS_TIMEOUT)
+        for observation in observations
+            applied = apply_node_observation!(observation; source=:monitor)
+            node = observation.node
+            current_state = get_node_state(node)
+            suffix = applied ? "" : string(" (observed=", observation.state, " ignored)")
+            println(rpad(node.name,10)," ", node.IP, ":", node.port, " => ", current_state, suffix)
         end
         run_dispatch_cycle!(nodes; max_retry=max_retry)
         println("queue length => ", queue_len())

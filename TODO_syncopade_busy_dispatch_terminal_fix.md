@@ -245,7 +245,7 @@ node状態、世代、task/job割当てを一つのrecordとして原子的に�
 
 ---
 
-## Step 2: 古いSTATUS応答を適用しない — 未着手
+## Step 2: 古いSTATUS応答を適用しない — 完了
 
 ### 目的
 
@@ -271,13 +271,110 @@ node状態、世代、task/job割当てを一つのrecordとして原子的に�
 3. 古い観測を破棄したlogが1件、`busy -> idle`変更logが0件であることを確認する。
 4. 通常の未割当てnodeのstatus refreshが壊れていないことを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- 状態確認値を書き戻すproduction経路を再確認し、SUBMIT後の`refresh_states_until_idle!`、定期`monitor_nodes`、cache clear成功後の再確認に加え、cache clear失敗時の`down`反映も世代照合対象とする。同じ古い観測で割当てを壊せる経路を残さない。
+- 各network要求を開始する直前に`NodeRuntimeState.generation`をsnapshotし、応答後はStep 1の`apply_observed_node_state!`だけから適用する。状態取得とnetwork I/Oの全時間をlockで囲まない。
+- 複数nodeの並列STATUS確認は、nodeごとの開始時generationと観測状態を対応させた結果を返す。配列順だけでなく同じnodeとtokenを一組にして扱う。
+- 観測適用に失敗した場合は現在recordを再取得し、`NODE_OBSERVATION_IGNORED`を記録する。既存CSV列の`task_id`、`job_id`、`state_from`、`state_to`、`status`、`error`を使い、`error`へ期待generation、現在generation、不適用理由を入れる。CSV列自体は増やさない。
+- `refresh_states_until_idle!`の戻り値は、古い応答にidleが含まれたかではなく、適用判定後の現在recordにidle nodeが存在するかで決める。
+- monitor表示も観測値でなく適用後の現在状態を表示し、不適用時は観測値が無視されたことを同じ行で区別する。
+- cache clear失敗の`down`反映にはcache clear開始前のgeneration、成功後のSTATUS反映にはそのSTATUS開始直前のgenerationを使用する。途中で予約・配送が進んだ場合は状態を巻き戻さない。
+- 修正前試験を`test/regression_conductor_stale_idle.jl`へ改名し、同じ明示順序のまま期待値を反転する。古いidle応答後も最終状態`busy`、refresh戻り値`false`、`busy -> idle` log 0件、不適用event 1件を要求する。
+- Step 2では手動`set_node_state!(NODE_BUSY)`で世代を進める。node予約と実配送の接続はStep 3へ残し、BUSY、retry、DONEの挙動は変更しない。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### `NodeObservation`
+
+- fields: `node::NODES`、`state::Symbol`、`expected_generation::UInt64`。
+- `state`はnetwork要求から得た`NODE_IDLE`、`NODE_BUSY`、`NODE_DOWN`のいずれかとする。
+- nodeと開始時generationを同じ値に保持し、parallel結果の取り違えを防ぐ。
+
+#### `probe_node_observation(node::NODES; timeout=DEFAULT_STATUS_TIMEOUT)::NodeObservation`
+
+- 最初に`get_node_runtime_state(node)`でgenerationを取得し、直後に既存`probe_node`を呼ぶ。
+- timeout、接続失敗、不正STATUSは既存`probe_node`どおり`NODE_DOWN`観測として返す。
+- node状態辞書への書込みとlog出力は行わない。
+
+#### `probe_nodes_parallel(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEOUT)::Vector{NodeObservation}`
+
+- nodeごとに`probe_node_observation`を非同期実行し、入力順と同じ順の観測を返す。
+- 個別taskの予期しない例外も、そのtask開始時generationと同じnodeを持つ`NODE_DOWN`観測へ変換する。
+- 状態辞書への書込みは行わない。
+
+#### `apply_node_observation!(observation::NodeObservation; source::Symbol)::Bool`
+
+- Step 1の`apply_observed_node_state!`へnode、state、expected generationを渡す。
+- 適用成功時は`true`を返し、追加eventは記録しない。stateが変化した場合の既存`NODE_STATE_CHANGED`はStep 1 helperが記録する。
+- 不適用時は現在recordを再取得し、`NODE_OBSERVATION_IGNORED`を1件記録して`false`を返す。
+- eventの`task_id`/`job_id`は現在割当て、`state_from`は現在状態、`state_to`は観測状態、`status`は`source`とする。
+- `error`は`reason=generation_changed`または`reason=active_assignment`、`expected_generation=<n>`、`current_generation=<n>`を空白区切りで持つ。
+- network、queue、retry、割当て変更は行わない。
+
+#### `refresh_states_until_idle!`
+
+- 全`NodeObservation`へ`source=:refresh`で適用を試みる。
+- 全適用処理後、入力nodesの現在状態を再取得し、1件以上`NODE_IDLE`なら`true`、なければ`false`を返す。
+- 古い`NODE_IDLE`観測そのものを戻り値へ使用しない。
+
+#### `monitor_nodes`
+
+- 全観測へ`source=:monitor`で適用を試みる。
+- 表示する主状態は適用後の`get_node_state(node)`とする。
+- 不適用時だけ`observed=<state> ignored`を付記する。
+
+#### `clear_all_node_caches`
+
+- cache clear非同期taskを作る前に各nodeのgenerationを保存する。
+- cache clear失敗時は保存したgenerationを使う`NODE_DOWN`観測を`source=:cache_clear`で適用する。
+- cache clear成功時はその後に`probe_node_observation`を開始し、`source=:cache_status`で適用する。
+- cache clearの成功・失敗集計自体は状態観測の適否にかかわらず従来どおり記録する。
+
+#### 修正後回帰試験
+
+- fileを`test/reproduction_conductor_stale_idle.jl`から`test/regression_conductor_stale_idle.jl`へ改名する。
+- worker request、busy設定、遅延idle responseの明示順序と時刻比較は維持する。
+- refresh戻り値は`false`、最終recordは`NODE_BUSY`かつbusy設定後のgenerationのままとする。
+- 一時CSVは`down -> idle`、`idle -> busy`を各1件含み、`busy -> idle`を含まない。
+- `NODE_OBSERVATION_IGNORED`は1件で、`source=refresh`、観測`idle`、現在`busy`、期待generationと現在generationが異なることを確認する。
+- markerは`STEP2_RESULT=PASS_STALE_IDLE_IGNORED`へ変更する。
+
+### Phase 3: 実装する — 完了
+
+- `NodeObservation`、単node観測、parallel観測、世代照合付き適用と不適用監査eventを実装した。
+- `refresh_states_until_idle!`は全観測適用後の現在recordからidle有無を返すよう変更した。
+- `monitor_nodes`は適用後状態を表示し、古い観測を無視した場合だけ観測値を付記するよう変更した。
+- cache clear開始前generationと、成功後STATUS開始前generationを保存し、成功・失敗どちらの状態反映も条件付き観測へ接続した。
+- `test/reproduction_conductor_stale_idle.jl`を`test/regression_conductor_stale_idle.jl`へ改名し、遅延idleを無視する正方向の期待値へ反転した。
+- BUSY分類、dispatch予約、retry、DONEのproduction処理には変更を加えていない。
+- `git diff --check`で検査できる範囲のwhitespace不整合はない。機能検証はPhase 4で行う。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 初回検証と強化C補正
+
+- 初回はproductionの最終状態、refresh戻り値、不適用eventまで正しかったが、試験がCSV全体から`"busy","idle"`を検索し、`NODE_OBSERVATION_IGNORED`の「現在busy・観測idle」を状態変更と誤認して1 assertion失敗した。
+- production codeやTodo前提の問題ではなく、灯子が試験の検索対象eventを限定しなかった局所ミスだった。
+- 強化C規則に従い、`NODE_STATE_CHANGED`行だけから状態遷移を検査するよう修正し、Phase 4を最初から再実行した。
+
+#### 最終検証
+
+- `test/regression_conductor_stale_idle.jl`を2回連続実行し、いずれもexit `0`、`26 / 26 pass`、marker `STEP2_RESULT=PASS_STALE_IDLE_IGNORED`。
+- 両実行で`STATUS request < busy確定 < 遅延idle response`の明示順序を確認した。
+- 遅延idle後のrefresh戻り値は`false`、最終状態は`NODE_BUSY`、generationはbusy確定時から不変だった。
+- 両CSVは`NODE_STATE_CHANGED`の`down -> idle`、`idle -> busy`を各1件含み、`busy -> idle`は0件だった。
+- 両CSVは`NODE_OBSERVATION_IGNORED`を1件含み、現在`busy`、観測`idle`、source `refresh`、reason `generation_changed`、expected/current generation `1/2`だった。
+- 1回目artifact: `/tmp/syncopade-step2-stale-retry.OL4yxh`、CSV SHA-1 `638aa1d114b014ab40bbecb2823600808e832aea`。
+- 2回目artifact: `/tmp/syncopade-step2-stale-repeat.72rT9n`、CSV SHA-1 `73ed453ba0e9f45ceb39a66d632571319ddfa926`。
+- `test/unit_conductor_node_state.jl`: exit `0`、`55 / 55 pass`。
+- `test/unit_conductor_queue.jl`: exit `0`、`17 / 17 pass`。
+- `git diff --check`はerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のままで、先生の既存差分を変更していない。
+
+### Step 2結論
+
+状態確認開始後に状態世代が進んだ場合、遅れて返ったidle観測は現在状態へ適用されない。固定順序で`busy -> idle`巻き戻りが消え、古い観測だけが監査eventへ残ることを2回確認した。
 
 ---
 
