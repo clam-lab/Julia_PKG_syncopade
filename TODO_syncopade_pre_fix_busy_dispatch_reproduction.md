@@ -540,7 +540,7 @@ conductorが受付済みtask IDを破棄した後、親のcallback listenerへ�
 
 ---
 
-## Step 5: lan100の単一server構成で実TCP前提を確認し証拠を統合する — 未着手
+## Step 5: lan100の単一server構成で実TCP前提を確認し証拠を統合する — 完了
 
 ### 目的
 
@@ -586,13 +586,133 @@ conductorが受付済みtask IDを破棄した後、親のcallback listenerへ�
 6. Step 1〜5の結果を、観測事実とコードからの説明に分けてreceiptへまとめる。
 7. process、port、temporary task、repository log identityを終了確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- このPCは`192.168.12.2`と`192.168.100.30`を同時に保持し、開始時点で8030/9030 listenerは存在しないことを確認した。
+- conductor/serverは公式wrapperを別processで起動し、共通して`SYNCOPADE_NODE_PROFILE=lan100`と`SYNCOPADE_WIRED_PREFIX=192.168.100.`を指定する。
+- conductor event logと両processのstdout/stderrはrepository外のStep 5 artifactへ保存する。
+- serverのmount rootはrepositoryの`test/fixtures`へ向け、`server_busy_probe.jl`だけを実行対象にする。
+- conductor起動後の初期`LIST`とserver起動後の最終`LIST`を確認し、idle endpointが`192.168.100.30:8030`以外を含む場合は4タスクを投入せず停止する。
+- 先に既存`integration_server_busy_rejection.jl`を実行し、1件実行中の2件目BUSY、job IDなし、callbackなし、終了後再受理を確認する。
+- 既存`integration_conductor_node_exclusivity.jl`は修正前の重複実行を期待して`max_active >= 2`を要求する旧再現testなので、現在のserver排他確認には使わない。
+- conductor経由4タスクの観測にはrepository外runnerを使う。4 listenerを先に開き、gateから4 SUBMITを解放し、各taskをcallback、drop、未終端に分類する。
+- 自然raceの発生自体はpass条件にしないが、各taskがcallbackまたは`TASK_DROPPED`へ到達するまでbounded waitし、未終端が残れば停止する。
+- callbackを受けたfixture intervalは重ならず、`max_active == 1`であることを要求する。
+- 実験後はserverを`q`で正常終了し、conductorをbounded interruptで終了する。8030/9030とcallback listener、Julia processを残さない。
+- production/test sourceは変更しない。実装物はrepository外runnerとこのTodoの記録だけとする。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### Artifactとprocess起動
+
+- artifact: `/tmp/syncopade-lan100-step5.XXXXXX/`。
+- conductor command: `julia --project=. scripts/run_conductor.jl`。
+- conductor environment: `SYNCOPADE_NODE_PROFILE=lan100`、`SYNCOPADE_WIRED_PREFIX=192.168.100.`、`SYNCOPADE_CONDUCTOR_LOG=<artifact>/conductor_events.csv`。
+- server command: `julia --project=. scripts/run_server.jl`。
+- server environment: 上記profile/prefixに加え、`SYNCOPADE_MOUNT_ROOT_UNIX=<repository>/test/fixtures`。
+- stdout/stderr: `<artifact>/conductor.stdout`、`conductor.stderr`、`server.stdout`、`server.stderr`。
+- readiness timeout: 各10秒。process先行終了、endpoint不一致、protocol応答不一致はerrorとする。
+
+#### Server排他確認
+
+- command: `julia --project=. test/integration_server_busy_rejection.jl 192.168.100.30 8030 9141 9142 1.0 10.0 9143`。
+- expected: `PASS_BUSY_REJECTED`、`PASS_NORMAL_RECOVERY`。
+- expected BUSY: `job_b_response=ERROR|BUSY`、callback Bなし。
+- expected accepted jobs: A/Cのjob IDは非空かつ異なり、実行区間は重ならない。
+- expected server state: initial、A終了後、finalがすべて`idle`、A実行中は`busy`。
+
+#### 4タスク観測runner
+
+- path: `<artifact>/observe_four_tasks.jl`。
+- inputs: repository path、conductor endpoint、server endpoint、conductor log path。
+- task count: `4`、fixture sleep: `1.0 s`、terminal wait: `30.0 s`。
+- callback listener: `192.168.100.30`の自動割当てportを4件、SUBMIT前に起動する。
+- SUBMIT: 4 taskを同じgateから解放し、各indexにtask IDとlistenerを固定対応させる。
+- source/module/function: `server_busy_probe:SyncopadeServerBusyProbe:busy_probe`。
+
+#### 4タスクの終端判定
+
+- conductor logに同じtask IDの`TASK_DONE`があれば`done`。
+- `TASK_DROPPED`があれば`dropped`。
+- 30秒以内にどちらもなければ`unterminated`としてrunner errorにする。
+- `done` taskは対応listenerへ正常callbackが1件届き、job IDとfixture payloadを持つ。
+- `dropped` taskは対応listenerへcallbackが届かない。
+- `done + dropped == 4`、`unterminated == 0`を要求する。
+- callback fixtureは`active_at_entry == 1`、`max_active == 1`、実行区間の重なり0件を要求する。
+- 最終server statusは`STATUS|idle`とする。
+- BUSY、retry、dropの件数はpass条件にせず観測値として出力する。
+
+#### Cleanupと最終確認
+
+- pending callback listenerは閉じ、receiver taskをbounded waitする。
+- server stdinへ`q`を送り、exit code `0`、signal `0`を要求する。
+- conductorはinterrupt後にbounded waitし、必要時だけ強制終了する。
+- 8030/9030 listener、実験用Julia processが残らないことを確認する。
+- process停止後にconductor log hash、stdout/stderr size、runner出力をreceiptへまとめる。
+- repository log SHA-1 `528443adeeff16bfcd482c552458584d7a080e99`と先生の既存差分を維持する。
+- expected marker: `STEP5_RESULT=PASS_LAN100_PRE_FIX_OBSERVATION`。
+
+### Phase 3: 実装する — 完了
+
+- repository外`/tmp/syncopade-lan100-step5.JmMWL4/observe_four_tasks.jl`を作成した。
+- 4個の自動port callback listener、同時SUBMIT gate、task ID固定対応を実装した。
+- conductor logから各taskを`done`、`dropped`、`unterminated`へ分類し、30秒のbounded終端待機を実装した。
+- done taskのcallback/job ID/fixture intervalと、dropped taskのcallback不在を照合する。
+- server実行区間の`active_at_entry == 1`、`max_active == 1`、重なり0件を検査する。
+- BUSY、dispatch failure、retry、dropは件数を観測出力し、自然発生の有無をpass条件にしていない。
+- pending listenerとreceiver taskのbounded cleanupを実装した。
+- production/test sourceは変更していない。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### Preflightと強化C補正
+
+- このPCの`192.168.100.30`を確認し、8030/9030/9141/9142/9143に既存listenerがないことを確認した。
+- 既存Syncopade conductor/server processはなかった。
+- runner include-onlyは`STEP5_RUNNER_INCLUDE_OK`、副作用なし。
+- conductor起動後・server起動前のLISTは`NODES|`。
+- server起動後は`STATUS|idle`、LISTは`NODES|192.168.100.30:8030`の1件だけだった。
+- 最初のLIST確認ワンライナーはtop-level loop内の変数更新によりJulia soft-scope警告となり、外側の空値を検査してerrorになった。
+- conductor/serverの状態やprotocol errorではなく検証commandの局所ミスだったため、強化C規則に従い同じ処理をfunction scopeへ移して再実行した。
+- 補正後は`STATUS|idle`と唯一のidle endpointを正常確認した。試験前提・完了条件は変更していない。
+
+#### 実server排他確認
+
+- `integration_server_busy_rejection.jl`は`PASS_BUSY_REJECTED`と`PASS_NORMAL_RECOVERY`。
+- job A実行中のjob Bは`ERROR|BUSY`、job IDなし、callbackなし。
+- job A/Cは異なるjob IDで正常完了し、実行区間の重なりなし。
+- `active_at_entry=1`、`max_active=1`。
+- A終了後と最終server状態は`STATUS|idle`。
+- test stderrは0 byte。
+
+#### conductor経由4タスク観測
+
+- result: `STEP5_RESULT=PASS_LAN100_PRE_FIX_OBSERVATION`。
+- submitted `4`、DONE `4`、DROPPED `0`、unterminated `0`、callback `4`。
+- DISPATCH_FAILED `0`、BUSY error `0`、TASK_REQUEUED `0`。
+- 4個のtask IDとworker job IDはすべて一意だった。
+- worker execution overlap pairは0、最終server状態は`STATUS|idle`。
+- 今回の4タスク実network実行では自然raceは発生しなかった。これは自然発生を必須条件にしておらず、Step 2の固定順序再現を否定しない。
+
+#### Shutdown、artifact、最終再実行
+
+- serverは`q`でexit code `0`。
+- conductorはSIGINTで終了し、SIGKILL fallbackは不要だった。
+- cleanup後、8030/9030/9141/9142/9143は全て再bindできた。
+- 実験用conductor/server/runner processとlistenerは残らなかった。
+- lan100 artifact: `/tmp/syncopade-lan100-step5.JmMWL4/`。
+- conductor CSV SHA-1: `d7330ce82154fcf8d3ba4f5e415441e19c82585d`。
+- runner SHA-1: `59541e0342167b68b6ee8ae087ba357e3cf3a88a`。
+- receipt: `/tmp/syncopade-lan100-step5.JmMWL4/receipt.md`。
+- receipt SHA-1: `be120173113ffa88312adf428ac2c67e643d2f9b`。
+- cleanup後にStep 1〜4を新しいartifactで連続再実行した。
+- final suite: Step 1 `15 / 15`、Step 2 `19 / 19`、Step 3 `39 / 39`、Step 4 `9 / 9`、全stderr 0 byte。
+- final suite artifact: `/tmp/syncopade-pre-fix-final.23U9xf/`。
+- repository log SHA-1は全試験後も`528443adeeff16bfcd482c552458584d7a080e99`のまま。
+
+### Step 5結論
+
+lan100の実TCP経路では、1 server排他、BUSY時のjob ID非発行、callbackなし、終了後の再受理、4タスクの逐次正常完了を確認した。自然raceは今回出なかったが、修正前の3不具合はStep 2〜4で応答順・BUSY回数・callback待機を固定して再現済みである。
 
 ---
 
@@ -608,7 +728,9 @@ conductorが受付済みtask IDを破棄した後、親のcallback listenerへ�
 
 ## 現在状態
 
-- Todo作成のみ。
-- Step 1〜5はすべて未着手。
-- production/test実装、再現試験、commit、pushは開始していない。
-- 先生との相互確認により、強化C進行でStep 1から開始する。
+- Step 1〜5はすべて完了。
+- production sourceは変更していない。
+- 修正前の状態巻き戻り、BUSY retry/drop、親への無通知を個別に決定的再現した。
+- lan100の1 conductor・1 server・4タスク実TCP確認を完了した。
+- 先生の既存`logs/conductor_events.csv`差分は変更・stage・commitしていない。
+- 原因修正、protocol改訂、修正後回帰は未着手であり、別Todo作成前で停止する。
