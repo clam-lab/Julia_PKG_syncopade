@@ -301,7 +301,7 @@
 
 ---
 
-## Step 3: BUSYの故障扱い・再試行消費・破棄を分離して再現する — 未着手
+## Step 3: BUSYの故障扱い・再試行消費・破棄を分離して再現する — 完了
 
 ### 目的
 
@@ -333,13 +333,99 @@
 5. 最終queue、偽worker要求履歴、一時conductor logを照合する。
 6. 初回配送からdropまでの実測時間を記録するが、0.291秒との完全一致は要求しない。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- Step 2の状態巻き戻りとは分離し、1回の配送cycleにつき偽workerの`ERROR|BUSY`を1回だけ返す。
+- retry `0`の固定task IDをqueueへ1件だけ入れる。
+- 各cycle直前に試験側でnodeを`NODE_IDLE`へ設定し、現行conductorが配送対象として選べる状態を明示的に作る。
+- `run_dispatch_cycle!([node]; max_retry=3)`を4cycle実行する。
+- 各cycle後にnodeが`NODE_DOWN`となることを確認する。
+- 1〜3cycle後はqueue内に同じtask IDが1件だけ残り、retryが`1, 2, 3`へ増えることを確認する。
+- 4cycle後はqueue length 0となることを確認する。
+- worker履歴からjob request 4件、`ERROR|BUSY` response 4件、`OK|STARTED` 0件を確認する。
+- 一時conductor logから`DISPATCH_START` 4件、`DISPATCH_FAILED` 4件、`TASK_REQUEUED` 3件、`TASK_DROPPED` 1件を確認する。
+- 初回配送開始からdropまでの時間を記録するが、実ログの0.291秒との一致は要求しない。
+- testは独立processで実行し、repository外log、bounded cleanup、既存log不変を維持する。
+- production source、既存test、`test/runtests.jl`は変更しない。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### 再現test entrypoint
+
+- file: `test/reproduction_conductor_busy_drop.jl`
+- command: `SYNCOPADE_TEST_ARTIFACT_DIR=<repository外path> julia --project=. test/reproduction_conductor_busy_drop.jl`
+- conductor log: `<artifact>/conductor_events.csv`
+- expected marker: `STEP3_RESULT=PASS_REPRODUCED_BUSY_DROP`。
+- elapsed output: `STEP3_DISPATCH_TO_DROP_SECONDS=<seconds>`。
+
+#### 固定taskとnode
+
+- task ID: `controlled-busy-drop-task`。
+- initial retry: `0`。
+- callback: `127.0.0.1:1`。偽workerは受付しないため接続しない。
+- source/module/function: `controlled_source:ControlledModule:controlled_function`。
+- node: Step 1のloopback偽worker 1件だけ。
+- max retry: production defaultと同じ`3`。
+
+#### 1cycleの判定
+
+1. 次のjob responseとして`ERROR|BUSY`を偽workerへ登録する。
+2. nodeを`NODE_IDLE`へ設定する。
+3. `run_dispatch_cycle!`を1回呼ぶ。
+4. nodeが`NODE_DOWN`となることを確認する。
+5. cycle 1〜3ではqueueが同じtask IDをretry `1, 2, 3`で1件だけ保持する。
+6. cycle 4ではqueue lengthが0となる。
+
+#### Logとworker履歴
+
+- task IDに対応する`DISPATCH_START`と`DISPATCH_FAILED`は各4件。
+- `DISPATCH_FAILED`例外本文は4件とも`ERROR|BUSY`を含む。
+- `TASK_REQUEUED`はretry `1, 2, 3`の3件。
+- `TASK_DROPPED`はretry `3`、reason `max_retry_exceeded`の1件。
+- worker request/responseは各4件ですべて`:job`、responseはすべて`ERROR|BUSY`。
+- `OK|STARTED`応答とworker job IDは0件。
+
+#### Cleanupと副作用
+
+- `finally`でconductor log writer、偽worker、task queue、node stateを終了・初期化する。
+- test timeout、件数不一致、task ID変化、listener残留ではPASS markerを出さない。
+- repository log SHA-1と、Step 3対象外のGit差分を実行前後で維持する。
+
+### Phase 3: 実装する — 完了
+
+- `test/reproduction_conductor_busy_drop.jl`を追加した。
+- retry `0`の固定taskを1件だけqueueへ入れ、各cycle前のnode `idle`と偽worker `ERROR|BUSY`を明示した。
+- 4cycleそれぞれでnode `down`、1〜3cycleの同一task ID/retry、4cycle後のqueue消滅を検査する。
+- worker要求・応答各4件、BUSY 4件、正常受理/job ID 0件を検査する。
+- 一時CSVの配送開始・失敗・再queue・drop件数、retry `0〜3`、`max_retry_exceeded`を検査する。
+- 初回cycle開始からdropまでのelapsed secondsを出力する。
+- `try/finally`でlog writer、偽worker、task queue、node stateをcleanupする。
+- production source、既存test、`test/runtests.jl`は変更していない。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+- 再現testを2回連続実行し、どちらも`39 / 39 pass`。
+- result: `STEP3_RESULT=PASS_REPRODUCED_BUSY_DROP`。
+- 両実行で同じtask IDをretry `0, 1, 2, 3`の順に配送した。
+- 各配送は偽workerの`ERROR|BUSY`で拒否され、conductor上のnodeは`down`となった。
+- retry `1, 2, 3`ではqueueに同じtask IDが1件だけ残り、4回目の拒否後はqueue length 0となった。
+- worker job request/responseは各4件、responseは全件`ERROR|BUSY`、正常受理/job ID発行は0件。
+- 一時CSVは`DISPATCH_START=4`、`DISPATCH_FAILED=4`、`TASK_REQUEUED=3`、`TASK_DROPPED=1`。
+- 4件の例外本文はすべて`Unexpected response from server: ERROR|BUSY`を含んだ。
+- 1回目の配送開始からdropまで: `1.402634083 s`。
+- 2回目の配送開始からdropまで: `1.253953 s`。
+- 実ログの`0.291 s`との一致は要求していない。test process内の初回関数compileを含むが、nodeが空くのを待たず4cycleで回数を消費する性質は同じ。
+- 1回目artifact: `/tmp/syncopade-busy-drop-step3.D7UXcx/`。
+- 1回目CSV SHA-1: `9b1edc52af024c18fae34331c520ef632f12c851`。
+- 2回目artifact: `/tmp/syncopade-busy-drop-step3-repeat.GV0zsB/`。
+- 2回目CSV SHA-1: `a786d12c6bad206febe07b1638d42956339d5168`。
+- cleanup後、偽worker listenerとJulia processは残らなかった。
+- `git diff --check`と新規testのwhitespace checkはerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のまま。
+
+### Step 3結論
+
+現行conductorはworkerの正常な未受理応答`ERROR|BUSY`を一般配送故障として扱い、nodeを`down`へ変更し、通常のfailure retryを消費する。空き状態と判断されるたびに同じtaskを再配送し、4回目で通知なしdropの直前まで進むことを、状態巻き戻りとは分けて確認した。
 
 ---
 
