@@ -126,7 +126,7 @@
 
 - `expected_kind`は`:status`または`:job`。
 - request通知channelがreadyになるまでbounded waitする。
-- 戻り値は`sequence`、`kind`、checksum除去後payload、`received_ns`を持つNamedTupleとする。
+- 戻り値は`request_id`、`kind`、checksum除去後payloadを表す`value`、記録時刻`recorded_ns`を持つNamedTupleとする。
 - 受信したkindが期待値と異なる場合はerrorにする。
 - timeout時に次のrequestを奪う待機taskを残さない。
 
@@ -191,7 +191,7 @@
 
 ---
 
-## Step 2: 古いidle観測によるbusy状態の巻き戻りを決定的に再現する — 未着手
+## Step 2: 古いidle観測によるbusy状態の巻き戻りを決定的に再現する — 完了
 
 ### 目的
 
@@ -222,13 +222,82 @@
 5. 最終状態が`NODE_IDLE`となり、一時logが`idle -> busy -> idle`を含むことを確認する。
 6. 同じ試験を再実行し、同じ順序で再現する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- testは独立Julia processで実行し、include前に`SYNCOPADE_CONDUCTOR_LOG`をrepository外artifactへ向ける。
+- productionのconductor/server mainやmonitor loopは起動せず、`refresh_states_until_idle!`、`set_node_state!`、`get_node_state`だけを呼ぶ。
+- 初期状態を`NODE_IDLE`へ設定した後、1 nodeだけの`refresh_states_until_idle!`を非同期に開始する。
+- 偽workerのrequest通知をgateとして使い、STATUS request受信後かつresponse前に`NODE_BUSY`へ変更する。
+- `NODE_BUSY`を確認してから、偽workerへ`STATUS|idle`の返信を許可する。
+- refresh完了後の`NODE_IDLE`を修正前の巻き戻り成立条件とする。
+- worker履歴のrequest時刻、busy設定時刻、response時刻がこの順であることをnanosecond値で検査する。
+- conductor log writerを明示停止してから、一時CSVの`down -> idle -> busy -> idle`を確認する。
+- `try/finally`で偽worker、log writer、node stateをcleanupする。
+- 同じtestを2回実行し、どちらも固定順序で`PASS_REPRODUCED_STALE_IDLE`となることを要求する。
+- production source、既存test、`test/runtests.jl`は変更しない。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### 再現test entrypoint
+
+- file: `test/reproduction_conductor_stale_idle.jl`
+- command: `SYNCOPADE_TEST_ARTIFACT_DIR=<repository外path> julia --project=. test/reproduction_conductor_stale_idle.jl`
+- conductor log: `<artifact>/conductor_events.csv`
+- network: `127.0.0.1`の自動割当てportだけを使用する。
+- expected marker: `STEP2_RESULT=PASS_REPRODUCED_STALE_IDLE`。
+
+#### 状態と同期順
+
+1. `node_states`を空にし、偽nodeを`NODE_IDLE`へ設定する。
+2. `refresh_states_until_idle!([node]; timeout=2.0)`を非同期に開始する。
+3. `wait_for_request(worker, :status)`が返るまで待つ。
+4. `set_node_state!(node, NODE_BUSY)`を呼び、読取りでも`NODE_BUSY`を確認する。
+5. busy確認時刻を記録後、`respond_status!(worker, "STATUS|idle")`を呼ぶ。
+6. refreshをbounded waitし、戻り値`true`と最終`NODE_IDLE`を要求する。
+
+#### 時刻とlogの判定
+
+- `request.recorded_ns < busy_confirmed_ns < response.recorded_ns`を要求する。
+- worker request/responseは各1件で、request payloadは`STATUS`、responseは`STATUS|idle`とする。
+- 一時conductor logのnode状態遷移は、順に`down -> idle`、`idle -> busy`、`busy -> idle`を各1件含む。
+- 最後の`busy -> idle`を修正前不具合の再現証拠とする。
+
+#### Cleanupと副作用
+
+- `finally`でconductor log writer、偽worker、node stateを終了・初期化する。
+- 一時artifact以外のfileを生成・変更しない。
+- repository log SHA-1とGit差分を実行前後で一致させる。
+- test timeoutや順序不一致では`PASS_REPRODUCED`を出さない。
+
+### Phase 3: 実装する — 完了
+
+- `test/reproduction_conductor_stale_idle.jl`を追加した。
+- conductor mainやmonitorを起動せず、1 nodeの`refresh_states_until_idle!`だけを偽workerへ接続する構造にした。
+- STATUS request受信後に`NODE_BUSY`を設定し、busy確認後に保留した`STATUS|idle`を返す明示同期を実装した。
+- request、busy確認、responseのnanosecond順序と最終`NODE_IDLE`を検査する。
+- 一時conductor CSVの`down -> idle -> busy -> idle`順序を検査する。
+- `try/finally`でlog writer、偽worker、node stateをcleanupする。
+- production source、既存test、`test/runtests.jl`は変更していない。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+- 再現testを2回連続実行し、どちらも`19 / 19 pass`。
+- result: `STEP2_RESULT=PASS_REPRODUCED_STALE_IDLE`。
+- 1回目の状態遷移: `down -> idle -> busy -> idle`。
+- 2回目の状態遷移: `down -> idle -> busy -> idle`。
+- 両実行でSTATUS request受信後、response前の`NODE_BUSY`を確認した。
+- 両実行で遅延`STATUS|idle`反映後の最終状態は`NODE_IDLE`となった。
+- 1回目artifact: `/tmp/syncopade-stale-idle-step2.RRtqsL/`。
+- 1回目CSV SHA-1: `770e48c0dbe4ce492a0154bf8636ae05d4cd6a88`。
+- 2回目artifact: `/tmp/syncopade-stale-idle-step2-repeat.m3iuET/`。
+- 2回目CSV SHA-1: `41c54ba52c83cac85d5fe1d774214da910f4a08b`。
+- cleanup後、偽worker listenerとJulia processは残らなかった。
+- `git diff --check`と新規testのwhitespace checkはerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のまま。
+
+### Step 2結論
+
+現行conductorは、STATUS問い合わせ後にnode状態が`busy`へ進んでも、その問い合わせの古い`idle`結果を無条件に適用する。状態辞書の個別lockだけでは観測の新旧を保証できないことを、固定順序で2回再現した。
 
 ---
 
