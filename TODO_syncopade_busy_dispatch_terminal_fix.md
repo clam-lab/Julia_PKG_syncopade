@@ -378,7 +378,7 @@ node状態、世代、task/job割当てを一つのrecordとして原子的に�
 
 ---
 
-## Step 3: node選択と配送予約を一体化する — 未着手
+## Step 3: node選択と配送予約を一体化する — 完了
 
 ### 目的
 
@@ -406,13 +406,107 @@ idle nodeを選んでからworkerへ接続するまでの間に、同じnodeが�
 3. 受付成功後にtask IDとjob IDが同じ割当てへ保存されることを確認する。
 4. 既存queue testとconductor wrapper起動試験を実行する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- 右から左へidle nodeを探す処理と`NODE_RESERVED/task_id`へのrecord置換を、`node_states_lock`の同じ取得区間で実行する`reserve_idle_node_right_to_left!`へまとめる。
+- 既存`pick_idle_node_right_to_left`は読取り専用互換helperとして残すが、productionの`dispatch_queued_tasks`からは使わない。
+- 予約成立後は既存`NODE_STATE_CHANGED`に加え、task ID付き`NODE_RESERVED` eventを記録する。別taskとの二重予約またはidleなしでは状態もlogも変更しない。
+- LISTのidle抽出を`idle_node_endpoints()`へ分離し、予約中nodeを返さないことをnetworkなしで直接検証できるようにする。wireの`NODES|...`形式は変えない。
+- `dispatch_queued_tasks`はqueueからtaskを取り出した後、atomic予約helperでnodeを取得する。予約できなければ従来どおり同じtaskをretry増加なしでqueueへ戻し、そのcycleを終了する。
+- `dispatch_to_worker`は自taskの予約が存在することを送信前条件とする。`OK|STARTED|job_id`受信後は`mark_node_running!`で同じ予約へjob IDを確定する。
+- 受付成功後に予約確定が失敗した場合も、workerが受理済みのtaskを再投入しないよう配送結果自体は成功として扱い、`DISPATCH_ASSIGNMENT_CONFLICT`へ現在recordとjob IDを記録する。早いDONEとの厳密な照合はStep 4で解消する。
+- 受付前の例外では、task ID一致・job ID未確定の自予約だけを`NODE_DOWN`へ解放する。他taskへ割当てが変わっていた場合は無条件`set_node_state!(NODE_DOWN)`を行わず、`DISPATCH_RESERVATION_RELEASE_FAILED`を記録する。
+- Step 3では`ERROR|BUSY`はまだ一般例外なので、従来どおり予約解放後`down`とfailure retryになる。分類変更はStep 5〜6へ残す。
+- 単体試験では、右優先、LIST除外、逐次・同時二重予約拒否、正常ACK後のtask/job保存、受付失敗後に自予約だけが解放されることを確認する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### `reserve_idle_node_right_to_left!(nodes::Vector{NODES}, task_id::String)::Union{Nothing,NODES}`
+
+- 空でないtask IDを要求し、空なら`ArgumentError`とする。
+- `node_states_lock`を1回取得し、`reverse(nodes)`順で`NODE_IDLE`かつtask/job IDが空の最初のrecordを探す。
+- 見つかったrecordを`NODE_RESERVED`、指定task ID、空job ID、generation + 1へ置換し、そのnodeを返す。
+- 見つからなければ何も変更せず`nothing`を返す。
+- 予約成功時だけ`NODE_STATE_CHANGED`の`idle -> reserved`と`NODE_RESERVED`を各1件記録する。`NODE_RESERVED`にはtask IDとnode endpointを含める。
+- queue、retry、network I/Oは変更しない。
+
+#### `idle_node_endpoints()::Vector{String}`
+
+- `node_states_lock`内で`runtime_state.state == NODE_IDLE`のentryだけを`ip:port`へ変換して返す。
+- `NODE_RESERVED`、`NODE_BUSY`、`NODE_DOWN`は返さない。
+- state、generation、割当て、queue、logを変更しない。
+
+#### `node_reserved_for_task(node::NODES, task_id::String)::Bool`
+
+- 現在recordが`NODE_RESERVED`、task ID一致、job ID空なら`true`を返す読取り専用helperとする。
+- network、state、logを変更しない。
+
+#### `dispatch_to_worker(task, node)`の予約契約
+
+- network接続前に`node_reserved_for_task(node, task.task_id)`を要求し、不成立なら`ArgumentError`を送出して通信しない。
+- 正常ACKで得たjob IDを`mark_node_running!`へ渡す。
+- mark成功時は従来どおり`DISPATCH_OK`を記録して`true`を返す。
+- mark不成立でもworker受付は成功済みなので、`DISPATCH_ASSIGNMENT_CONFLICT`へtask ID、job ID、現在state/generation/割当てを記録し、`DISPATCH_OK`と`true`を返す。queueへ戻さない。
+- ACK前の例外では`release_node_assignment!(node, task.task_id, ""; next_state=NODE_DOWN)`を呼ぶ。成功時は自予約だけが消える。
+- release不成立時は`DISPATCH_RESERVATION_RELEASE_FAILED`へ現在recordを記録し、他割当てを変更しない。
+- 例外経路は既存`DISPATCH_FAILED`を記録して`false`を返す。
+
+#### `dispatch_queued_tasks`の選択契約
+
+- `pick_idle_node_right_to_left`の代わりに`reserve_idle_node_right_to_left!`を呼ぶ。
+- `nothing`なら取り出したtaskをそのままqueue末尾へ戻し、`NO_IDLE_REQUEUE`を記録してreturnする。
+- nodeを得た場合だけ`dispatch_to_worker`を呼ぶ。
+- `false`の場合のfailure retryはStep 3では既存どおり維持する。
+
+#### 単体試験
+
+- file: `test/unit_conductor_dispatch_reservation.jl`。
+- `--threads=4`で実行し、1 nodeへ同時に二つのtask IDから予約を試みて成功が1件だけであることを確認する。
+- 3 nodesのidle/busy配置で右端idleが選ばれ、予約後に`idle_node_endpoints()`から除外されることを確認する。
+- 制御workerの正常ACKでrecordが`busy/task_id/job_id`になることを確認する。
+- 制御workerの現行BUSY例外で自予約だけが`down`へ解放され、taskがretry 1でqueueへ戻ることを確認する。
+- 一時logから`NODE_RESERVED`、`DISPATCH_OK`、`DISPATCH_FAILED`をtask IDごとに照合する。
+- `finally`でworker、log writer、queue、node stateをcleanupする。
+
+### Phase 3: 実装する — 完了
+
+- `reserve_idle_node_right_to_left!`を追加し、右から左のidle探索とtask ID付き予約を一つの`node_states_lock`区間へ統合した。
+- 予約済みnode判定とidle endpoint抽出を追加し、LISTを共通抽出helperへ接続した。
+- `dispatch_queued_tasks`をread-only pickからatomic予約へ変更した。
+- `dispatch_to_worker`へ予約precondition、正常ACK後のjob ID確定、受付成功後の割当て競合監査、例外時の自予約だけの解放を実装した。
+- 予約解放に失敗した場合は他taskの割当てを変更せず、`DISPATCH_RESERVATION_RELEASE_FAILED`へ現在recordを残すようにした。
+- `test/unit_conductor_dispatch_reservation.jl`を追加し、右優先、LIST除外、同時予約、正常ACK、現行BUSY失敗を独立に検査する構造を実装した。
+- BUSY分類、DONE照合、task lifecycleは変更していない。
+- `git diff --check`で検査できる範囲のwhitespace不整合はない。機能検証はPhase 4で行う。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 初回検証と強化C補正
+
+- 初回の正常ACK経路は、`split`由来の`SubString` job IDを`mark_node_running!(..., job_id::String)`へ渡したため`MethodError`となり、5 assertionsが失敗した。
+- wire応答、状態設計、Todo前提の問題ではなく、灯子が配送境界で具体的な`String`へ確定しなかった局所的な型ミスだった。
+- ACK取得時に`String(fetch(dispatch_task))`へ直し、同じPhase 4を最初から再実行した。
+- 失敗したtestset内でもPASS markerが先に表示される配置も灯子の試験記述ミスだったため、testset成功後だけ表示する位置へ同時に修正した。
+
+#### 最終検証
+
+- `julia --startup-file=no --threads=4 --project=. test/unit_conductor_dispatch_reservation.jl`を補正後2回実行し、いずれもexit `0`、`29 / 29 pass`、marker `STEP3_RESULT=PASS_ATOMIC_DISPATCH_RESERVATION`。
+- 右優先予約、予約中LIST除外、逐次予約、4 threads上の二重予約競合で成功1件/失敗1件を確認した。
+- 正常ACKはrecordが`busy/task-success/job-success`となり、queueは0だった。
+- 現行BUSY例外は自予約だけを`down`へ解放し、taskをretry 1でqueueへ戻した。BUSY専用修正前なのでStep 3の期待どおりである。
+- `test/regression_conductor_stale_idle.jl`: exit `0`、`26 / 26 pass`、artifact `/tmp/syncopade-step3-stale.niQJXB`。
+- `test/reproduction_conductor_busy_drop.jl`: exit `0`、`39 / 39 pass`、artifact `/tmp/syncopade-step3-busy.BG7Fd7`。
+- `test/unit_conductor_node_state.jl`: exit `0`、`55 / 55 pass`。
+- `test/unit_conductor_queue.jl`: exit `0`、`17 / 17 pass`。
+- `test/integration_conductor_wrapper_entrypoint.jl 192.168.100.30 9030 8.0`: exit `0`、marker `STEP3_RESULT=PASS_WRAPPER_ENTRYPOINT_REGRESSION`。
+- wrapperは`NODES|`を返して継続起動し、SIGTERMで終了、SIGKILL fallbackなし、include-onlyはexit `0`、最終9030/tcp再bind成功だった。
+- wrapper artifact: `/var/folders/__/7pnh5g_x5qb2r25n4tgyyhww0000gn/T/syncopade-wrapper-entrypoint-TPdxIJ`。
+- `git diff --check`はerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のままで、先生の既存差分を変更していない。
+
+### Step 3結論
+
+nodeの右優先選択とtask ID付き予約が一つのlock区間になり、予約中nodeはLISTと後続選択から除外される。正常ACKは同じ予約へjob IDを保存し、ACK前失敗は他taskへ触れず自予約だけを解放することを確認した。
 
 ---
 

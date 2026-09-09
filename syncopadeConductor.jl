@@ -783,7 +783,67 @@ function pick_idle_node_right_to_left(nodes::Vector{NODES})::Union{Nothing,NODES
     return nothing
 end
 
+function reserve_idle_node_right_to_left!(
+    nodes::Vector{NODES},
+    task_id::String
+)::Union{Nothing,NODES}
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    selected = nothing
+    lock(node_states_lock) do
+        for node in reverse(nodes)
+            key = (node.IP, node.port)
+            current = get(node_states, key, default_node_runtime_state())
+            if current.state == NODE_IDLE && isempty(current.task_id) && isempty(current.job_id)
+                node_states[key] = NodeRuntimeState(
+                    NODE_RESERVED,
+                    current.generation + UInt64(1),
+                    task_id,
+                    ""
+                )
+                selected = node
+                break
+            end
+        end
+    end
+
+    if selected !== nothing
+        log_node_state_change(selected, NODE_IDLE, NODE_RESERVED)
+        log_conductor_event(
+            "NODE_RESERVED";
+            task_id=task_id,
+            node_name=selected.name,
+            node_ip=selected.IP,
+            node_port=selected.port,
+            queue_len=queue_len(),
+            state_from=string(NODE_IDLE),
+            state_to=string(NODE_RESERVED)
+        )
+    end
+    return selected
+end
+
+function node_reserved_for_task(node::NODES, task_id::String)::Bool
+    current = get_node_runtime_state(node)
+    return current.state == NODE_RESERVED &&
+        current.task_id == task_id &&
+        isempty(current.job_id)
+end
+
+function idle_node_endpoints()::Vector{String}
+    lock(node_states_lock) do
+        endpoints = String[]
+        for ((ip, port), runtime_state) in node_states
+            runtime_state.state == NODE_IDLE || continue
+            push!(endpoints, string(ip, ":", port))
+        end
+        return endpoints
+    end
+end
+
 function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
+    node_reserved_for_task(node, task.task_id) || throw(ArgumentError(
+        "node $(node.IP):$(node.port) is not reserved for task $(task.task_id)"
+    ))
     conductor_ip = string(preferred_local_ip())
     conductor_port_num = conductor_port()
     wire_args = copy(task.args)
@@ -817,8 +877,27 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
         if w === :timed_out
             throw(ArgumentError("dispatch timeout waiting worker start-ack > $(DEFAULT_DISPATCH_TIMEOUT)s"))
         end
-        jobId = fetch(dispatch_task)
-        set_node_state!(node, NODE_BUSY)
+        jobId = String(fetch(dispatch_task))
+        assignment_recorded = mark_node_running!(node, task.task_id, jobId)
+        if !assignment_recorded
+            current = get_node_runtime_state(node)
+            log_task_event(
+                "DISPATCH_ASSIGNMENT_CONFLICT",
+                task;
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                job_id=jobId,
+                queue_len=queue_len(),
+                state_from=string(current.state),
+                state_to=string(NODE_BUSY),
+                error=string(
+                    "current_generation=", current.generation,
+                    " current_task_id=", current.task_id,
+                    " current_job_id=", current.job_id
+                )
+            )
+        end
         println("Dispatch OK ", task_label(task), " worker=", node.name, " jobId=", jobId)
         log_task_event(
             "DISPATCH_OK",
@@ -831,7 +910,30 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
         )
         return true
     catch e
-        set_node_state!(node, NODE_DOWN)
+        released = release_node_assignment!(
+            node,
+            task.task_id,
+            "";
+            next_state=NODE_DOWN
+        )
+        if !released
+            current = get_node_runtime_state(node)
+            log_task_event(
+                "DISPATCH_RESERVATION_RELEASE_FAILED",
+                task;
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                job_id=current.job_id,
+                queue_len=queue_len(),
+                state_from=string(current.state),
+                state_to=string(NODE_DOWN),
+                error=string(
+                    "current_generation=", current.generation,
+                    " current_task_id=", current.task_id
+                )
+            )
+        end
         println("Dispatch failed ", task_label(task), " worker=", node.name, " error=", e)
         log_task_event(
             "DISPATCH_FAILED",
@@ -851,7 +953,7 @@ function dispatch_queued_tasks(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY
         task = pop_task!()
         task === nothing && return
 
-        node = pick_idle_node_right_to_left(nodes)
+        node = reserve_idle_node_right_to_left!(nodes, task.task_id)
         if node === nothing
             # keep LIFO order semantics by putting the latest task back on top
             println("No idle worker. Requeue ", task_label(task))
@@ -935,14 +1037,7 @@ function conductor_server()
                     cmd = parts[1]
 
                     if cmd == "LIST"
-                        idle_nodes = String[]
-                        lock(node_states_lock) do
-                            for ((ip, p), runtime_state) in node_states
-                                if runtime_state.state == NODE_IDLE
-                                    push!(idle_nodes, string(ip, ":", p))
-                                end
-                            end
-                        end
+                        idle_nodes = idle_node_endpoints()
                         println(sock, add_checksum("NODES|" * join(idle_nodes, "|")))
                     elseif cmd == "SUBMIT"
                         println("SUBMIT payload = ", payload)
