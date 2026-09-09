@@ -5,7 +5,6 @@ using Sockets
 using UUIDs
 
 # shared state for conductor
-const node_states = Dict{Tuple{String,Int},Symbol}()
 const node_states_lock = ReentrantLock()
 const task_queue_lock = ReentrantLock()
 const dispatch_lock = ReentrantLock()
@@ -27,11 +26,20 @@ struct ConductorTask
     retry_count::Int
 end
 
-const task_queue = ConductorTask[]
-
 const NODE_IDLE = :idle
 const NODE_BUSY = :busy
 const NODE_DOWN = :down
+const NODE_RESERVED = :reserved
+
+struct NodeRuntimeState
+    state::Symbol
+    generation::UInt64
+    task_id::String
+    job_id::String
+end
+
+const node_states = Dict{Tuple{String,Int},NodeRuntimeState}()
+const task_queue = ConductorTask[]
 
 const DEFAULT_POLL_INTERVAL = 2.0  # seconds
 const DEFAULT_STATUS_TIMEOUT = 0.2  # seconds (per node)
@@ -528,31 +536,168 @@ function requeue_with_retry!(task::ConductorTask; max_retry=DEFAULT_MAX_RETRY)
     log_task_event("TASK_REQUEUED", retried; queue_len=queue_len())
 end
 
-function get_node_state(node::NODES)::Symbol
+function default_node_runtime_state()::NodeRuntimeState
+    return NodeRuntimeState(NODE_DOWN, UInt64(0), "", "")
+end
+
+function get_node_runtime_state(node::NODES)::NodeRuntimeState
     lock(node_states_lock) do
-        return get(node_states, (node.IP, node.port), NODE_DOWN)
+        return get(node_states, (node.IP, node.port), default_node_runtime_state())
     end
 end
 
-function set_node_state!(node::NODES, state::Symbol)
+function get_node_state(node::NODES)::Symbol
+    return get_node_runtime_state(node).state
+end
+
+function validate_legacy_node_state(state::Symbol)
+    state in (NODE_IDLE, NODE_BUSY, NODE_DOWN) && return nothing
+    throw(ArgumentError("unsupported node state: $state"))
+end
+
+function validate_observed_node_state(state::Symbol)
+    state in (NODE_IDLE, NODE_BUSY, NODE_DOWN) && return nothing
+    throw(ArgumentError("unsupported observed node state: $state"))
+end
+
+function validate_release_node_state(state::Symbol)
+    state in (NODE_IDLE, NODE_DOWN) && return nothing
+    throw(ArgumentError("unsupported node release state: $state"))
+end
+
+function log_node_state_change(node::NODES, prev_state::Symbol, next_state::Symbol)
+    prev_state == next_state && return nothing
+    log_conductor_event(
+        "NODE_STATE_CHANGED";
+        node_name=node.name,
+        node_ip=node.IP,
+        node_port=node.port,
+        state_from=string(prev_state),
+        state_to=string(next_state),
+        queue_len=queue_len()
+    )
+    return nothing
+end
+
+function set_node_state!(node::NODES, state::Symbol)::Nothing
+    validate_legacy_node_state(state)
     prev_state = NODE_DOWN
     changed = false
     lock(node_states_lock) do
-        prev_state = get(node_states, (node.IP, node.port), NODE_DOWN)
-        node_states[(node.IP, node.port)] = state
-        changed = prev_state != state
-    end
-    if changed
-        log_conductor_event(
-            "NODE_STATE_CHANGED";
-            node_name=node.name,
-            node_ip=node.IP,
-            node_port=node.port,
-            state_from=string(prev_state),
-            state_to=string(state),
-            queue_len=queue_len()
+        key = (node.IP, node.port)
+        current = get(node_states, key, default_node_runtime_state())
+        prev_state = current.state
+        clear_assignment = state == NODE_IDLE || state == NODE_DOWN
+        task_id = clear_assignment ? "" : current.task_id
+        job_id = clear_assignment ? "" : current.job_id
+        node_states[key] = NodeRuntimeState(
+            state,
+            current.generation + UInt64(1),
+            task_id,
+            job_id
         )
+        changed = current.state != state
     end
+    changed && log_node_state_change(node, prev_state, state)
+    return nothing
+end
+
+function apply_observed_node_state!(
+    node::NODES,
+    state::Symbol,
+    expected_generation::UInt64
+)::Bool
+    validate_observed_node_state(state)
+    prev_state = NODE_DOWN
+    applied = false
+    state_changed = false
+    lock(node_states_lock) do
+        key = (node.IP, node.port)
+        current = get(node_states, key, default_node_runtime_state())
+        prev_state = current.state
+        if current.generation == expected_generation && isempty(current.task_id)
+            node_states[key] = NodeRuntimeState(
+                state,
+                current.generation + UInt64(1),
+                "",
+                ""
+            )
+            applied = true
+            state_changed = current.state != state
+        end
+    end
+    state_changed && log_node_state_change(node, prev_state, state)
+    return applied
+end
+
+function try_reserve_node!(node::NODES, task_id::String)::Bool
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    reserved = false
+    lock(node_states_lock) do
+        key = (node.IP, node.port)
+        current = get(node_states, key, default_node_runtime_state())
+        if current.state == NODE_IDLE && isempty(current.task_id) && isempty(current.job_id)
+            node_states[key] = NodeRuntimeState(
+                NODE_RESERVED,
+                current.generation + UInt64(1),
+                task_id,
+                ""
+            )
+            reserved = true
+        end
+    end
+    reserved && log_node_state_change(node, NODE_IDLE, NODE_RESERVED)
+    return reserved
+end
+
+function mark_node_running!(node::NODES, task_id::String, job_id::String)::Bool
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    isempty(job_id) && throw(ArgumentError("job_id must not be empty"))
+    marked = false
+    lock(node_states_lock) do
+        key = (node.IP, node.port)
+        current = get(node_states, key, default_node_runtime_state())
+        if current.state == NODE_RESERVED && current.task_id == task_id && isempty(current.job_id)
+            node_states[key] = NodeRuntimeState(
+                NODE_BUSY,
+                current.generation + UInt64(1),
+                task_id,
+                job_id
+            )
+            marked = true
+        end
+    end
+    marked && log_node_state_change(node, NODE_RESERVED, NODE_BUSY)
+    return marked
+end
+
+function release_node_assignment!(
+    node::NODES,
+    task_id::String,
+    job_id::String;
+    next_state::Symbol=NODE_IDLE
+)::Bool
+    validate_release_node_state(next_state)
+    released = false
+    prev_state = NODE_DOWN
+    lock(node_states_lock) do
+        key = (node.IP, node.port)
+        current = get(node_states, key, default_node_runtime_state())
+        prev_state = current.state
+        if !isempty(current.task_id) &&
+           current.task_id == task_id &&
+           current.job_id == job_id
+            node_states[key] = NodeRuntimeState(
+                next_state,
+                current.generation + UInt64(1),
+                "",
+                ""
+            )
+            released = true
+        end
+    end
+    released && log_node_state_change(node, prev_state, next_state)
+    return released
 end
 
 function probe_nodes_parallel(nodes::Vector{NODES}; timeout=DEFAULT_STATUS_TIMEOUT)::Vector{Symbol}
@@ -739,8 +884,8 @@ function conductor_server()
                     if cmd == "LIST"
                         idle_nodes = String[]
                         lock(node_states_lock) do
-                            for ((ip, p), state) in node_states
-                                if state == NODE_IDLE
+                            for ((ip, p), runtime_state) in node_states
+                                if runtime_state.state == NODE_IDLE
                                     push!(idle_nodes, string(ip, ":", p))
                                 end
                             end

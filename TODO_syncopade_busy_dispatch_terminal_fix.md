@@ -116,7 +116,7 @@ A(n) \in \{\varnothing, (task\_id, job\_id?)\}
 
 ---
 
-## Step 1: node状態と割当ての原子的な遷移を定義する — 未着手
+## Step 1: node状態と割当ての原子的な遷移を定義する — 完了
 
 ### 目的
 
@@ -142,13 +142,106 @@ nodeの単純な状態記号だけでなく、状態の世代と現在のtask/jo
 3. 古い世代の更新、不一致task ID、不一致job IDが無視されることを確認する。
 4. `test/unit_conductor_queue.jl`を含む既存の軽量試験を実行する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- 現在の`Dict{Tuple{String,Int},Symbol}`を、同じendpoint keyの`NodeRuntimeState`へ置き換える。recordは`state`、単調増加する`generation`、`task_id`、`job_id`を持つimmutableな内部型とし、lock外へ参照を返しても後から内容が変わらない構造にする。
+- 未割当ては空文字列で表し、`reserved`はtask IDあり・job IDなし、worker受付後の`busy`はtask IDとjob IDの両方ありとする。外部STATUSで観測した`busy`は割当てIDなしを許す。
+- 新しい内部操作は、snapshot取得、世代一致時だけの観測反映、idleからのtask予約、同じtask予約へのjob ID確定、task/job一致時だけの解放に分ける。各操作は`node_states_lock`を1回だけ取得し、判定と更新を同じlock区間で行う。
+- 更新はrecord全体の置換とし、成立した更新ごとに`generation`を1増やす。古い世代、不一致task、不一致job、二重予約はrecordを変更せず失敗を返す。
+- 既存`get_node_state`はrecordの`state`だけを返す互換入口として残す。既存`set_node_state!`もStep 1では残し、状態更新時に世代を進め、`idle`または`down`への従来更新では割当てを空にする。後続Stepでmonitor、dispatch、DONEを専用操作へ順に置き換える。
+- 現在`node_states`を直接読むLIST処理だけは、recordの`state`を読むよう追従させる。monitor、配送、DONEの挙動変更はこのStepへ混ぜない。
+- 単体試験はnetworkを使わず、正常遷移、二重予約拒否、古い世代の観測拒否、task/job不一致解放拒否、record snapshotの不変性を確認する。
+- 監査logは既存`NODE_STATE_CHANGED`を維持する。新しい遷移固有eventの追加は、その遷移をproduction経路へ接続するSteps 2〜4で行う。
+- `logs/conductor_events.csv`へ書かないよう、試験processではinclude前に一時log pathを設定し、終了時にwriterとglobal stateを片付ける。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### `NodeRuntimeState`
+
+- fields: `state::Symbol`、`generation::UInt64`、`task_id::String`、`job_id::String`。
+- 未登録nodeの論理値は`NodeRuntimeState(NODE_DOWN, 0, "", "")`とする。読取りだけでは辞書へ追加しない。
+- `NODE_RESERVED = :reserved`を内部状態へ追加する。workerのSTATUS応答が返す状態ではなく、conductor内だけの配送予約状態とする。
+- recordはimmutableとし、更新前に取得したsnapshotのfieldsは後続更新で変化しない。
+
+#### `get_node_runtime_state(node::NODES)::NodeRuntimeState`
+
+- endpoint keyで現在recordをlock内取得し、未登録なら上記の初期値を返す。
+- network、log、辞書追加を行わない。
+
+#### `get_node_state(node::NODES)::Symbol`
+
+- `get_node_runtime_state(node).state`だけを返す既存互換APIとする。
+- network、log、状態変更を行わない。
+
+#### `set_node_state!(node::NODES, state::Symbol)::Nothing`
+
+- 既存互換の無条件更新入口として残し、更新のたびにgenerationを1増やす。
+- `state`が`NODE_IDLE`または`NODE_DOWN`ならtask/job割当てを空にする。`NODE_BUSY`なら現在の割当てを維持する。
+- stateが変わった場合だけ既存`NODE_STATE_CHANGED`を記録する。割当てまたはgenerationだけの変更では、このStepで新eventを増やさない。
+- 互換入口で許可する`NODE_IDLE`、`NODE_BUSY`、`NODE_DOWN`以外は`ArgumentError`とし、内部専用`NODE_RESERVED`は予約関数からだけ設定する。
+
+#### `apply_observed_node_state!(node::NODES, state::Symbol, expected_generation::UInt64)::Bool`
+
+- worker状態確認の結果を適用する内部関数とする。
+- 現在generationが`expected_generation`と一致し、task割当てが空の場合だけ状態を置換し、generationを1増やして`true`を返す。
+- 世代不一致または割当てありでは何も変更せず`false`を返す。
+- 許可する観測値は`NODE_IDLE`、`NODE_BUSY`、`NODE_DOWN`だけとし、`NODE_RESERVED`は`ArgumentError`とする。
+- Step 1ではproductionの状態確認経路からまだ呼ばない。
+
+#### `try_reserve_node!(node::NODES, task_id::String)::Bool`
+
+- 空でないtask IDを要求する。
+- 現在状態が`NODE_IDLE`かつtask/job割当てが空の場合だけ、`NODE_RESERVED`、指定task ID、空job IDへ置換し、generationを1増やして`true`を返す。
+- 条件不一致ではrecordを変えず`false`を返す。
+- worker接続、queue変更、task retry変更を行わない。
+
+#### `mark_node_running!(node::NODES, task_id::String, job_id::String)::Bool`
+
+- 空でないtask IDとjob IDを要求する。
+- 現在状態が`NODE_RESERVED`、task ID一致、job ID未確定の場合だけ`NODE_BUSY`と指定job IDへ置換し、generationを1増やして`true`を返す。
+- 条件不一致ではrecordを変えず`false`を返す。
+
+#### `release_node_assignment!(node::NODES, task_id::String, job_id::String; next_state::Symbol=NODE_IDLE)::Bool`
+
+- 現在のtask IDとjob IDが引数に完全一致し、task IDが空でない場合だけ割当てを空にし、`next_state`へ置換してgenerationを1増やし、`true`を返す。
+- `next_state`は`NODE_IDLE`または`NODE_DOWN`だけを許可する。
+- task不一致、job不一致、割当てなしではrecordを変えず`false`を返す。
+- Step 1ではproductionのDONE経路からまだ呼ばない。
+
+#### 単体試験と副作用境界
+
+- file: `test/unit_conductor_node_state.jl`。
+- include前に`SYNCOPADE_CONDUCTOR_LOG`をrepository外の一時pathへ設定する。
+- 未登録初期値、legacy set/get、正常予約・受付・解放、二重予約、古い世代、不一致task/job、snapshot不変性、invalid stateを確認する。
+- `finally`でlog writerを停止し、`node_states`をlock内で空にする。
+- 実行後に一時log以外のfile、listener、processを残さない。
+
+### Phase 3: 実装する — 完了
+
+- `NodeRuntimeState`と内部状態`NODE_RESERVED`を追加し、`node_states`のvalueを状態recordへ変更した。
+- 未登録nodeの副作用なしsnapshot取得、legacy state取得・設定、世代一致観測反映、idle予約、job ID確定、一致割当て解放を実装した。
+- 各遷移の判定とrecord置換を`node_states_lock`内で一体化し、成立しない操作はrecordを変更せず`false`を返すようにした。
+- legacy `set_node_state!`は`NODE_IDLE`、`NODE_BUSY`、`NODE_DOWN`だけを受け付け、既存呼出しの戻り値と状態取得契約を維持した。
+- LISTの直接辞書参照を`NodeRuntimeState.state`へ追従させた。monitor、dispatch、DONEの呼出し経路はまだ変更していない。
+- `test/unit_conductor_node_state.jl`を追加し、一時log、global state cleanupを含むnetworkなしの単体試験を実装した。
+- `git diff --check`で検査できる範囲のwhitespace不整合はない。機能検証はPhase 4で行う。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+- `julia --startup-file=no --project=. test/unit_conductor_node_state.jl`: exit `0`、`55 / 55 pass`、marker `STEP1_RESULT=PASS_NODE_RUNTIME_STATE`。
+- 未登録読取りは辞書を変更せず、legacy set/get、`idle -> reserved -> busy -> idle`、二重予約拒否、古い世代拒否、task/job不一致拒否、snapshot不変性、invalid stateを確認した。
+- repository外logで`test/unit_conductor_queue.jl`を実行し、exit `0`、`17 / 17 pass`。
+- Step 1でproduction経路の挙動を変えていないことを確認するため、修正前再現3本も独立processで再実行した。
+  - stale idle: exit `0`、`19 / 19 pass`、artifact `/tmp/syncopade-step1-stale.1WStFj`。
+  - BUSY retry/drop: exit `0`、`39 / 39 pass`、artifact `/tmp/syncopade-step1-busy.3gNYI3`。
+  - silent drop: exit `0`、`9 / 9 pass`、artifact `/tmp/syncopade-step1-silent.XHcp96`。
+- `git diff --check`はerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のままで、先生の既存差分を変更していない。
+- 起動した試験processとlistenerの残留はない。
+
+### Step 1結論
+
+node状態、世代、task/job割当てを一つのrecordとして原子的に更新できる内部境界が成立した。既存の状態取得・設定、queue、修正前再現経路は維持されており、STATUS、dispatch、DONEへの接続は後続Stepへ分離できている。
 
 ---
 
