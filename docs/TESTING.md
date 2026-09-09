@@ -21,7 +21,7 @@ test helper globals from leaking into the next test.
 - `test/integration_conductor_node_exclusivity.jl`: four-task lan100
   exclusivity and task-terminal regression.
 
-## 3. Run unit tests
+## 3. Run the deterministic suite
 ```bash
 julia --startup-file=no --project=. --threads=4 test/runtests.jl
 ```
@@ -30,7 +30,7 @@ The command exits nonzero if a child test exits nonzero or writes to stderr.
 Conductor logs used by the suite are placed in a temporary directory and
 removed at the end, so `logs/conductor_events.csv` is not modified.
 
-## 4. Run one-PC integration test
+## 4. Run one-PC integration tests
 Open 3 terminals in project root.
 
 Terminal A:
@@ -91,6 +91,12 @@ on timing; deterministic BUSY retention is covered by
 
 Stop the server with `q` and the conductor with SIGINT. Verify ports 8030, 9030,
 and the four callback ports can be rebound after shutdown.
+
+`test/integration_server_busy_acceptance.jl` is a preserved pre-fix harness
+that expects the old overlapping behavior. It is historical evidence, not a
+current regression test, and is intentionally excluded from `test/runtests.jl`.
+Use `test/integration_server_busy_rejection.jl` for the current one-server
+admission contract.
 
 Conductor entrypoint contract:
 - Direct execution of `syncopadeConductor.jl` starts `main()` through its

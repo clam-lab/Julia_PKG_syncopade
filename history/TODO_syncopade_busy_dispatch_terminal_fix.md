@@ -1,4 +1,8 @@
-# Syncopade BUSY配送・終端通知 修正 Todo
+# Syncopade BUSY配送・終端通知 修正 Todo（完了記録）
+
+- 実装修正・統合試験完了commit: `eb13d14d7c707c972b01d8a94091befa68858f26`
+- 完了時点のbranch: `master`、`origin/master`と一致
+- 本記録の退避と文書整理、version更新は上記commitの後続作業として分離する
 
 ## 目的
 
@@ -1541,5 +1545,5 @@ worker job IDが発行されないままconductorがtaskをterminalにした場�
 - wire callbackはworker受理後の`TASK_RESULT|task_id|job_id|OK/ERROR|...`と、worker未受理terminalの`TASK_RESULT|task_id||ERROR|terminal_kind|reason`。legacy `RESULT` parserと3引数handlerは互換維持する。
 - sibling repositoryはSyncopade依存をこの修正版へ更新し、可能なら4引数result handler `(task_id, job_id, ok, payload)`または`submit_conductor_task_and_wait`を使う。長時間taskは900秒固定にせず、実行時間を含む十分な`acceptance_timeout_seconds`を明示する。
 - 実稼働へ反映する際はconductor/serverを同じrevisionへ更新して再起動し、task code更新を伴う場合は全node cache clearで`failed_nodes == 0`かつ`success_nodes == total_nodes`を確認してから投入する。
-- Step別commitは`974158d`、`6f8429b`、`e8e25b`、`d29c2b`、`bf2fbfa`、`a26386c`、`2a240ad`、`68cc929`、`ecd2e59`、`871c35a`。Step 11 commit/hashはpush後の最終報告へ記載する。
+- Step別commitは`974158d`、`6f8429b`、`e8e25b`、`d29c2b`、`bf2fbfa`、`a26386c`、`2a240ad`、`68cc929`、`ecd2e59`、`871c35a`、`eb13d14`。
 - version更新、tag、release、sibling repositoryの変更は行っていない。
