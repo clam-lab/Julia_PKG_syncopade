@@ -95,6 +95,22 @@ struct UnknownConductorTaskStatus <: ConductorTaskStatus
 end
 
 
+"""
+    SyncopadeResultMessage
+
+Normalized callback result parsed from either legacy `RESULT` or task-aware
+`TASK_RESULT` payloads. `task_id` is empty only for the legacy protocol, and
+`job_id` may be empty only for a task-aware failure before worker acceptance.
+"""
+struct SyncopadeResultMessage
+    protocol::Symbol
+    task_id::String
+    job_id::String
+    ok::Bool
+    payload::String
+end
+
+
 function Base.showerror(io::IO, error_value::SyncopadeWorkerBusyError)
     print(io, "Unexpected response from server: ", error_value.raw_response)
 end
@@ -261,6 +277,121 @@ function parse_conductor_task_status_response(
 end
 
 
+"""
+    parse_syncopade_result_payload(payload) -> SyncopadeResultMessage
+
+Parse a checksum-free Syncopade callback payload. Supports legacy `RESULT` and
+task-aware `TASK_RESULT` while rejecting missing identifiers, unknown statuses,
+and malformed success or error fields.
+"""
+function parse_syncopade_result_payload(
+    payload_value::AbstractString
+)::SyncopadeResultMessage
+    payload = String(chomp(payload_value))
+    parts = split(payload, '|'; keepempty=true)
+    isempty(parts) && throw(ArgumentError("empty Syncopade result payload"))
+
+    if parts[1] == "RESULT"
+        length(parts) >= 4 || throw(ArgumentError("malformed RESULT payload: $payload"))
+        job_id = String(parts[2])
+        isempty(job_id) && throw(ArgumentError("RESULT job_id must not be empty"))
+        status = parts[3]
+        if status == "OK"
+            return SyncopadeResultMessage(
+                :legacy_result,
+                "",
+                job_id,
+                true,
+                String(join(parts[4:end], "|"))
+            )
+        elseif status == "ERROR"
+            length(parts) >= 5 || throw(ArgumentError(
+                "malformed RESULT ERROR payload: $payload"
+            ))
+            error_type = String(parts[4])
+            isempty(error_type) && throw(ArgumentError(
+                "RESULT error_type must not be empty"
+            ))
+            return SyncopadeResultMessage(
+                :legacy_result,
+                "",
+                job_id,
+                false,
+                error_type * "|" * String(join(parts[5:end], "|"))
+            )
+        end
+        throw(ArgumentError("unsupported RESULT status: $status"))
+    elseif parts[1] == "TASK_RESULT"
+        length(parts) >= 5 || throw(ArgumentError(
+            "malformed TASK_RESULT payload: $payload"
+        ))
+        task_id = String(parts[2])
+        isempty(task_id) && throw(ArgumentError("TASK_RESULT task_id must not be empty"))
+        job_id = String(parts[3])
+        status = parts[4]
+        if status == "OK"
+            isempty(job_id) && throw(ArgumentError(
+                "TASK_RESULT OK job_id must not be empty"
+            ))
+            return SyncopadeResultMessage(
+                :task_result,
+                task_id,
+                job_id,
+                true,
+                String(join(parts[5:end], "|"))
+            )
+        elseif status == "ERROR"
+            length(parts) >= 6 || throw(ArgumentError(
+                "malformed TASK_RESULT ERROR payload: $payload"
+            ))
+            error_type = String(parts[5])
+            isempty(error_type) && throw(ArgumentError(
+                "TASK_RESULT error_type must not be empty"
+            ))
+            return SyncopadeResultMessage(
+                :task_result,
+                task_id,
+                job_id,
+                false,
+                error_type * "|" * String(join(parts[6:end], "|"))
+            )
+        end
+        throw(ArgumentError("unsupported TASK_RESULT status: $status"))
+    end
+
+    throw(ArgumentError("unsupported Syncopade result prefix: $(parts[1])"))
+end
+
+
+function invoke_syncopade_result_handler(
+    handler,
+    message::SyncopadeResultMessage
+)::Nothing
+    args3 = (message.job_id, message.ok, message.payload)
+    args4 = (message.task_id, message.job_id, message.ok, message.payload)
+    if message.protocol == :task_result
+        if applicable(handler, args4...)
+            handler(args4...)
+        elseif applicable(handler, args3...)
+            handler(args3...)
+        else
+            throw(MethodError(handler, args4))
+        end
+    elseif message.protocol == :legacy_result
+        if applicable(handler, args3...)
+            handler(args3...)
+        elseif applicable(handler, args4...)
+            handler(args4...)
+        else
+            throw(MethodError(handler, args3))
+        end
+    else
+        throw(ArgumentError("unsupported result protocol: $(message.protocol)"))
+    end
+    return nothing
+end
+
+
 function parse_worker_start_response(response::AbstractString)::WorkerStartReply
     raw_response = String(chomp(response))
     parts = split(raw_response, '|'; keepempty=true)
@@ -335,9 +466,12 @@ Start a result receiver server that listens forever and dispatches callbacks asy
 # Expected Payload Formats
 - `RESULT|jobId|OK|value`
 - `RESULT|jobId|ERROR|errType|errMsg`
+- `TASK_RESULT|taskId|jobId|OK|value`
+- `TASK_RESULT|taskId|jobId|ERROR|errType|errMsg`
 
 # Handler Signature
-`handler(jobId::String, ok::Bool, payload::String)`
+Legacy handlers keep `handler(jobId::String, ok::Bool, payload::String)`.
+Task-aware handlers use `handler(taskId::String, jobId::String, ok::Bool, payload::String)`.
 - When `ok == true`, `payload` is `value`.
 - When `ok == false`, `payload` is `"errType|errMsg"`.
 
@@ -359,23 +493,8 @@ function syncopade_result_server(port::Int, handler::Function)
                     close(sock)
                     return
                 end
-                parts = split(payload, '|')
-                # expected format:
-                # RESULT|jobId|OK|value
-                # or
-                # RESULT|jobId|ERROR|errType|errMsg
-                if length(parts) >= 4 && parts[1] == "RESULT"
-                    jobId = parts[2]
-                    status = parts[3]
-                    if status == "OK"
-                        value = join(parts[4:end], "|")
-                        handler(jobId, true, value)
-                    elseif status == "ERROR" && length(parts) >= 5
-                        errType = parts[4]
-                        errMsg = join(parts[5:end], "|")
-                        handler(jobId, false, errType * "|" * errMsg)
-                    end
-                end
+                message = parse_syncopade_result_payload(payload)
+                invoke_syncopade_result_handler(handler, message)
             catch e
                 # ignore errors in handler
             end
@@ -392,9 +511,12 @@ Start a one-shot result receiver: accepts exactly one connection, handles one RE
 # Expected Payload Formats
 - `RESULT|jobId|OK|value`
 - `RESULT|jobId|ERROR|errType|errMsg`
+- `TASK_RESULT|taskId|jobId|OK|value`
+- `TASK_RESULT|taskId|jobId|ERROR|errType|errMsg`
 
 # Handler Signature
-`handler(jobId::String, ok::Bool, payload::String)`
+Legacy handlers keep `handler(jobId::String, ok::Bool, payload::String)`.
+Task-aware handlers use `handler(taskId::String, jobId::String, ok::Bool, payload::String)`.
 
 # Notes
 - Runs with `@async`; this function returns immediately.
@@ -411,23 +533,8 @@ function syncopade_result_server_once(port::Int, handler::Function)
                 line = readline(sock)
                 ok, payload = verify_checksum(line)
                 if ok
-                    parts = split(payload, '|')
-                    # expected format:
-                    # RESULT|jobId|OK|value
-                    # or
-                    # RESULT|jobId|ERROR|errType|errMsg
-                    if length(parts) >= 4 && parts[1] == "RESULT"
-                        jobId = parts[2]
-                        status = parts[3]
-                        if status == "OK"
-                            value = join(parts[4:end], "|")
-                            handler(jobId, true, value)
-                        elseif status == "ERROR" && length(parts) >= 5
-                            errType = parts[4]
-                            errMsg = join(parts[5:end], "|")
-                            handler(jobId, false, errType * "|" * errMsg)
-                        end
-                    end
+                    message = parse_syncopade_result_payload(payload)
+                    invoke_syncopade_result_handler(handler, message)
                 end
             finally
                 close(sock)
@@ -865,21 +972,19 @@ function submit_conductor_task_and_wait(
             error("Invalid checksum in callback: $line")
         end
 
-        parts = split(payload, '|')
-        if length(parts) >= 4 && parts[1] == "RESULT"
-            job_id = parts[2]
-            status = parts[3]
-            if status == "OK"
-                value = join(parts[4:end], "|")
-                return (task_id=task_id, job_id=job_id, ok=true, payload=value)
-            elseif status == "ERROR" && length(parts) >= 5
-                errType = parts[4]
-                errMsg = join(parts[5:end], "|")
-                return (task_id=task_id, job_id=job_id, ok=false, payload=errType * "|" * errMsg)
-            end
+        message = parse_syncopade_result_payload(payload)
+        if message.protocol == :task_result && message.task_id != task_id
+            throw(ArgumentError(
+                "callback task_id $(message.task_id) does not match submitted task_id $task_id"
+            ))
         end
-
-        error("Unexpected callback payload: $payload")
+        resolved_task_id = message.protocol == :task_result ? message.task_id : task_id
+        return (
+            task_id=resolved_task_id,
+            job_id=message.job_id,
+            ok=message.ok,
+            payload=message.payload
+        )
     finally
         if sock !== nothing
             try

@@ -243,6 +243,10 @@ end
 # RESULT|jobId|OK|<string(result)>|CHECKSUM
 # またはエラー時は
 # RESULT|jobId|ERROR|<errorType>|<errorMessage>|CHECKSUM
+# conductor metadata付きjobでは
+# TASK_RESULT|taskId|jobId|OK|<string(result)>|CHECKSUM
+# または
+# TASK_RESULT|taskId|jobId|ERROR|<errorType>|<errorMessage>|CHECKSUM
 # を送信する
 function syncopade_server(port::Int)
     target = resolve_server_bind_target(requested_port=port)
@@ -493,19 +497,45 @@ function checksum_hex(payload::String)::String
 end
 
 # 計算結果またはエラーをクライアントにコールバック送信する
-function send_result(job::SyncopadeJob, jobId::String, ok::Bool; result::String="", errType::String="", errMsg::String="")::Bool
-    fields = String[]
-    push!(fields, "RESULT")
-    push!(fields, jobId)
+function has_conductor_metadata(job::SyncopadeJob)::Bool
+    return !isempty(job.task_id) &&
+        !isempty(job.conductor_ip_addr) &&
+        job.conductor_port > 0
+end
+
+function build_result_payload(
+    job::SyncopadeJob,
+    jobId::String,
+    ok::Bool;
+    result::String="",
+    errType::String="",
+    errMsg::String=""
+)::String
+    isempty(jobId) && throw(ArgumentError("jobId must not be empty"))
+    fields = has_conductor_metadata(job) ?
+        String["TASK_RESULT", job.task_id, jobId] :
+        String["RESULT", jobId]
     if ok
         push!(fields, "OK")
         push!(fields, result)
     else
+        isempty(errType) && throw(ArgumentError("errType must not be empty"))
         push!(fields, "ERROR")
         push!(fields, errType)
         push!(fields, errMsg)
     end
-    payload = build_payload(fields)
+    return build_payload(fields)
+end
+
+function send_result(job::SyncopadeJob, jobId::String, ok::Bool; result::String="", errType::String="", errMsg::String="")::Bool
+    payload = build_result_payload(
+        job,
+        jobId,
+        ok;
+        result=result,
+        errType=errType,
+        errMsg=errMsg
+    )
     chksum = checksum_hex(payload)
     msg = payload * "|" * chksum
 

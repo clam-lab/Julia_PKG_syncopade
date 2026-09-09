@@ -1171,7 +1171,7 @@ worker未送信のqueue待ちは初回受付からの単調deadlineで`QUEUE_TIM
 
 ---
 
-## Step 9: task ID付き結果protocolを追加する — 未着手
+## Step 9: task ID付き結果protocolを追加する — 完了
 
 ### 目的
 
@@ -1202,13 +1202,99 @@ conductor経由のworker結果をconductor task IDへ直接結び付け、成功
 3. conductor metadata付きworker jobだけが新形式を送ることを確認する。
 4. public export、docstring、既存client/server protocol試験を確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- 旧形式`RESULT|job_id|...`を変更せず、新形式を別prefix `TASK_RESULT`として追加する。field位置を流用せず、task IDとjob IDを常に別fieldにする。
+- 新形式は成功`TASK_RESULT|task_id|job_id|OK|value`、失敗`TASK_RESULT|task_id|job_id|ERROR|error_type|error_message`とする。worker未受理のconductor終端ではjob ID fieldを空にできる。
+- workerは`SyncopadeJob`にtask ID・conductor IP・conductor portが全て揃う場合だけconductor経由と判定し、新形式を親へ送る。直接投入またはmetadata不完全なjobは旧形式を維持する。
+- clientに旧・新形式を一つの具体型へ正規化する純粋parserを置く。protocol種別、task ID、job ID、成功可否、payloadを返し、field不足、空必須ID、status不正を例外にする。
+- 既存`syncopade_result_server`とone-shot serverは共通parserを使う。旧3引数handlerを維持しつつ、新形式では4引数`(task_id, job_id, ok, payload)`を優先し、旧handlerしか適用できない場合は従来3引数で配送する。
+- `submit_conductor_task_and_wait`は新形式ならcallbackのtask IDがSUBMIT受付IDと一致することを必須にする。旧workerとの移行互換のため旧RESULTも受理し、その場合だけ受付IDを既存どおり補う。
+- server送信payload生成をsocket I/Oから分け、直接jobとconductor jobの成功・失敗をnetworkなしで照合できるようにする。
+- Step 9ではworker実行結果のprotocolだけを変更する。worker未受理のterminal callback送信、重複抑止、callback成否保存はStep 10まで実装しない。
+- 純粋parser、pure payload builder、handler arity、実loopback送信、public exportを小テストで確認し、既存server排他とclient protocolを回帰する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### `SyncopadeResultMessage`
+
+- fieldsは`protocol::Symbol`、`task_id::String`、`job_id::String`、`ok::Bool`、`payload::String`。
+- `protocol`は`:legacy_result`または`:task_result`だけとする。
+- 旧形式ではtask IDを空、job IDを非空とする。新形式ではtask IDを非空とし、成功時のjob IDは非空、失敗時は空を許す。
+- 成功payloadはvalue、新旧失敗payloadは`error_type|error_message`へ正規化する。
+
+#### `parse_syncopade_result_payload(payload::AbstractString)::SyncopadeResultMessage`
+
+- `split(...; keepempty=true)`を使い、旧`RESULT|job_id|OK|value...`と`RESULT|job_id|ERROR|type|message...`を解析する。
+- 新`TASK_RESULT|task_id|job_id|OK|value...`と`TASK_RESULT|task_id|job_id|ERROR|type|message...`を解析する。
+- valueとerror message内の`|`は末尾field列をjoinして復元する。
+- 旧job ID、新task ID、新成功job ID、error typeの空文字、未知prefix、未知status、field不足は`ArgumentError`。
+- checksum検証やsocket I/O、handler呼出しは行わない。
+
+#### `invoke_syncopade_result_handler(handler, message)::Nothing`
+
+- `:task_result`では4引数`handler(task_id, job_id, ok, payload)`がapplicableなら優先する。なければ既存3引数`handler(job_id, ok, payload)`へfallbackする。
+- `:legacy_result`では既存3引数を優先する。4引数しかない場合は空task IDを第1引数として呼ぶ。
+- どちらも適用不能なら`MethodError`とし、result server側の既存error処理へ流す。
+
+#### worker payload生成
+
+- `has_conductor_metadata(job::SyncopadeJob)::Bool`はtask ID非空、conductor IP非空、conductor port正値の積で判定し、副作用を持たない。
+- `build_result_payload(job, job_id, ok; result="", errType="", errMsg="")::String`はjob IDを必須とする。
+- conductor metadataが揃えば`TASK_RESULT`、それ以外は`RESULT`を先頭にする。成功は`OK|result`、失敗は非空error typeと`ERROR|type|message`を付ける。
+- `send_result`はbuilder結果へ従来checksumを付けて送るだけとし、接続・Bool戻り値契約を維持する。
+
+#### result serverとwait wrapper
+
+- `syncopade_result_server`と`syncopade_result_server_once`はchecksum成功後に共通parserとhandler dispatcherを呼ぶ。旧3引数handlerの既存挙動は維持する。
+- `submit_conductor_task_and_wait`は共通parserを使い、新形式では`message.task_id == submitted_task_id`を必須にする。不一致は`ArgumentError`。
+- 新形式の戻り値はmessage内task/job IDを返す。旧形式はsubmitted task IDとmessage job IDを返し、既存NamedTuple shapeを維持する。
+
+#### 試験
+
+- `test/unit_result_protocol.jl`を新設し、旧成功・失敗、新成功・worker失敗・空job IDのconductor失敗、delimiter復元、malformedを確認する。
+- 同試験でmetadataなし・完全・不完全jobのpure builder、3/4引数handler互換、直接jobとconductor jobのloopback送信を確認する。
+- `test/unit_server_admission_state.jl`にはmetadata完全性判定の最小回帰を追加する。
+- `test/unit_client_protocol.jl`、package export smoke、server admission回帰を実行する。
+
+### Phase 3: 実装する — 完了
+
+- clientへ`SyncopadeResultMessage`、旧/new共通parser、3/4引数handler dispatcherを追加した。
+- continuous/one-shot result serverの重複解析を共通parserへ置換し、旧3引数handlerを維持しつつtask-aware 4引数handlerを受けられるようにした。
+- `submit_conductor_task_and_wait`も共通parserへ接続し、新形式のtask ID一致を必須、旧形式は受付ID補完の互換経路とした。
+- package exportへ結果message型とparserを追加した。
+- workerへconductor metadata完全性判定とpure result builderを追加し、完全metadataだけ`TASK_RESULT`、直接・不完全metadataは旧`RESULT`を生成するようにした。
+- `send_result`はbuilder出力へ従来checksumを付ける構造へ変更し、接続とBool戻り値は維持した。
+- `test/unit_result_protocol.jl`を追加し、旧/new parser、空job IDのconductor失敗、malformed、builder、handler arity、実loopback送信を検証する構成にした。
+- `test/unit_server_admission_state.jl`へmetadata完全・なし・不完全の判定を追加した。
+- client/server include smokeはどちらもexit `0`、`STEP9_CLIENT_INCLUDE_OK`、`STEP9_SERVER_INCLUDE_OK`。`git diff --check`もerrorなし。機能検証はPhase 4で行う。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 初回検証と強化C補正
+
+- `test/unit_result_protocol.jl`は初回からexit `0`、`37 / 37 pass`となった。
+- worker wire metadataからtask情報を抽出する実経路のassertionを6件追加し、pure builderへ手作業で完全jobを渡すだけでなく、`convMSG2JOB`から新形式へ接続することを確認する構成へ強化した。
+- packageはprecompileとexport確認まで成功したが、灯子のdocstring検査commandがJulia 1.12の`Base.Docs.doc`を型、次にBindingへ直接呼ぶ誤った使い方で2回`MethodError`となり、続くmeta keyの比較方法も1回`AssertionError`となった。
+- 製品コードやdocstring欠落ではなく検査commandのAPI理解ミスだった。`Base.Docs.meta(Syncopade)`のBinding keyをmoduleとsymbolで照合する読取りへ直し、同じ公開面検査を完了した。
+
+#### 最終検証
+
+- `test/unit_result_protocol.jl`を追加assertion後2回実行し、いずれもexit `0`、`43 / 43 pass`、`STEP9_RESULT=PASS_RESULT_PROTOCOL`。
+- 旧成功・失敗、新成功・worker失敗、空job IDのconductor失敗、payload内`|`復元、malformed 10種を確認した。
+- metadataなしjobと不完全jobは`RESULT`、完全metadata jobは`TASK_RESULT`となった。wire metadataはuser argsから除去され、task/conductor情報へ保存された。
+- 3引数handlerは新形式からjob ID・結果を受け、4引数handlerは新形式のtask IDを受ける。4引数handlerへ旧形式を渡す場合は空task IDとなった。
+- loopback実送信で、直接jobは旧形式成功、conductor jobはtask/job ID付き新形式失敗をchecksum検証後に解析できた。
+- `test/unit_server_admission_state.jl`: `--threads=4`、exit `0`、`16 / 16 pass`。
+- `test/unit_client_protocol.jl`: exit `0`、`63 / 63 pass`。
+- `test/unit_controlled_worker_fixture.jl`: exit `0`、`23 / 23 pass`。
+- package precompile、export、doc metadata検査はexit `0`、`STEP9_PUBLIC_API=PASS`。
+- `git diff --check`はerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のままで、先生の既存差分4行を変更していない。
+
+### Step 9結論
+
+直接worker投入の旧`RESULT`は維持され、conductor metadataが完全なworker結果だけが`TASK_RESULT`でtask IDとjob IDを別々に返す。公開parserは旧・新を同じ型へ正規化し、worker未受理のjob ID空失敗も表現できる。conductor自身がその失敗callbackを送る処理はStep 10へ残した。
 
 ---
 

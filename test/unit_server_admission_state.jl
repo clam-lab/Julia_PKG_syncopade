@@ -28,4 +28,19 @@ include(joinpath(@__DIR__, "..", "syncopadeServer.jl"))
     end
 
     @test get_server_state() == :idle
+
+    direct_job = SyncopadeJob(
+        "127.0.0.1", 1, "source", "Module", "function", String[], "", "", 0
+    )
+    conductor_job = SyncopadeJob(
+        "127.0.0.1", 1, "source", "Module", "function", String[],
+        "task-1", "127.0.0.1", 9001
+    )
+    partial_job = SyncopadeJob(
+        "127.0.0.1", 1, "source", "Module", "function", String[],
+        "task-1", "", 0
+    )
+    @test !has_conductor_metadata(direct_job)
+    @test has_conductor_metadata(conductor_job)
+    @test !has_conductor_metadata(partial_job)
 end
