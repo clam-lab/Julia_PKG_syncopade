@@ -18,6 +18,7 @@ function reset_task_lifecycle_test_state!()
     end
     lock(task_runtime_states_lock) do
         empty!(task_runtime_states)
+        empty!(task_acceptance_windows)
     end
     lock(node_states_lock) do
         empty!(node_states)
@@ -48,6 +49,7 @@ end
             (TASK_RESERVED, TASK_DISPATCH_UNKNOWN),
             (TASK_RESERVED, TASK_TERMINAL),
             (TASK_RUNNING, TASK_TERMINAL),
+            (TASK_DISPATCH_UNKNOWN, TASK_QUEUED),
             (TASK_DISPATCH_UNKNOWN, TASK_RUNNING),
             (TASK_DISPATCH_UNKNOWN, TASK_TERMINAL),
         ])

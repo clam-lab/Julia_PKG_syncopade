@@ -25,6 +25,30 @@ struct ConductorTask
     function_name::String
     args::Vector{String}
     retry_count::Int
+    acceptance_timeout_seconds::Float64
+end
+
+function ConductorTask(
+    task_id::String,
+    coordinator_ip::String,
+    coordinator_port::Int,
+    source::String,
+    module_name::String,
+    function_name::String,
+    args::Vector{String},
+    retry_count::Int
+)
+    return ConductorTask(
+        task_id,
+        coordinator_ip,
+        coordinator_port,
+        source,
+        module_name,
+        function_name,
+        args,
+        retry_count,
+        default_queue_acceptance_timeout_seconds()
+    )
 end
 
 const NODE_IDLE = :idle
@@ -60,9 +84,16 @@ struct TaskRuntimeState
     reason::String
 end
 
+struct TaskAcceptanceWindow
+    started_ns::UInt64
+    deadline_ns::UInt64
+    timeout_seconds::Float64
+end
+
 const node_states = Dict{Tuple{String,Int},NodeRuntimeState}()
 const task_queue = ConductorTask[]
 const task_runtime_states = Dict{String,TaskRuntimeState}()
+const task_acceptance_windows = Dict{String,TaskAcceptanceWindow}()
 
 const TASK_QUEUED = :queued
 const TASK_RESERVED = :reserved
@@ -82,6 +113,8 @@ const DEFAULT_STATUS_TIMEOUT = 0.2  # seconds (per node)
 const DEFAULT_CACHE_CLEAR_TIMEOUT = 1.0  # seconds (per node)
 const DEFAULT_MAX_RETRY = 3
 const DEFAULT_DISPATCH_TIMEOUT = 3.0  # seconds (worker start-ack timeout)
+const DEFAULT_QUEUE_ACCEPTANCE_TIMEOUT_SECONDS = 14400.0
+const QUEUE_ACCEPTANCE_TIMEOUT_ENV = "SYNCOPADE_QUEUE_ACCEPTANCE_TIMEOUT_SECONDS"
 const DEFAULT_CONDUCTOR_LOG_PATH = joinpath(@__DIR__, "logs", "conductor_events.csv")
 const DEFAULT_LOG_BATCH_SIZE = 64
 const DEFAULT_LOG_FLUSH_INTERVAL_SEC = 0.1
@@ -156,7 +189,11 @@ function start_conductor_log_writer!()
                     if remaining <= 0
                         break
                     end
-                    w = Base.timedwait(() -> isready(ch), remaining; pollint=min(0.01, remaining))
+                    w = Base.timedwait(
+                        () -> isready(ch),
+                        remaining;
+                        pollint=max(0.001, min(0.01, remaining))
+                    )
                     if w === :timed_out
                         break
                     end
@@ -585,14 +622,62 @@ function default_callback_port(ip::AbstractString)::Int
     return 8000 + parse(Int, parts[end])
 end
 
+function default_queue_acceptance_timeout_seconds()::Float64
+    if !haskey(ENV, QUEUE_ACCEPTANCE_TIMEOUT_ENV)
+        return DEFAULT_QUEUE_ACCEPTANCE_TIMEOUT_SECONDS
+    end
+    raw_value = ENV[QUEUE_ACCEPTANCE_TIMEOUT_ENV]
+    parsed_value = try
+        parse(Float64, raw_value)
+    catch
+        throw(ArgumentError(
+            "$QUEUE_ACCEPTANCE_TIMEOUT_ENV must be a finite positive number"
+        ))
+    end
+    return normalize_acceptance_timeout_seconds(parsed_value)
+end
+
+function acceptance_timeout_nanoseconds(timeout_seconds::Real)::UInt64
+    seconds = normalize_acceptance_timeout_seconds(timeout_seconds)
+    nanoseconds = seconds * 1.0e9
+    if !isfinite(nanoseconds) || nanoseconds >= Float64(typemax(UInt64))
+        return typemax(UInt64)
+    end
+    return UInt64(ceil(nanoseconds))
+end
+
+function acceptance_deadline_ns(started_ns::UInt64, timeout_seconds::Real)::UInt64
+    duration_ns = acceptance_timeout_nanoseconds(timeout_seconds)
+    duration_ns > typemax(UInt64) - started_ns && return typemax(UInt64)
+    return started_ns + duration_ns
+end
+
 function parse_submit_task(payload::String)::ConductorTask
-    parts = split(payload, '|')
+    parts = split(payload, '|'; keepempty=true)
     if length(parts) < 3 || parts[1] != "SUBMIT"
         throw(ArgumentError("Invalid SUBMIT format"))
     end
 
-    coordinator_ip = parts[2]
-    idx = 3
+    idx = 2
+    acceptance_timeout_seconds = default_queue_acceptance_timeout_seconds()
+    if startswith(parts[idx], ACCEPTANCE_TIMEOUT_FIELD_PREFIX)
+        raw_timeout = String(chopprefix(String(parts[idx]), ACCEPTANCE_TIMEOUT_FIELD_PREFIX))
+        isempty(raw_timeout) && throw(ArgumentError(
+            "ACCEPTANCE_TIMEOUT_SECONDS must not be empty"
+        ))
+        parsed_timeout = try
+            parse(Float64, raw_timeout)
+        catch
+            throw(ArgumentError("Invalid ACCEPTANCE_TIMEOUT_SECONDS: $raw_timeout"))
+        end
+        acceptance_timeout_seconds = normalize_acceptance_timeout_seconds(parsed_timeout)
+        idx += 1
+    end
+
+    length(parts) >= idx + 1 || throw(ArgumentError("Invalid SUBMIT format"))
+    coordinator_ip = String(parts[idx])
+    isempty(coordinator_ip) && throw(ArgumentError("coordinator_ip must not be empty"))
+    idx += 1
     coordinator_port = 0
     func_spec = ""
 
@@ -627,7 +712,8 @@ function parse_submit_task(payload::String)::ConductorTask
         module_name,
         function_name,
         args,
-        0
+        0,
+        acceptance_timeout_seconds
     )
 end
 
@@ -664,7 +750,11 @@ function task_transition_allowed(current::Symbol, next_state::Symbol)::Bool
         TASK_TERMINAL,
     )
     current == TASK_RUNNING && return next_state == TASK_TERMINAL
-    current == TASK_DISPATCH_UNKNOWN && return next_state in (TASK_RUNNING, TASK_TERMINAL)
+    current == TASK_DISPATCH_UNKNOWN && return next_state in (
+        TASK_QUEUED,
+        TASK_RUNNING,
+        TASK_TERMINAL,
+    )
     return false
 end
 
@@ -768,16 +858,57 @@ function task_status_response_payload(task_id::String)::String
     )
 end
 
+function register_task_acceptance_window!(
+    task_id::String,
+    timeout_seconds::Real;
+    now_ns::UInt64=time_ns()
+)::TaskAcceptanceWindow
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    normalized_timeout = normalize_acceptance_timeout_seconds(timeout_seconds)
+    return lock(task_runtime_states_lock) do
+        get!(task_acceptance_windows, task_id) do
+            TaskAcceptanceWindow(
+                now_ns,
+                acceptance_deadline_ns(now_ns, normalized_timeout),
+                normalized_timeout
+            )
+        end
+    end
+end
+
+function get_task_acceptance_window(
+    task_id::String
+)::Union{Nothing,TaskAcceptanceWindow}
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    return lock(task_runtime_states_lock) do
+        get(task_acceptance_windows, task_id, nothing)
+    end
+end
+
+function acceptance_deadline_reached(
+    task_id::String;
+    now_ns::UInt64=time_ns()
+)::Bool
+    window = get_task_acceptance_window(task_id)
+    return window !== nothing && now_ns >= window.deadline_ns
+end
+
 function queue_len()::Int
     lock(task_queue_lock) do
         return length(task_queue)
     end
 end
 
-function enqueue_task!(task::ConductorTask)
+function enqueue_task!(task::ConductorTask; now_ns::UInt64=time_ns())
+    normalize_acceptance_timeout_seconds(task.acceptance_timeout_seconds)
     mark_task_queued!(task.task_id) || throw(ArgumentError(
         "task $(task.task_id) cannot transition to queued"
     ))
+    register_task_acceptance_window!(
+        task.task_id,
+        task.acceptance_timeout_seconds;
+        now_ns=now_ns
+    )
     lock(task_queue_lock) do
         push!(task_queue, task)
     end
@@ -813,10 +944,87 @@ function requeue_with_retry!(task::ConductorTask; max_retry=DEFAULT_MAX_RETRY)
         task.module_name,
         task.function_name,
         task.args,
-        next_retry
+        next_retry,
+        task.acceptance_timeout_seconds
     )
     enqueue_task!(retried)
     log_task_event("TASK_REQUEUED", retried; queue_len=queue_len())
+end
+
+function expire_waiting_tasks!(; now_ns::UInt64=time_ns())::NamedTuple
+    queue_timeouts = ConductorTask[]
+    outcome_unknown_ids = String[]
+
+    lock(task_runtime_states_lock) do
+        lock(task_queue_lock) do
+            retained = ConductorTask[]
+            for task in task_queue
+                state = get(task_runtime_states, task.task_id, nothing)
+                window = get(task_acceptance_windows, task.task_id, nothing)
+                expired = state !== nothing &&
+                    state.state == TASK_QUEUED &&
+                    window !== nothing &&
+                    now_ns >= window.deadline_ns
+                if expired && mark_task_terminal!(
+                    task.task_id,
+                    "QUEUE_TIMEOUT",
+                    "worker_acceptance_deadline_exceeded"
+                )
+                    push!(queue_timeouts, task)
+                else
+                    push!(retained, task)
+                end
+            end
+            empty!(task_queue)
+            append!(task_queue, retained)
+        end
+
+        for (task_id, state) in task_runtime_states
+            window = get(task_acceptance_windows, task_id, nothing)
+            if state.state == TASK_DISPATCH_UNKNOWN &&
+               window !== nothing &&
+               now_ns >= window.deadline_ns &&
+               mark_task_terminal!(
+                   task_id,
+                   "DISPATCH_OUTCOME_UNKNOWN",
+                   "worker_acceptance_outcome_unknown_at_deadline"
+               )
+                push!(outcome_unknown_ids, task_id)
+            end
+        end
+    end
+
+    for task in queue_timeouts
+        log_task_event(
+            "TASK_QUEUE_TIMEOUT",
+            task;
+            queue_len=queue_len(),
+            state_from=string(TASK_QUEUED),
+            state_to=string(TASK_TERMINAL),
+            status="QUEUE_TIMEOUT",
+            error="worker_acceptance_deadline_exceeded"
+        )
+    end
+    for task_id in outcome_unknown_ids
+        released_nodes = release_unknown_task_reservations!(task_id)
+        log_conductor_event(
+            "DISPATCH_OUTCOME_UNKNOWN";
+            task_id=task_id,
+            queue_len=queue_len(),
+            state_from=string(TASK_DISPATCH_UNKNOWN),
+            state_to=string(TASK_TERMINAL),
+            status="DISPATCH_OUTCOME_UNKNOWN",
+            error=string(
+                "worker_acceptance_outcome_unknown_at_deadline released_nodes=",
+                released_nodes
+            )
+        )
+    end
+
+    return (
+        queue_timeout_count=length(queue_timeouts),
+        outcome_unknown_count=length(outcome_unknown_ids)
+    )
 end
 
 function default_node_runtime_state()::NodeRuntimeState
@@ -983,6 +1191,29 @@ function release_node_assignment!(
     return released
 end
 
+function release_unknown_task_reservations!(task_id::String)::Int
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    candidates = lock(node_states_lock) do
+        NODES[
+            find_node_by_endpoint(ip, port)
+            for ((ip, port), state) in node_states
+            if state.state == NODE_RESERVED &&
+               state.task_id == task_id &&
+               isempty(state.job_id)
+        ]
+    end
+    released_count = 0
+    for node in candidates
+        released_count += release_node_assignment!(
+            node,
+            task_id,
+            "";
+            next_state=NODE_DOWN
+        ) ? 1 : 0
+    end
+    return released_count
+end
+
 function probe_node_observation(
     node::NODES;
     timeout=DEFAULT_STATUS_TIMEOUT
@@ -1134,7 +1365,173 @@ function mark_node_busy_after_rejection!(node::NODES, task_id::String)::Bool
     return transitioned
 end
 
-function dispatch_to_worker(task::ConductorTask, node::NODES)::DispatchOutcome
+function remaining_acceptance_seconds(task_id::String, now_ns::UInt64)::Float64
+    window = get_task_acceptance_window(task_id)
+    window === nothing && return Inf
+    now_ns >= window.deadline_ns && return 0.0
+    return Float64(window.deadline_ns - now_ns) / 1.0e9
+end
+
+function resolve_late_task_acceptance!(
+    task_id::String,
+    job_id::String,
+    now_ns::UInt64
+)::Symbol
+    return lock(task_runtime_states_lock) do
+        current = get(task_runtime_states, task_id, nothing)
+        current !== nothing && current.state == TASK_DISPATCH_UNKNOWN || return :ignored
+        window = get(task_acceptance_windows, task_id, nothing)
+        window !== nothing && now_ns >= window.deadline_ns && return :expired
+        mark_task_running!(task_id, job_id) ? :running : :ignored
+    end
+end
+
+function resolve_late_task_busy!(task_id::String, now_ns::UInt64)::Symbol
+    return lock(task_runtime_states_lock) do
+        current = get(task_runtime_states, task_id, nothing)
+        current !== nothing && current.state == TASK_DISPATCH_UNKNOWN || return :ignored
+        window = get(task_acceptance_windows, task_id, nothing)
+        if window !== nothing && now_ns >= window.deadline_ns
+            marked = mark_task_terminal!(
+                task_id,
+                "QUEUE_TIMEOUT",
+                "worker_acceptance_deadline_exceeded"
+            )
+            return marked ? :expired : :ignored
+        end
+        transition_task_state!(task_id, TASK_QUEUED) ? :queued : :ignored
+    end
+end
+
+function start_unknown_dispatch_watcher!(
+    dispatch_task::Task,
+    task::ConductorTask,
+    node::NODES;
+    monotonic_clock::Function=time_ns
+)::Task
+    return @async begin
+        try
+            now_ns = UInt64(monotonic_clock())
+            remaining = remaining_acceptance_seconds(task.task_id, now_ns)
+            if remaining <= 0.0
+                expire_waiting_tasks!(; now_ns=now_ns)
+                return
+            end
+
+            while true
+                current = get_task_runtime_state(task.task_id)
+                current !== nothing && current.state == TASK_DISPATCH_UNKNOWN || return
+                istaskdone(dispatch_task) && break
+                now_ns = UInt64(monotonic_clock())
+                remaining = remaining_acceptance_seconds(task.task_id, now_ns)
+                if remaining <= 0.0
+                    expire_waiting_tasks!(; now_ns=now_ns)
+                    return
+                end
+                sleep(min(0.01, remaining))
+            end
+
+            current = get_task_runtime_state(task.task_id)
+            current !== nothing && current.state == TASK_DISPATCH_UNKNOWN || return
+            istaskdone(dispatch_task) || return
+            dispatch_result = fetch(dispatch_task)
+            if dispatch_result.error === nothing
+                job_id = String(dispatch_result.job_id)
+                resolution = resolve_late_task_acceptance!(
+                    task.task_id,
+                    job_id,
+                    UInt64(monotonic_clock())
+                )
+                if resolution == :running
+                    node_recorded = mark_node_running!(node, task.task_id, job_id)
+                    log_task_event(
+                        "DISPATCH_LATE_ACK",
+                        task;
+                        node_name=node.name,
+                        node_ip=node.IP,
+                        node_port=node.port,
+                        job_id=job_id,
+                        queue_len=queue_len(),
+                        status=node_recorded ? "running" : "node_assignment_conflict"
+                    )
+                elseif resolution == :expired
+                    expire_waiting_tasks!(; now_ns=UInt64(monotonic_clock()))
+                end
+                return
+            end
+
+            error_kind = classify_worker_start_error(dispatch_result.error)
+            if error_kind == :busy
+                now_after_busy = UInt64(monotonic_clock())
+                resolution = resolve_late_task_busy!(task.task_id, now_after_busy)
+                node_recorded = mark_node_busy_after_rejection!(node, task.task_id)
+                if resolution == :queued
+                    enqueue_task!(task; now_ns=now_after_busy)
+                elseif resolution == :expired
+                    log_task_event(
+                        "TASK_QUEUE_TIMEOUT",
+                        task;
+                        node_name=node.name,
+                        node_ip=node.IP,
+                        node_port=node.port,
+                        queue_len=queue_len(),
+                        state_from=string(TASK_DISPATCH_UNKNOWN),
+                        state_to=string(TASK_TERMINAL),
+                        status="QUEUE_TIMEOUT",
+                        error="worker_acceptance_deadline_exceeded"
+                    )
+                end
+                log_task_event(
+                    "DISPATCH_LATE_BUSY",
+                    task;
+                    node_name=node.name,
+                    node_ip=node.IP,
+                    node_port=node.port,
+                    queue_len=queue_len(),
+                    status=string(resolution),
+                    error=string(
+                        "node_recorded=",
+                        node_recorded,
+                        " worker_error=",
+                        sprint(showerror, dispatch_result.error)
+                    )
+                )
+                return
+            end
+
+            log_task_event(
+                "DISPATCH_LATE_FAILURE",
+                task;
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                queue_len=queue_len(),
+                status=string(error_kind),
+                error=sprint(showerror, dispatch_result.error)
+            )
+        catch error_value
+            log_task_event(
+                "DISPATCH_UNKNOWN_WATCHER_FAILED",
+                task;
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                queue_len=queue_len(),
+                error=sprint(showerror, error_value)
+            )
+        end
+    end
+end
+
+function dispatch_to_worker(
+    task::ConductorTask,
+    node::NODES;
+    dispatch_timeout_seconds::Real=DEFAULT_DISPATCH_TIMEOUT,
+    monotonic_clock::Function=time_ns
+)::DispatchOutcome
+    normalized_dispatch_timeout = normalize_acceptance_timeout_seconds(
+        dispatch_timeout_seconds
+    )
     node_reserved_for_task(node, task.task_id) || throw(ArgumentError(
         "node $(node.IP):$(node.port) is not reserved for task $(task.task_id)"
     ))
@@ -1171,9 +1568,43 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::DispatchOutcome
         catch error_value
             (job_id="", error=error_value)
         end
-        w = Base.timedwait(() -> istaskdone(dispatch_task), DEFAULT_DISPATCH_TIMEOUT; pollint=0.01)
+        remaining = remaining_acceptance_seconds(
+            task.task_id,
+            UInt64(monotonic_clock())
+        )
+        wait_seconds = min(normalized_dispatch_timeout, remaining)
+        w = wait_seconds <= 0.0 ? :timed_out : Base.timedwait(
+            () -> istaskdone(dispatch_task),
+            wait_seconds;
+            pollint=max(0.001, min(0.01, wait_seconds))
+        )
         if w === :timed_out
-            throw(SyncopadeWorkerStartTimeoutError(DEFAULT_DISPATCH_TIMEOUT))
+            transitioned = mark_task_dispatch_unknown!(task.task_id)
+            if transitioned
+                log_task_event(
+                    "DISPATCH_OUTCOME_UNKNOWN_PENDING",
+                    task;
+                    node_name=node.name,
+                    node_ip=node.IP,
+                    node_port=node.port,
+                    queue_len=queue_len(),
+                    state_from=string(TASK_RESERVED),
+                    state_to=string(TASK_DISPATCH_UNKNOWN),
+                    status="outcome_unknown",
+                    error=string(
+                        "dispatch_timeout_seconds=",
+                        normalized_dispatch_timeout
+                    )
+                )
+                start_unknown_dispatch_watcher!(
+                    dispatch_task,
+                    task,
+                    node;
+                    monotonic_clock=monotonic_clock
+                )
+            end
+            expire_waiting_tasks!(; now_ns=UInt64(monotonic_clock()))
+            return DISPATCH_OUTCOME_UNKNOWN
         end
         dispatch_result = fetch(dispatch_task)
         dispatch_result.error === nothing || throw(dispatch_result.error)
@@ -1302,7 +1733,13 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::DispatchOutcome
     end
 end
 
-function dispatch_queued_tasks(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY)
+function dispatch_queued_tasks(
+    nodes::Vector{NODES};
+    max_retry=DEFAULT_MAX_RETRY,
+    dispatch_timeout_seconds::Real=DEFAULT_DISPATCH_TIMEOUT,
+    monotonic_clock::Function=time_ns
+)
+    expire_waiting_tasks!(; now_ns=UInt64(monotonic_clock()))
     while true
         task = pop_task!()
         task === nothing && return
@@ -1338,7 +1775,12 @@ function dispatch_queued_tasks(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY
             return
         end
 
-        outcome = dispatch_to_worker(task, node)
+        outcome = dispatch_to_worker(
+            task,
+            node;
+            dispatch_timeout_seconds=dispatch_timeout_seconds,
+            monotonic_clock=monotonic_clock
+        )
         if outcome == DISPATCH_BUSY_REJECTED
             enqueue_task!(task)
             log_task_event("TASK_REQUEUED_BUSY", task; queue_len=queue_len())
@@ -1346,14 +1788,24 @@ function dispatch_queued_tasks(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY
         elseif outcome == DISPATCH_FAILED
             requeue_with_retry!(task; max_retry=max_retry)
         elseif outcome == DISPATCH_OUTCOME_UNKNOWN
-            throw(ArgumentError("DISPATCH_OUTCOME_UNKNOWN is not handled before Step 8"))
+            return
         end
     end
 end
 
-function run_dispatch_cycle!(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY)
+function run_dispatch_cycle!(
+    nodes::Vector{NODES};
+    max_retry=DEFAULT_MAX_RETRY,
+    dispatch_timeout_seconds::Real=DEFAULT_DISPATCH_TIMEOUT,
+    monotonic_clock::Function=time_ns
+)
     lock(dispatch_lock) do
-        dispatch_queued_tasks(nodes; max_retry=max_retry)
+        dispatch_queued_tasks(
+            nodes;
+            max_retry=max_retry,
+            dispatch_timeout_seconds=dispatch_timeout_seconds,
+            monotonic_clock=monotonic_clock
+        )
     end
 end
 

@@ -2,6 +2,15 @@ using Sockets
 using UUIDs
 
 const DEFAULT_WIRED_LAN_PREFIX = "192.168.12."
+const ACCEPTANCE_TIMEOUT_FIELD_PREFIX = "ACCEPTANCE_TIMEOUT_SECONDS="
+
+function normalize_acceptance_timeout_seconds(value::Real)::Float64
+    seconds = Float64(value)
+    isfinite(seconds) && seconds > 0.0 || throw(ArgumentError(
+        "acceptance_timeout_seconds must be finite and positive"
+    ))
+    return seconds
+end
 
 function preferred_local_ip(; prefix::AbstractString=get(ENV, "SYNCOPADE_WIRED_PREFIX", DEFAULT_WIRED_LAN_PREFIX))::IPAddr
     for ip in getipaddrs()
@@ -706,14 +715,15 @@ end
         source::String,
         module_name::String,
         function_name::String,
-        args::Vector{String}=String[]
+        args::Vector{String}=String[],
+        acceptance_timeout_seconds::Union{Nothing,Real}=nothing
     ) -> String
 
 Submit one task to Syncopade Conductor and receive a conductor `task_id`.
 
 # Protocol
 Client -> Conductor payload:
-- `SUBMIT|coord_ip|coord_port(optional)|source:module:function|arg1|arg2|...`
+- `SUBMIT|ACCEPTANCE_TIMEOUT_SECONDS=s(optional)|coord_ip|coord_port(optional)|source:module:function|arg1|arg2|...`
 
 The payload is sent as `payload|cc` with XOR checksum.
 
@@ -731,10 +741,19 @@ function submit_conductor_task(
     source::String,
     module_name::String,
     function_name::String,
-    args::Vector{String}=String[]
+    args::Vector{String}=String[],
+    acceptance_timeout_seconds::Union{Nothing,Real}=nothing
 )
     func_spec = string(source, ":", module_name, ":", function_name)
-    payload_parts = String["SUBMIT", coordinator_ip]
+    payload_parts = String["SUBMIT"]
+    if acceptance_timeout_seconds !== nothing
+        timeout_value = normalize_acceptance_timeout_seconds(acceptance_timeout_seconds)
+        push!(
+            payload_parts,
+            ACCEPTANCE_TIMEOUT_FIELD_PREFIX * string(timeout_value)
+        )
+    end
+    push!(payload_parts, coordinator_ip)
     if coordinator_port !== nothing
         push!(payload_parts, string(coordinator_port))
     end
@@ -774,6 +793,7 @@ end
         module_name::String,
         function_name::String,
         args::Vector{String}=String[],
+        acceptance_timeout_seconds::Union{Nothing,Real}=nothing,
         timeout::Float64=60.0
     ) -> NamedTuple
 
@@ -799,6 +819,7 @@ function submit_conductor_task_and_wait(
     module_name::String,
     function_name::String,
     args::Vector{String}=String[],
+    acceptance_timeout_seconds::Union{Nothing,Real}=nothing,
     timeout::Float64=60.0
 )
     bind_ip = preferred_local_ip()
@@ -822,7 +843,8 @@ function submit_conductor_task_and_wait(
             source=source,
             module_name=module_name,
             function_name=function_name,
-            args=args
+            args=args,
+            acceptance_timeout_seconds=acceptance_timeout_seconds
         )
 
         w_accept = Base.timedwait(() -> istaskdone(accept_task), timeout; pollint=0.01)

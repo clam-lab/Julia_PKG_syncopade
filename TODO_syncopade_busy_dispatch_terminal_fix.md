@@ -1019,7 +1019,7 @@ conductorはtaskをqueueから消した後もprocess存続中はtask ID単位で
 
 ---
 
-## Step 8: worker受付期限と受付成否不明を別々に終端する — 未着手
+## Step 8: worker受付期限と受付成否不明を別々に終端する — 完了
 
 ### 目的
 
@@ -1032,6 +1032,7 @@ BUSYまたはidle nodeなしでworker受付前のtaskを無期限に待たせず
 - `test/regression_conductor_queue_deadline.jl`（新規候補）
 - `test/regression_conductor_dispatch_timeout.jl`（新規候補）
 - `test/fixtures/conductor_controlled_worker.jl`
+- `test/unit_conductor_task_lifecycle.jl`（遅延BUSYの許可遷移追従）
 - このTodo
 
 ### 完了条件
@@ -1053,13 +1054,120 @@ BUSYまたはidle nodeなしでworker受付前のtaskを無期限に待たせず
 4. 期限まで不明な場合だけ`DISPATCH_OUTCOME_UNKNOWN`になることを確認する。
 5. worker受付後に注入時計を受付期限より先へ進めても、running taskが期限切れにならないことを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- worker受付待機期限と1回のdispatch ACK待ちtimeoutを別の時計として扱う。前者はtaskをconductorが最初にqueue登録した時点から始まり、後者はworkerへの各requestだけを監視する。
+- 受付待機期限はwall clockでなく`time_ns()`由来の単調時計で保存する。既定値は`14400 s`とし、環境変数`SYNCOPADE_QUEUE_ACCEPTANCE_TIMEOUT_SECONDS`とSUBMITごとの値で上書き可能にする。
+- taskの最初の`queued`登録時に開始時刻・絶対deadlineを保存し、BUSY、idle nodeなし、通常retryでqueueへ戻っても更新しない。
+- deadline sweepはqueue全体を走査し、LIFO末尾以外の期限切れも除去する。worker requestをまだ送っていない`queued` taskは`QUEUE_TIMEOUT`でterminalにする。
+- worker request後にACK timeoutへ達したtaskはnode予約を解放せず`dispatch_unknown`へ移し、queueへ戻さない。配送loopもそのcycleを終了し、同一・別nodeへの即時再配送を行わない。
+- timeoutしたrequest task自体は捨てず、bounded watcherが後着結果を照合する。期限前の正常ACKは同じtask/nodeをrunningへ進め、期限前の対応DONEは既存early-DONE経路でterminalにする。
+- timeout後に明示的な遅延BUSYが届いた場合だけ「未受理」が確定するため、`dispatch_unknown -> queued`を許可して元taskを再待機させる。これはtimeout時点での無条件再配送ではなく、明示的な非受理確認後の安全な再開とする。
+- timeout後のprotocol/transport失敗は受理有無を確定できないため`dispatch_unknown`のまま保持する。deadline到達時だけ`DISPATCH_OUTCOME_UNKNOWN`でterminalにする。
+- `dispatch_unknown` terminal時は対応する未確定node予約を`down`へ解放する。以後はnode STATUSでbusy/idleを再観測するまで配送対象にせず、task自体は再配送しない。
+- 正常ACK後の`running` taskは受付deadline sweepの対象外にし、50分以上を含むworker実行時間へ新しいtimeoutを掛けない。
+- client SUBMITはtimeout指定をfunction引数へ混ぜず、command直後の予約fieldとして送る。指定なしの旧SUBMIT wireはそのまま受理する。
+- queue期限、ACK保留、後着ACK、早期DONE、request総数1件、running非期限切れをそれぞれ制御試験に分ける。実時間待機は短い試験値だけにし、4時間既定値は純粋関数と保存値で確認する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### timeout値とSUBMIT wire
+
+- `DEFAULT_QUEUE_ACCEPTANCE_TIMEOUT_SECONDS = 14400.0`。
+- `normalize_acceptance_timeout_seconds(value)::Float64`は`Real`を有限・正値の`Float64`へ変換し、0、負値、NaN、Infは`ArgumentError`とする。
+- `default_queue_acceptance_timeout_seconds()::Float64`は`SYNCOPADE_QUEUE_ACCEPTANCE_TIMEOUT_SECONDS`があればparse・validationし、なければ既定値を返す。不正環境値はsilent fallbackしない。
+- per-submit fieldは`ACCEPTANCE_TIMEOUT_SECONDS=<seconds>`とし、存在する場合だけ`SUBMIT`直後へ置く。旧形式`SUBMIT|coordinator_ip|...`との曖昧性を生じさせない。
+- `submit_conductor_task`と`submit_conductor_task_and_wait`へ`acceptance_timeout_seconds::Union{Nothing,Real}=nothing`を追加し、指定時だけfieldを送る。
+- `parse_submit_task`は予約fieldを最大1個だけ認識し、`ConductorTask.acceptance_timeout_seconds`へ保存する。省略時はconductor環境値を使う。
+- `ConductorTask`の既存8引数constructorは環境既定値を補う互換入口として残し、retry時は元taskのtimeout値を明示的に引き継ぐ。
+
+#### `TaskAcceptanceWindow`
+
+- fieldsは`started_ns::UInt64`、`deadline_ns::UInt64`、`timeout_seconds::Float64`。
+- `acceptance_timeout_nanoseconds(seconds)::UInt64`は秒を切上げでnsへ変換し、overflowは`typemax(UInt64)`へ飽和させる。
+- `acceptance_deadline_ns(started_ns, seconds)::UInt64`も加算overflowを飽和させる。
+- `task_acceptance_windows::Dict{String,TaskAcceptanceWindow}`を既存`task_runtime_states_lock`で保護する。
+- `register_task_acceptance_window!(task_id, seconds; now_ns=time_ns())`は未登録時だけwindowを作り、再queue時は開始時刻・deadlineを変更せず既存値を返す。
+- `get_task_acceptance_window(task_id)::Union{Nothing,TaskAcceptanceWindow}`はread-only snapshotを返す。
+- `enqueue_task!(task; now_ns=time_ns())`はtaskの初回queued登録とwindow登録後にqueueへpushする。禁止遷移ではpushしない。
+
+#### 期限判定
+
+- `acceptance_deadline_reached(task_id; now_ns=time_ns())::Bool`はwindowがあり`now_ns >= deadline_ns`の場合だけtrue。
+- `expire_waiting_tasks!(; now_ns=time_ns())`は同一snapshot時点でqueue全体と`dispatch_unknown` registryを確認する。
+- `queued`かつ期限到達したtaskはqueueの位置に関係なく除去し、`terminal_kind=QUEUE_TIMEOUT`、`reason=worker_acceptance_deadline_exceeded`へ1回だけ遷移して`TASK_QUEUE_TIMEOUT`を記録する。
+- `dispatch_unknown`かつ期限到達したtaskは`terminal_kind=DISPATCH_OUTCOME_UNKNOWN`、`reason=worker_acceptance_outcome_unknown_at_deadline`へ1回だけ遷移して同名eventを記録する。
+- unknown terminal後はtask ID一致・job ID未確定のnode予約だけを`NODE_DOWN`へ解放する。他taskの割当ては変更しない。
+- 戻り値は`(queue_timeout_count, outcome_unknown_count)`。callback送信はStep 10まで行わない。
+
+#### dispatch ACK timeoutと後着応答
+
+- `dispatch_to_worker`、`dispatch_queued_tasks`、`run_dispatch_cycle!`へ試験用keyword `dispatch_timeout_seconds`と`monotonic_clock::Function=time_ns`を通す。既定挙動は現行3秒と単調時計。
+- ACK待ち時間はdispatch timeoutと残り受付期限の小さい方とする。
+- ACK timeout時は自予約を保持したままtaskを`dispatch_unknown`へ遷移し、`DISPATCH_OUTCOME_UNKNOWN_PENDING`を記録して`DISPATCH_OUTCOME_UNKNOWN`を返す。通常failure catch、retry、node downへ流さない。
+- `dispatch_queued_tasks`はunknown outcomeをqueueへ戻さず、そのcycleをreturnする。
+- `start_unknown_dispatch_watcher!(dispatch_task, task, node; monotonic_clock)`はtaskがunknownである間だけ、元request taskの終了または受付deadlineまで待つ。
+- 期限前の遅延`OK|STARTED|job_id`はtaskを`dispatch_unknown -> running`へ移し、同じnode予約へjob IDを確定して`DISPATCH_LATE_ACK`を記録する。terminal化済みなら無視し再配送しない。
+- 期限前の遅延BUSYは自予約を割当てなしbusyへ移し、taskを`dispatch_unknown -> queued`へ戻して`DISPATCH_LATE_BUSY`を記録する。明示的BUSY以外の遅延errorはunknownのままにする。
+- watcher自身がdeadlineへ達した場合は`expire_waiting_tasks!`を呼ぶ。periodic dispatch cycleとの競合はtask terminal first-write-winsとtask ID付き予約解放で吸収する。
+- 対応DONEが先に来た場合は既存early-DONEがnodeを解放し、taskをterminalにする。watcherはterminalを見て後着ACKを適用しない。
+
+#### 試験
+
+- `test/regression_conductor_queue_deadline.jl`で既定14400秒、環境上書き、per-submit parse、開始/deadline保存、BUSY/idleなしでの不変、LIFO内部の期限切れ除去、running非期限切れ、不正値を確認する。
+- `test/regression_conductor_dispatch_timeout.jl`で応答保留後にunknown・予約保持・queue 0・request 1件を確認し、追加cycleでもrequestが増えないことを確認する。
+- 同試験で期限前の遅延ACK、期限前のearly DONE、明示的遅延BUSY後の安全なqueue復帰、deadline後のunknown terminalと予約downを個別workerで確認する。
+- 既存BUSY待機、task lifecycle、client protocol、予約、DONE identity回帰も再実行する。
+
+### Phase 3: 実装する — 完了
+
+- clientへtimeout正値validationと`ACCEPTANCE_TIMEOUT_SECONDS=` SUBMIT fieldを追加し、単体submitとwait wrapperの両方から指定できるようにした。
+- `ConductorTask`へ受付timeoutを追加し、旧8引数constructorは環境既定値を補う互換入口として維持した。retry taskは元値を引き継ぐ。
+- conductorへ既定14400秒、環境値取得、秒からnsへの飽和変換、絶対deadline計算を追加した。
+- `TaskAcceptanceWindow`とregistryを追加し、初回enqueueだけで単調時刻の開始・deadlineを保存するようにした。
+- queue全体の`QUEUE_TIMEOUT`と`dispatch_unknown`の`DISPATCH_OUTCOME_UNKNOWN`を同じ期限走査でterminal化し、unknownの自予約だけをdownへ解放するようにした。
+- dispatch ACK timeout時は通常failure catchへ送らず、taskをunknown、nodeをreserved、queueを空のまま保持するようにした。配送loopは再投入せずreturnする。
+- 元request taskをdeadlineまで追うwatcherを追加し、遅延ACK、early DONE、遅延BUSY、遅延protocol/transport failureを別々に処理するようにした。
+- 明示的遅延BUSY用に`dispatch_unknown -> queued`だけを許可遷移へ追加し、lifecycle遷移行列試験を追従させた。
+- `test/regression_conductor_queue_deadline.jl`と`test/regression_conductor_dispatch_timeout.jl`を追加した。controlled workerは既存の「response channelへ値を入れるまで保留」機構で要件を満たすため変更していない。
+- `syncopadeConductor.jl`のincludeとper-submit parse smokeはexit `0`、`STEP8_INCLUDE_OK`。`git diff --check`もerrorなし。機能検証はPhase 4で行う。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 初回検証と強化C補正
+
+- queue deadline回帰は初回からexit `0`、`43 / 43 pass`となった。
+- dispatch timeout回帰の初回はexit `1`、`5 pass / 3 fail / 1 error`で停止した。1秒deadlineのtaskがtimeout直後の確認時にはterminal、node downとなり、遅延ACK待ちもtimeoutした。
+- 保存windowの差分は正しく`1_000_000_000 ns`だった。切分け用実TCP smokeで、`run_dispatch_cycle!`が0.05秒指定に対して約0.85秒を要し、watcherがdeadlineまで呼出元を実質待たせていることを確認した。
+- 原因は、同じevent loopの`@async` watcher内で`Base.timedwait`した構造と、初回JIT時間を1秒deadlineへ含めた試験値だった。watcherを短い`sleep`でyieldする状態loopへ変え、呼出元を待たせない形にした。遅延ACK/BUSY/DONE用deadlineはJITより十分長い5秒、unknown終端だけ0.5秒とした。
+- 同じ初回でlog writerのflush残時間が1ms未満になり、`Base.timedwait`の最小`pollint`制約に反する既存境界も検出した。`pollint`を最低1msへclampし、logを失わずwriterが継続するよう局所補正した。
+- さらに1ms未満のdispatch timeout指定でも同じ制約違反にならないようACK待ち側も最低1msへclampした。
+- 遅延BUSYがdeadline後に確定した枝でも、terminal reasonを通常の`worker_acceptance_deadline_exceeded`へ統一し、`TASK_QUEUE_TIMEOUT`を必ず記録するよう補った。
+
+#### 最終検証
+
+- `test/regression_conductor_queue_deadline.jl`を補正後2回実行し、いずれもexit `0`、`43 / 43 pass`、`STEP8_QUEUE_RESULT=PASS_ACCEPTANCE_DEADLINE`。
+- 永続queue artifactは`/tmp/syncopade-step8-queue-recheck.q1fyln/conductor_events.csv`、SHA-1は`0225bf358054cd37453f4cd0133e77a7bc82c957`。
+- 既定14400秒、環境7200.5秒、per-submit 12.5秒とwire 7.5秒、無効値、ns overflow飽和、初回window不変、期限直前保持、期限一致terminal、LIFO内部除去、running非期限切れを確認した。
+- `test/regression_conductor_dispatch_timeout.jl`を補正後3回実行し、すべてexit `0`、`40 / 40 pass`、`STEP8_DISPATCH_RESULT=PASS_OUTCOME_UNKNOWN`。
+- 永続dispatch artifactは`/tmp/syncopade-step8-dispatch-recheck.zxZPta/conductor_events.csv`、SHA-1は`4992bddfa1c088d30810290561ca03debfe048a6`。
+- 4 taskはいずれもACK timeoutまでworker request 1件だけだった。追加dispatch cycleでもrequestは増えなかった。
+- 遅延ACKは同じtask/nodeでrunning、early DONEは後着ACKで巻戻らずterminal、遅延BUSYはretry増加なしでqueue 1件、deadline不明は`DISPATCH_OUTCOME_UNKNOWN`かつnode downとなった。
+- artifact eventは`DISPATCH_OUTCOME_UNKNOWN_PENDING=4`、`DISPATCH_LATE_ACK=1`、`DISPATCH_LATE_BUSY=1`、`DISPATCH_OUTCOME_UNKNOWN=1`、`DISPATCH_FAILED=0`。
+- `test/regression_conductor_busy_wait.jl`: exit `0`、`48 / 48 pass`。
+- `test/unit_conductor_task_lifecycle.jl`: exit `0`、`145 / 145 pass`。
+- `test/unit_client_protocol.jl`: exit `0`、`63 / 63 pass`。
+- `test/unit_conductor_dispatch_reservation.jl`: exit `0`、`29 / 29 pass`。
+- `test/regression_conductor_done_identity.jl`: exit `0`、`33 / 33 pass`。
+- `test/regression_conductor_stale_idle.jl`: exit `0`、`26 / 26 pass`、artifact `/tmp/syncopade-step8-stale.PTntce`。
+- `test/reproduction_conductor_silent_drop.jl`: exit `0`、`11 / 11 pass`、artifact `/tmp/syncopade-step8-silent.7OsAhR`。
+- `test/unit_conductor_queue.jl`: repository外log指定でexit `0`、`17 / 17 pass`。
+- `git diff --check`はerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のままで、先生の既存差分4行を変更していない。
+
+### Step 8結論
+
+worker未送信のqueue待ちは初回受付からの単調deadlineで`QUEUE_TIMEOUT`となる。request送信後にACKがないtaskは再配送せず`dispatch_unknown`で保持され、遅延ACK/DONE/BUSYを同じtaskへ照合し、最後まで不明な場合だけ`DISPATCH_OUTCOME_UNKNOWN`となる。正常ACK後のworker実行時間には期限を掛けていない。
 
 ---
 
