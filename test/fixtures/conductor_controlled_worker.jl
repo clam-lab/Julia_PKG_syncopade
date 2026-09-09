@@ -164,7 +164,8 @@ function respond_status!(worker::ControlledWorker, response::String)::Nothing
 end
 
 function respond_job!(worker::ControlledWorker, response::String)::Nothing
-    valid = response == "ERROR|BUSY" || startswith(response, "OK|STARTED|")
+    valid = response in ("ERROR|BUSY", "ERROR|UNEXPECTED") ||
+        startswith(response, "OK|STARTED|")
     valid || throw(ArgumentError("unsupported job response: $response"))
     if startswith(response, "OK|STARTED|")
         fields = split(response, '|')

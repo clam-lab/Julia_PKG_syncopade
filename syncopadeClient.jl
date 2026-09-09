@@ -42,6 +42,66 @@ struct SyncopadeClient
     args::Vector{String}
 end
 
+abstract type WorkerStartReply end
+
+struct WorkerStartAccepted <: WorkerStartReply
+    job_id::String
+end
+
+
+struct WorkerStartBusy <: WorkerStartReply
+    raw_response::String
+end
+
+
+struct SyncopadeWorkerBusyError <: Exception
+    raw_response::String
+end
+
+
+struct SyncopadeWorkerProtocolError <: Exception
+    raw_response::String
+end
+
+
+struct SyncopadeWorkerStartTimeoutError <: Exception
+    timeout_seconds::Float64
+end
+
+
+function Base.showerror(io::IO, error_value::SyncopadeWorkerBusyError)
+    print(io, "Unexpected response from server: ", error_value.raw_response)
+end
+
+
+function Base.showerror(io::IO, error_value::SyncopadeWorkerProtocolError)
+    print(io, "Unexpected response from server: ", error_value.raw_response)
+end
+
+
+function Base.showerror(io::IO, error_value::SyncopadeWorkerStartTimeoutError)
+    print(
+        io,
+        "dispatch timeout waiting worker start-ack > ",
+        error_value.timeout_seconds,
+        "s; worker acceptance outcome is unknown"
+    )
+end
+
+
+function classify_worker_start_error(error_value)::Symbol
+    if error_value isa SyncopadeWorkerBusyError
+        return :busy
+    elseif error_value isa SyncopadeWorkerProtocolError
+        return :protocol_error
+    elseif error_value isa SyncopadeWorkerStartTimeoutError
+        return :outcome_unknown
+    elseif error_value isa Base.IOError || error_value isa EOFError || error_value isa SystemError
+        return :transport_error
+    end
+    return :unexpected_error
+end
+
 # checksum utilities
 """
     geneXORchecksum(s::String) -> UInt8
@@ -128,6 +188,21 @@ function verify_checksum(msg::String)::Tuple{Bool,String}
     return (checksum_str == expected, payload)
 end
 
+
+function parse_worker_start_response(response::AbstractString)::WorkerStartReply
+    raw_response = String(chomp(response))
+    parts = split(raw_response, '|'; keepempty=true)
+    if length(parts) == 3 &&
+       parts[1] == "OK" &&
+       parts[2] == "STARTED" &&
+       !isempty(parts[3])
+        return WorkerStartAccepted(String(parts[3]))
+    elseif length(parts) == 2 && parts[1] == "ERROR" && parts[2] == "BUSY"
+        return WorkerStartBusy(raw_response)
+    end
+    throw(SyncopadeWorkerProtocolError(raw_response))
+end
+
 """
     syncopade_calc_request(pList::SyncopadeClient) -> String
 
@@ -149,32 +224,30 @@ Expected single-line response:
 - `String`: `jobId` assigned by the server.
 
 # Throws
-- `error(...)` if the server response does not match the expected format.
+- `SyncopadeWorkerBusyError` if the worker explicitly rejects the request as busy.
+- `SyncopadeWorkerProtocolError` if the response does not match the protocol.
+- Transport exceptions from connect, write, or read operations.
 """
-function syncopade_calc_request(pList::SyncopadeClient)
+function syncopade_calc_request(pList::SyncopadeClient)::String
     sock = connect(pList.server_ip_addr, pList.server_port)
+    try
+        # フォーマットは self_ip_addr|self_port|file:module:func|arg1|arg2|...
+        func_spec = string(pList.file_name, ":", pList.module_name, ":", pList.function_name)
+        payload_parts = [pList.self_ip_addr, string(pList.self_port), func_spec]
+        if !isempty(pList.args)
+            append!(payload_parts, pList.args)
+        end
+        payload = join(payload_parts, "|")
+        msg_with_checksum = add_checksum(payload)
+        println(sock, msg_with_checksum)
 
-    # フォーマットは self_ip_addr|self_port|file:module:func|arg1|arg2|...
-    func_spec = string(pList.file_name, ":", pList.module_name, ":", pList.function_name)
-    payload_parts = [pList.self_ip_addr, string(pList.self_port), func_spec]
-    if !isempty(pList.args)
-        append!(payload_parts, pList.args)
-    end
-    payload = join(payload_parts, "|")
-    msg_with_checksum = add_checksum(payload)
-    println(sock, msg_with_checksum)
-
-    # 1行だけ読み込み、OK|STARTED|jobIdを受け取る
-    resp = readline(sock)
-    close(sock)
-
-    # parse response: OK|STARTED|jobId
-    resp_parts = split(resp, '|')
-    if length(resp_parts) == 3 && resp_parts[1] == "OK" && resp_parts[2] == "STARTED"
-        jobId = resp_parts[3]
-        return jobId
-    else
-        error("Unexpected response from server: $resp")
+        reply = parse_worker_start_response(readline(sock))
+        if reply isa WorkerStartAccepted
+            return reply.job_id
+        end
+        throw(SyncopadeWorkerBusyError(reply.raw_response))
+    finally
+        close(sock)
     end
 end
 

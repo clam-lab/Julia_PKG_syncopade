@@ -3,6 +3,31 @@ using Test
 include(joinpath(@__DIR__, "..", "syncopadeClient.jl"))
 
 @testset "Client Protocol" begin
+    accepted_reply = parse_worker_start_response("OK|STARTED|job-123")
+    @test accepted_reply isa WorkerStartAccepted
+    @test accepted_reply.job_id == "job-123"
+    @test accepted_reply.job_id isa String
+
+    busy_reply = parse_worker_start_response("ERROR|BUSY")
+    @test busy_reply isa WorkerStartBusy
+    @test busy_reply.raw_response == "ERROR|BUSY"
+
+    for malformed in ("OK|STARTED|", "OK|STARTED|job|extra", "ERROR|UNKNOWN")
+        error_value = try
+            parse_worker_start_response(malformed)
+            nothing
+        catch caught
+            caught
+        end
+        @test error_value isa SyncopadeWorkerProtocolError
+        @test classify_worker_start_error(error_value) == :protocol_error
+    end
+
+    @test classify_worker_start_error(SyncopadeWorkerBusyError("ERROR|BUSY")) == :busy
+    @test classify_worker_start_error(SyncopadeWorkerStartTimeoutError(3.0)) == :outcome_unknown
+    @test classify_worker_start_error(EOFError()) == :transport_error
+    @test classify_worker_start_error(ArgumentError("unexpected")) == :unexpected_error
+
     payload = "ABC|123|xyz"
     msg = add_checksum(payload)
     ok, decoded = verify_checksum(msg)

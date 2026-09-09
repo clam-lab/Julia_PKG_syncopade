@@ -613,7 +613,7 @@ DONEはendpointだけでnodeをidle化せず、現在のtask/job割当てと対�
 
 ---
 
-## Step 5: worker受付応答を種類別に解析する — 未着手
+## Step 5: worker受付応答を種類別に解析する — 完了
 
 ### 目的
 
@@ -622,6 +622,7 @@ DONEはendpointだけでnodeをidle化せず、現在のtask/job割当てと対�
 ### 対象ファイル
 
 - `syncopadeClient.jl`
+- `syncopadeConductor.jl`
 - `test/unit_client_protocol.jl`
 - `test/unit_controlled_worker_fixture.jl`
 - このTodo
@@ -640,13 +641,112 @@ DONEはendpointだけでnodeをidle化せず、現在のtask/job割当てと対�
 3. 正常受理時だけjob IDが得られることを確認する。
 4. 既存client protocol testとserver BUSY拒否試験を実行する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- worker受付応答の解析をsocket処理から分離し、正常受理とBUSYを異なるreply型、malformed responseを専用protocol例外として表す。
+- `syncopade_calc_request`の成功戻り値は具体的な`String` job IDのまま維持し、BUSYでは`SyncopadeWorkerBusyError`、不正応答では`SyncopadeWorkerProtocolError`を送出する。
+- socketは接続後の送信、読取り、解析の成功・失敗にかかわらず`finally`で閉じ、分類追加によるdescriptor残留を防ぐ。
+- conductorの受付応答timeoutは専用`SyncopadeWorkerStartTimeoutError`へ変更する。通信接続・読取り例外は既存Julia例外を保ち、共通分類helperで`:transport_error`と判定する。
+- 現在の`@async syncopade_calc_request`は内部例外を`TaskFailedException`で包むため、async task内で例外値を捕捉したresultを返し、conductor側catchが元のBUSY/protocol例外を直接分類できるようにする。
+- conductorのcatchは分類結果を`DISPATCH_FAILED.status`へ記録するが、このStepでは全分類を従来どおり自予約解放、node down、failure retryへ流す。BUSYだけを待機へ変えるのはStep 6とする。
+- reply型と例外型はこのStepでは内部契約とし、package exportは増やさない。公開結果protocolの型とexportはStep 9でまとめて扱う。
+- `test/unit_client_protocol.jl`で純粋な応答解析を確認し、`test/unit_controlled_worker_fixture.jl`で実TCPの正常、BUSY、malformed、接続拒否を個別に確認する。
+- timeoutは長い実待機をせず、専用例外値の分類を単体確認する。実際の保留応答と再配送防止はStep 8で検証する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### worker start reply型
+
+- `abstract type WorkerStartReply end`を内部基底型とする。
+- `WorkerStartAccepted(job_id::String) <: WorkerStartReply`は非空job IDを持つ。
+- `WorkerStartBusy(raw_response::String) <: WorkerStartReply`は正確な受信行を持つ。
+
+#### worker start例外型
+
+- `SyncopadeWorkerBusyError(raw_response::String) <: Exception`。
+- `SyncopadeWorkerProtocolError(raw_response::String) <: Exception`。
+- `SyncopadeWorkerStartTimeoutError(timeout_seconds::Float64) <: Exception`。
+- BUSYの`showerror`は既存test/logとの照合を保つため`Unexpected response from server: ERROR|BUSY`を含める。
+- protocol例外も`Unexpected response from server: <raw>`を含める。
+- timeout例外は秒数と、worker start ACKの受付成否が不明であることを示す。
+
+#### `parse_worker_start_response(response::AbstractString)::WorkerStartReply`
+
+- 改行を除いた応答が厳密に`OK|STARTED|<nonempty_job_id>`なら`WorkerStartAccepted`を返す。
+- 厳密に`ERROR|BUSY`なら`WorkerStartBusy`を返す。
+- field不足、余分field、空job ID、未知statusは`SyncopadeWorkerProtocolError`とする。
+- network、file、global stateを変更しない純粋な解析関数とする。
+
+#### `syncopade_calc_request(pList::SyncopadeClient)::String`
+
+- request wire形式は変更しない。
+- `WorkerStartAccepted`なら具体的な`String` job IDを返す。
+- `WorkerStartBusy`なら同じraw responseを持つ`SyncopadeWorkerBusyError`を送出する。
+- protocol例外とtransport例外は型を保って上位へ送出する。
+- 接続に成功したsocketは`finally`で必ず閉じる。
+
+#### `classify_worker_start_error(error_value)::Symbol`
+
+- `SyncopadeWorkerBusyError`は`:busy`。
+- `SyncopadeWorkerProtocolError`は`:protocol_error`。
+- `SyncopadeWorkerStartTimeoutError`は`:outcome_unknown`。
+- `Base.IOError`、`EOFError`、`SystemError`は`:transport_error`。
+- その他は`:unexpected_error`。
+- 分類だけを返し、例外送出、log、state変更は行わない。
+
+#### conductor dispatch内のasync結果
+
+- async taskは`(job_id=<String>, error=nothing)`または`(job_id="", error=<original exception>)`を返す。
+- timedwait期限到達時は`SyncopadeWorkerStartTimeoutError(DEFAULT_DISPATCH_TIMEOUT)`を送出する。
+- task完了時はresultをfetchし、`error !== nothing`なら元例外を再送出する。
+- catchは`classify_worker_start_error`の結果を`DISPATCH_FAILED.status`へ記録する。
+- state、queue、retryの分岐はこのStepでは既存経路を維持する。
+
+#### 試験
+
+- `test/unit_client_protocol.jl`でaccepted、BUSY、空job ID、余分field、未知応答と全分類記号を確認する。
+- `test/unit_controlled_worker_fixture.jl`でBUSY例外型、malformed例外型、正常job IDの具体型`String`、閉じたloopback portへの接続例外分類を確認する。
+- controlled worker履歴はSTATUS 1件、job 3件（BUSY、malformed、accepted）とし、request/response ID対応を維持する。
+- cleanup後にworker portを再bindできることを確認する。
+
+### Phase 3: 実装する — 完了
+
+- worker start reply 2型、BUSY/protocol/timeout例外3型、`showerror`、例外分類helperを`syncopadeClient.jl`へ追加した。
+- 応答解析を`parse_worker_start_response`へ分離し、正常job IDを具体的な`String`、BUSYを専用reply、不正形式を専用例外として実装した。
+- `syncopade_calc_request`を成功時`String`契約へ固定し、接続後socketを`finally`で閉じるよう変更した。
+- conductorのasync requestは元例外をNamedTuple内で保持して返し、`TaskFailedException`へ包まれたまま分類しない構造へ変更した。
+- start ACK timeoutを専用例外へ変更し、`DISPATCH_FAILED.status`へ分類記号を追加した。state、retry、requeue分岐は変更していない。
+- `test/unit_client_protocol.jl`へ純粋解析と分類試験、`test/unit_controlled_worker_fixture.jl`へ実TCPのBUSY、malformed、accepted、transport error試験を追加した。
+- 最初の一括patchは末尾log行の現行文脈指定が一致せず全体未適用となった。灯子のpatch位置指定ミスで、仕様・実装差分は入っていなかったため、強化Cの局所補正としてclient、conductor、testへ分割して適用した。
+- `git diff --check`はerrorなし。機能検証はPhase 4で行う。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 初回検証と強化C補正
+
+- `test/unit_client_protocol.jl`は初回から`23 / 23 pass`。
+- controlled worker初回はfixtureが`ERROR|BUSY`と正常ACK以外を禁止していたため、malformed応答を返す前にfixture自身が`ArgumentError`となり、`10 pass / 1 error`で停止した。
+- client分類やTodo前提の問題ではなく、灯子が新しいmalformed試験に必要なfixture応答を許可し忘れた局所ミスだった。
+- fixtureの許可応答へ試験専用`ERROR|UNEXPECTED`だけを追加し、任意文字列は許可せず、同じPhase 4を最初から再実行した。
+
+#### 最終検証
+
+- `test/unit_client_protocol.jl`: exit `0`、`23 / 23 pass`。accepted/BUSY、malformed 3種、BUSY/protocol/timeout/transport/unexpected分類を確認した。
+- `test/unit_controlled_worker_fixture.jl`を補正後2回実行し、いずれもexit `0`、`23 / 23 pass`。
+- 実TCPでBUSYは`SyncopadeWorkerBusyError/:busy`、malformedは`SyncopadeWorkerProtocolError/:protocol_error`、正常ACKは具体的な`String` job IDとなった。
+- 閉じたloopback portへの接続はtransport例外となり、`:transport_error`へ分類された。controlled worker終了後は同portを再bindできた。
+- `test/reproduction_conductor_busy_drop.jl`: exit `0`、`39 / 39 pass`、artifact `/tmp/syncopade-step5-busy.cwbRkS`、CSV SHA-1 `ec94c0335c71d35461f62d24e0483d5239ad632b`。
+- BUSY 4回は全て`DISPATCH_FAILED.status=busy`、例外本文`Unexpected response from server: ERROR|BUSY`として記録された。
+- Step 6前なのでBUSYは従来どおりretry `0..3`を消費し、1回dropした。分類以外の挙動を変えていない証拠である。
+- `test/unit_conductor_dispatch_reservation.jl`: exit `0`、`29 / 29 pass`。
+- `test/regression_conductor_done_identity.jl`: exit `0`、`33 / 33 pass`。
+- `test/regression_conductor_stale_idle.jl`: exit `0`、`26 / 26 pass`、artifact `/tmp/syncopade-step5-stale.MkXF4x`。
+- `git diff --check`はerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のままで、先生の既存差分を変更していない。
+
+### Step 5結論
+
+workerの正常受理、BUSY未受理、protocol異常、transport失敗、受付成否不明timeoutを別々に識別できる。conductor logへ分類を残しつつ、このStepでは意図どおりretry判断をまだ変更していない。
 
 ---
 

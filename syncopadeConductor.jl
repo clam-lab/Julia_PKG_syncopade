@@ -946,12 +946,18 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
             node_port=node.port,
             queue_len=queue_len()
         )
-        dispatch_task = @async syncopade_calc_request(client)
+        dispatch_task = @async try
+            (job_id=syncopade_calc_request(client), error=nothing)
+        catch error_value
+            (job_id="", error=error_value)
+        end
         w = Base.timedwait(() -> istaskdone(dispatch_task), DEFAULT_DISPATCH_TIMEOUT; pollint=0.01)
         if w === :timed_out
-            throw(ArgumentError("dispatch timeout waiting worker start-ack > $(DEFAULT_DISPATCH_TIMEOUT)s"))
+            throw(SyncopadeWorkerStartTimeoutError(DEFAULT_DISPATCH_TIMEOUT))
         end
-        jobId = String(fetch(dispatch_task))
+        dispatch_result = fetch(dispatch_task)
+        dispatch_result.error === nothing || throw(dispatch_result.error)
+        jobId = String(dispatch_result.job_id)
         assignment_recorded = mark_node_running!(node, task.task_id, jobId)
         if !assignment_recorded
             current = get_node_runtime_state(node)
@@ -984,6 +990,7 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
         )
         return true
     catch e
+        error_kind = classify_worker_start_error(e)
         released = release_node_assignment!(
             node,
             task.task_id,
@@ -1015,6 +1022,7 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
             node_name=node.name,
             node_ip=node.IP,
             node_port=node.port,
+            status=string(error_kind),
             error=sprint(showerror, e),
             queue_len=queue_len()
         )
