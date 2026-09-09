@@ -1298,7 +1298,7 @@ conductor経由のworker結果をconductor task IDへ直接結び付け、成功
 
 ---
 
-## Step 10: conductor打切りを親へ一度だけ通知する — 未着手
+## Step 10: conductor打切りを親へ一度だけ通知する — 完了
 
 ### 目的
 
@@ -1327,13 +1327,77 @@ worker job IDが発行されないままconductorがtaskをterminalにした場�
 3. terminal処理を重複呼出しし、callback 1件、terminal log 1件であることを確認する。
 4. callback先不通でも状態照会から同じ終端種別と理由を取得できることを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- retry上限、queue deadline、dispatch outcome unknownの3経路を、task terminal確定と親通知を一体で扱う共通関数へ集約する。worker DONEは既にworkerが結果callbackを送るため、このconductor打切り通知の対象外とする。
+- conductorは初回enqueue時の`ConductorTask`をtask ID別に保持し、queueから消えた後もcoordinator IP/portへ通知できるようにする。retryでは同じ受付taskの最新版を保持する。
+- terminal確定と「callback送信権の取得」を同じtask lock内でfirst-write-winsにする。送信自体はlock外で行い、重複terminal呼出しは送信前に拒否する。
+- callbackはStep 9の`TASK_RESULT|task_id||ERROR|terminal_kind|reason`を使い、worker未受理なのでjob IDを空fieldにする。親からのACKは要求せず、write完了を送信成功とする。
+- callback試行状態はtask lifecycleと同じ同期境界で別recordに保持し、未試行、送信中、成功、失敗と失敗理由を区別する。process内で同じtaskへ再試行・二重送信はしない。
+- 共通terminal関数はtask状態を先に確定するため、callback接続失敗でも状態照会のterminal kind/reasonは失われない。監査logにはterminal確定、callback成否、宛先、理由を1件だけ残す。
+- queue期限走査は候補抽出後に共通terminal関数でclaimし、成功したtaskだけqueueから除去する。unknown期限も同関数でclaim後、自taskのnode予約だけをdownへ解放する。
+- 遅延BUSYがdeadline後に届く枝は直接terminal stateを書かず、共通terminal関数へ渡して通知漏れを防ぐ。
+- 修正前silent-drop試験は正方向へ反転・改名し、長い親timeoutを待たずtask ID付きcallbackが届くこと、job ID空、状態照会一致、重複送信なしを確認する。
+- 別単体試験でcallback先不通でもterminal照会できることと、複数taskの非対象側へ接続しないことを確認する。Step 9 parserをそのまま正本としてcallbackを解析する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### task recordと通知状態
+
+- `conductor_task_records::Dict{String,ConductorTask}`と`task_terminal_notifications::Dict{String,TaskTerminalNotificationState}`を既存`task_runtime_states_lock`で保護する。
+- `TaskTerminalNotificationState`のfieldsは`status::Symbol`、`callback_ok::Bool`、`error::String`。statusは`:sending`、`:succeeded`、`:failed`だけを保存し、未試行は辞書entryなしで表す。
+- `register_conductor_task_record!(task)::Nothing`は初回enqueueとretry enqueueで同じtask IDのrecordを保存する。coordinator、function、受付timeoutは同一であることを確認し、retry countだけ最新版へ更新する。不一致は`ArgumentError`。
+- `get_conductor_task_record(task_id)::Union{Nothing,ConductorTask}`と`get_task_terminal_notification_state(task_id)::Union{Nothing,TaskTerminalNotificationState}`はread-only snapshotを返す。
+- `enqueue_task!`はqueued stateとacceptance windowの登録後、queue push前にtask recordを登録する。
+
+#### callback payloadと送信
+
+- `conductor_terminal_callback_payload(task_id, terminal_kind, reason)::String`は`TASK_RESULT|task_id||ERROR|terminal_kind|reason`を返す。task IDとterminal kindは非空必須。
+- `send_conductor_terminal_callback(task, terminal_kind, reason)`はpayloadへ既存checksumを付け、`coordinator_ip:coordinator_port`へ1行送信してsocketを閉じる。
+- 戻り値は`(ok::Bool, error::String)`。connect/write成功は`ok=true`、例外は`ok=false`と`showerror`文字列を返し、例外を外へ送出しない。
+
+#### `finalize_conductor_task!`
+
+- signatureは`finalize_conductor_task!(task_id, terminal_kind, reason; expected_states)::Bool`。
+- `expected_states`は呼出し経路が許す非terminal state tuple。現在stateが含まれず、未知task、既存terminal、通知entry既存なら`false`で副作用なし。
+- claim時はtask lock内で`mark_task_terminal!`を行い、通知状態を`:sending`として先に保存する。task record欠落でもterminalは維持し、送信結果を`:failed`、理由`missing_conductor_task_record`とする。
+- lock外でcallbackを1回だけ送り、同じ通知entryを`:succeeded`または`:failed`へ更新する。
+- `TASK_TERMINAL` eventを1件だけ記録し、task ID、endpoint、terminal kind/reason、`callback_ok`、送信errorを残す。
+- 戻り値trueはterminal claim成功を表し、callback成功そのものとは区別する。
+
+#### 既存terminal経路
+
+- `requeue_with_retry!`の上限超過は`expected_states=(TASK_RESERVED,)`で`MAX_RETRY_EXCEEDED`を共通関数へ渡し、従来`TASK_DROPPED`も1件維持する。
+- queue deadlineは`expected_states=(TASK_QUEUED,)`で`QUEUE_TIMEOUT`を共通関数へ渡し、claim成功後だけ同task IDをqueueから除去して`TASK_QUEUE_TIMEOUT`を記録する。
+- unknown deadlineは`expected_states=(TASK_DISPATCH_UNKNOWN,)`で`DISPATCH_OUTCOME_UNKNOWN`を共通関数へ渡し、claim成功後だけ自予約をdownへ解放して従来eventを記録する。
+- deadline後の遅延BUSYも直接`mark_task_terminal!`せず、`:expired`判定後に共通関数へ渡す。
+- worker DONEの`WORKER_DONE_OK/ERROR`は共通conductor callbackを呼ばず、現行worker callbackとtask terminal更新を維持する。
+
+#### 試験
+
+- `test/reproduction_conductor_silent_drop.jl`を`test/regression_conductor_terminal_callback.jl`へ改名し、retry上限で2秒以内に新形式callback 1件を受信する正方向試験へ反転する。
+- 同回帰でtask ID一致、job ID空、`MAX_RETRY_EXCEEDED|max_retry_exceeded`、状態照会一致、`TASK_TERMINAL=1`、重複finalize後の2件目接続なしを確認する。
+- 新規`test/unit_conductor_terminal_callback.jl`で閉じたcallback portへの送信失敗状態、status fallback、別task listener非接続、queue timeout、outcome unknownの共通経路を確認する。
+- Step 8 deadline/dispatch timeout、Step 9 result protocol、task lifecycle、DONE identityを再実行する。
+
+### Phase 3: 実装する — 完了
+
+- `syncopadeConductor.jl`へtask definition snapshotとterminal callback試行状態を追加し、初回enqueueからretryまで同じtask IDの通知先を保持するようにした。
+- `finalize_conductor_task!`でtask terminal遷移と送信権を同じlock内でclaimし、lock外でtask ID付き失敗callbackを1回だけ送るようにした。送信失敗時もterminal stateと失敗理由を保持する。
+- retry上限、queue deadline、dispatch outcome unknown、deadline後の遅延BUSYを共通terminal処理へ接続した。worker DONE経路は変更していない。
+- silent-drop再現試験を`test/regression_conductor_terminal_callback.jl`へ反転・改名し、`test/unit_conductor_terminal_callback.jl`へcallback失敗、非対象task、queue timeout、unknown deadline、遅延BUSY deadlineの試験を追加した。
+- 新しい`TASK_TERMINAL` logのstatus欄をevent名と誤認した既存dispatch試験は、CSVのevent列だけを比較するよう修正した。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+- `julia --startup-file=no --project=. test/regression_conductor_terminal_callback.jl`: 19/19 pass。retry上限で2秒以内にtask ID付き失敗callbackを受信し、空job ID、状態照会一致、重複送信なし、`TASK_TERMINAL=1`を確認した。
+- `julia --startup-file=no --project=. test/unit_conductor_terminal_callback.jl`: 51/51 pass。callback先不通時のterminal保持、snapshot非共有、非対象taskへの非接続、queue timeout、dispatch unknown、deadline後の遅延BUSYを確認した。
+- `julia --startup-file=no --project=. test/regression_conductor_queue_deadline.jl`: 43/43 pass。
+- `julia --startup-file=no --project=. test/regression_conductor_dispatch_timeout.jl`: 40/40 pass。
+- `julia --startup-file=no --project=. test/unit_result_protocol.jl`: 43/43 pass。
+- `julia --startup-file=no --project=. test/unit_conductor_task_lifecycle.jl`: 145/145 pass。
+- `julia --startup-file=no --project=. test/regression_conductor_done_identity.jl`: 33/33 pass。
+- 合計374/374 pass、全process exit code 0。Step 10の範囲では未解決errorなし。
 
 ---
 

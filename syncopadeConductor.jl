@@ -90,10 +90,18 @@ struct TaskAcceptanceWindow
     timeout_seconds::Float64
 end
 
+struct TaskTerminalNotificationState
+    status::Symbol
+    callback_ok::Bool
+    error::String
+end
+
 const node_states = Dict{Tuple{String,Int},NodeRuntimeState}()
 const task_queue = ConductorTask[]
 const task_runtime_states = Dict{String,TaskRuntimeState}()
 const task_acceptance_windows = Dict{String,TaskAcceptanceWindow}()
+const conductor_task_records = Dict{String,ConductorTask}()
+const task_terminal_notifications = Dict{String,TaskTerminalNotificationState}()
 
 const TASK_QUEUED = :queued
 const TASK_RESERVED = :reserved
@@ -885,6 +893,183 @@ function get_task_acceptance_window(
     end
 end
 
+function same_conductor_task_definition(
+    left::ConductorTask,
+    right::ConductorTask
+)::Bool
+    return left.task_id == right.task_id &&
+        left.coordinator_ip == right.coordinator_ip &&
+        left.coordinator_port == right.coordinator_port &&
+        left.source == right.source &&
+        left.module_name == right.module_name &&
+        left.function_name == right.function_name &&
+        left.args == right.args &&
+        left.acceptance_timeout_seconds == right.acceptance_timeout_seconds
+end
+
+function copy_conductor_task(task::ConductorTask)::ConductorTask
+    return ConductorTask(
+        task.task_id,
+        task.coordinator_ip,
+        task.coordinator_port,
+        task.source,
+        task.module_name,
+        task.function_name,
+        copy(task.args),
+        task.retry_count,
+        task.acceptance_timeout_seconds
+    )
+end
+
+function register_conductor_task_record!(task::ConductorTask)::Nothing
+    record = copy_conductor_task(task)
+    lock(task_runtime_states_lock) do
+        current = get(conductor_task_records, task.task_id, nothing)
+        if current !== nothing && !same_conductor_task_definition(current, record)
+            throw(ArgumentError(
+                "task $(task.task_id) was re-enqueued with a different definition"
+            ))
+        end
+        conductor_task_records[task.task_id] = record
+    end
+    return nothing
+end
+
+function get_conductor_task_record(
+    task_id::String
+)::Union{Nothing,ConductorTask}
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    return lock(task_runtime_states_lock) do
+        current = get(conductor_task_records, task_id, nothing)
+        current === nothing ? nothing : copy_conductor_task(current)
+    end
+end
+
+function get_task_terminal_notification_state(
+    task_id::String
+)::Union{Nothing,TaskTerminalNotificationState}
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    return lock(task_runtime_states_lock) do
+        get(task_terminal_notifications, task_id, nothing)
+    end
+end
+
+function conductor_terminal_callback_payload(
+    task_id::String,
+    terminal_kind::String,
+    reason::String
+)::String
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    isempty(terminal_kind) && throw(ArgumentError("terminal_kind must not be empty"))
+    return join(
+        String["TASK_RESULT", task_id, "", "ERROR", terminal_kind, reason],
+        "|"
+    )
+end
+
+function send_conductor_terminal_callback(
+    task::ConductorTask,
+    terminal_kind::String,
+    reason::String
+)::NamedTuple{(:ok, :error),Tuple{Bool,String}}
+    socket = nothing
+    try
+        socket = connect(task.coordinator_ip, task.coordinator_port)
+        println(
+            socket,
+            add_checksum(conductor_terminal_callback_payload(
+                task.task_id,
+                terminal_kind,
+                reason
+            ))
+        )
+        flush(socket)
+        return (ok=true, error="")
+    catch error_value
+        return (ok=false, error=sprint(showerror, error_value))
+    finally
+        if socket !== nothing
+            try
+                close(socket)
+            catch
+            end
+        end
+    end
+end
+
+function finalize_conductor_task!(
+    task_id::String,
+    terminal_kind::String,
+    reason::String;
+    expected_states::Tuple{Vararg{Symbol}}
+)::Bool
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    isempty(terminal_kind) && throw(ArgumentError("terminal_kind must not be empty"))
+    isempty(expected_states) && throw(ArgumentError("expected_states must not be empty"))
+    all(state -> state in TASK_RUNTIME_STATES && state != TASK_TERMINAL, expected_states) ||
+        throw(ArgumentError("expected_states must contain only non-terminal task states"))
+
+    task_record = nothing
+    state_from = ""
+    claimed = lock(task_runtime_states_lock) do
+        current = get(task_runtime_states, task_id, nothing)
+        if current === nothing ||
+           !(current.state in expected_states) ||
+           haskey(task_terminal_notifications, task_id)
+            return false
+        end
+        state_from = string(current.state)
+        mark_task_terminal!(task_id, terminal_kind, reason) || return false
+        task_terminal_notifications[task_id] = TaskTerminalNotificationState(
+            :sending,
+            false,
+            ""
+        )
+        task_record = get(conductor_task_records, task_id, nothing)
+        return true
+    end
+    claimed || return false
+
+    delivery = task_record === nothing ?
+        (ok=false, error="missing_conductor_task_record") :
+        send_conductor_terminal_callback(task_record, terminal_kind, reason)
+    notification_status = delivery.ok ? :succeeded : :failed
+    lock(task_runtime_states_lock) do
+        task_terminal_notifications[task_id] = TaskTerminalNotificationState(
+            notification_status,
+            delivery.ok,
+            delivery.error
+        )
+    end
+
+    log_error = isempty(delivery.error) ? reason :
+        string(reason, " callback_error=", delivery.error)
+    if task_record === nothing
+        log_conductor_event(
+            "TASK_TERMINAL";
+            task_id=task_id,
+            queue_len=queue_len(),
+            state_from=state_from,
+            state_to=string(TASK_TERMINAL),
+            status=terminal_kind,
+            callback_ok=delivery.ok,
+            error=log_error
+        )
+    else
+        log_task_event(
+            "TASK_TERMINAL",
+            task_record;
+            queue_len=queue_len(),
+            state_from=state_from,
+            state_to=string(TASK_TERMINAL),
+            status=terminal_kind,
+            callback_ok=delivery.ok,
+            error=log_error
+        )
+    end
+    return true
+end
+
 function acceptance_deadline_reached(
     task_id::String;
     now_ns::UInt64=time_ns()
@@ -909,6 +1094,7 @@ function enqueue_task!(task::ConductorTask; now_ns::UInt64=time_ns())
         task.acceptance_timeout_seconds;
         now_ns=now_ns
     )
+    register_conductor_task_record!(task)
     lock(task_queue_lock) do
         push!(task_queue, task)
     end
@@ -925,10 +1111,11 @@ function requeue_with_retry!(task::ConductorTask; max_retry=DEFAULT_MAX_RETRY)
     next_retry = task.retry_count + 1
     if next_retry > max_retry
         println("Drop task ", task.task_id, " after retries=", task.retry_count)
-        mark_task_terminal!(
+        finalize_conductor_task!(
             task.task_id,
             "MAX_RETRY_EXCEEDED",
-            "max_retry_exceeded"
+            "max_retry_exceeded";
+            expected_states=(TASK_RESERVED,)
         ) || throw(ArgumentError(
             "task $(task.task_id) cannot transition to terminal after retry exhaustion"
         ))
@@ -952,46 +1139,59 @@ function requeue_with_retry!(task::ConductorTask; max_retry=DEFAULT_MAX_RETRY)
 end
 
 function expire_waiting_tasks!(; now_ns::UInt64=time_ns())::NamedTuple
-    queue_timeouts = ConductorTask[]
-    outcome_unknown_ids = String[]
-
-    lock(task_runtime_states_lock) do
+    queue_candidates = lock(task_runtime_states_lock) do
         lock(task_queue_lock) do
-            retained = ConductorTask[]
-            for task in task_queue
-                state = get(task_runtime_states, task.task_id, nothing)
-                window = get(task_acceptance_windows, task.task_id, nothing)
-                expired = state !== nothing &&
-                    state.state == TASK_QUEUED &&
+            ConductorTask[
+                task
+                for task in task_queue
+                if begin
+                    state = get(task_runtime_states, task.task_id, nothing)
+                    window = get(task_acceptance_windows, task.task_id, nothing)
+                    state !== nothing &&
+                        state.state == TASK_QUEUED &&
+                        window !== nothing &&
+                        now_ns >= window.deadline_ns
+                end
+            ]
+        end
+    end
+    unknown_candidates = lock(task_runtime_states_lock) do
+        String[
+            task_id
+            for (task_id, state) in task_runtime_states
+            if begin
+                window = get(task_acceptance_windows, task_id, nothing)
+                state.state == TASK_DISPATCH_UNKNOWN &&
                     window !== nothing &&
                     now_ns >= window.deadline_ns
-                if expired && mark_task_terminal!(
-                    task.task_id,
-                    "QUEUE_TIMEOUT",
-                    "worker_acceptance_deadline_exceeded"
-                )
-                    push!(queue_timeouts, task)
-                else
-                    push!(retained, task)
-                end
             end
-            empty!(task_queue)
-            append!(task_queue, retained)
-        end
+        ]
+    end
 
-        for (task_id, state) in task_runtime_states
-            window = get(task_acceptance_windows, task_id, nothing)
-            if state.state == TASK_DISPATCH_UNKNOWN &&
-               window !== nothing &&
-               now_ns >= window.deadline_ns &&
-               mark_task_terminal!(
-                   task_id,
-                   "DISPATCH_OUTCOME_UNKNOWN",
-                   "worker_acceptance_outcome_unknown_at_deadline"
-               )
-                push!(outcome_unknown_ids, task_id)
-            end
+    queue_timeouts = ConductorTask[]
+    for task in queue_candidates
+        finalized = finalize_conductor_task!(
+            task.task_id,
+            "QUEUE_TIMEOUT",
+            "worker_acceptance_deadline_exceeded";
+            expected_states=(TASK_QUEUED,)
+        )
+        finalized || continue
+        lock(task_queue_lock) do
+            filter!(queued_task -> queued_task.task_id != task.task_id, task_queue)
         end
+        push!(queue_timeouts, task)
+    end
+
+    outcome_unknown_ids = String[]
+    for task_id in unknown_candidates
+        finalized = finalize_conductor_task!(
+            task_id,
+            "DISPATCH_OUTCOME_UNKNOWN",
+            "worker_acceptance_outcome_unknown_at_deadline";
+            expected_states=(TASK_DISPATCH_UNKNOWN,)
+        )
+        finalized && push!(outcome_unknown_ids, task_id)
     end
 
     for task in queue_timeouts
@@ -1392,12 +1592,7 @@ function resolve_late_task_busy!(task_id::String, now_ns::UInt64)::Symbol
         current !== nothing && current.state == TASK_DISPATCH_UNKNOWN || return :ignored
         window = get(task_acceptance_windows, task_id, nothing)
         if window !== nothing && now_ns >= window.deadline_ns
-            marked = mark_task_terminal!(
-                task_id,
-                "QUEUE_TIMEOUT",
-                "worker_acceptance_deadline_exceeded"
-            )
-            return marked ? :expired : :ignored
+            return :expired
         end
         transition_task_state!(task_id, TASK_QUEUED) ? :queued : :ignored
     end
@@ -1468,18 +1663,26 @@ function start_unknown_dispatch_watcher!(
                 if resolution == :queued
                     enqueue_task!(task; now_ns=now_after_busy)
                 elseif resolution == :expired
-                    log_task_event(
-                        "TASK_QUEUE_TIMEOUT",
-                        task;
-                        node_name=node.name,
-                        node_ip=node.IP,
-                        node_port=node.port,
-                        queue_len=queue_len(),
-                        state_from=string(TASK_DISPATCH_UNKNOWN),
-                        state_to=string(TASK_TERMINAL),
-                        status="QUEUE_TIMEOUT",
-                        error="worker_acceptance_deadline_exceeded"
+                    finalized = finalize_conductor_task!(
+                        task.task_id,
+                        "QUEUE_TIMEOUT",
+                        "worker_acceptance_deadline_exceeded";
+                        expected_states=(TASK_DISPATCH_UNKNOWN,)
                     )
+                    if finalized
+                        log_task_event(
+                            "TASK_QUEUE_TIMEOUT",
+                            task;
+                            node_name=node.name,
+                            node_ip=node.IP,
+                            node_port=node.port,
+                            queue_len=queue_len(),
+                            state_from=string(TASK_DISPATCH_UNKNOWN),
+                            state_to=string(TASK_TERMINAL),
+                            status="QUEUE_TIMEOUT",
+                            error="worker_acceptance_deadline_exceeded"
+                        )
+                    end
                 end
                 log_task_event(
                     "DISPATCH_LATE_BUSY",

@@ -230,7 +230,10 @@ end
     @test count(line -> occursin("\"DISPATCH_OUTCOME_UNKNOWN_PENDING\"", line), log_lines) == 4
     @test count(line -> occursin("\"DISPATCH_LATE_ACK\"", line), log_lines) == 1
     @test count(line -> occursin("\"DISPATCH_LATE_BUSY\"", line), log_lines) == 1
-    @test count(line -> occursin("\"DISPATCH_OUTCOME_UNKNOWN\"", line), log_lines) == 1
+    @test count(
+        line -> split(line, ','; limit=3)[2] == "\"DISPATCH_OUTCOME_UNKNOWN\"",
+        log_lines
+    ) == 1
     @test count(line -> occursin("\"DISPATCH_FAILED\"", line), log_lines) == 0
     @test count(line -> occursin("\"TASK_REQUEUED\"", line), log_lines) == 0
 end
