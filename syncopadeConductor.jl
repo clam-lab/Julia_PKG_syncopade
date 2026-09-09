@@ -281,38 +281,112 @@ function find_node_by_endpoint(ip::AbstractString, port::Int)::NODES
     return NODES(ip_s, port, "unknown")
 end
 
-function handle_done_payload(payload::String)
+function apply_done_to_node!(node::NODES, task_id::String, job_id::String)::NamedTuple
+    released = false
+    reason = :untracked_endpoint
+    previous = default_node_runtime_state()
+    lock(node_states_lock) do
+        key = (node.IP, node.port)
+        if haskey(node_states, key)
+            current = node_states[key]
+            previous = current
+            if isempty(current.task_id)
+                reason = :no_assignment
+            elseif current.task_id != task_id
+                reason = :task_mismatch
+            elseif isempty(job_id)
+                reason = :job_mismatch
+            elseif current.state == NODE_BUSY
+                if current.job_id == job_id
+                    node_states[key] = NodeRuntimeState(
+                        NODE_IDLE,
+                        current.generation + UInt64(1),
+                        "",
+                        ""
+                    )
+                    released = true
+                    reason = :matched
+                else
+                    reason = :job_mismatch
+                end
+            elseif current.state == NODE_RESERVED && isempty(current.job_id)
+                node_states[key] = NodeRuntimeState(
+                    NODE_IDLE,
+                    current.generation + UInt64(1),
+                    "",
+                    ""
+                )
+                released = true
+                reason = :early_done
+            else
+                reason = :state_mismatch
+            end
+        end
+    end
+    released && log_node_state_change(node, previous.state, NODE_IDLE)
+    return (released=released, reason=reason, previous=previous)
+end
+
+function handle_done_payload(payload::String)::Bool
     parts = split(payload, '|')
     if length(parts) < 10 || parts[1] != "DONE"
         throw(ArgumentError("Invalid DONE format"))
     end
 
-    task_id = parts[2]
-    job_id = parts[3]
-    worker_ip = parts[4]
+    task_id = String(parts[2])
+    job_id = String(parts[3])
+    worker_ip = String(parts[4])
     worker_port = parse(Int, parts[5])
-    status = parts[6]
-    started_at = parts[7]
-    finished_at = parts[8]
-    callback_ok = parts[9]
-    error_msg = join(parts[10:end], "|")
+    status = String(parts[6])
+    started_at = String(parts[7])
+    finished_at = String(parts[8])
+    callback_ok = String(parts[9])
+    error_msg = String(join(parts[10:end], "|"))
 
     node = find_node_by_endpoint(worker_ip, worker_port)
-    set_node_state!(node, NODE_IDLE)
+    result = apply_done_to_node!(node, task_id, job_id)
+    if result.released
+        log_conductor_event(
+            "TASK_DONE";
+            task_id=task_id,
+            node_name=node.name,
+            node_ip=node.IP,
+            node_port=node.port,
+            job_id=job_id,
+            queue_len=queue_len(),
+            status=status,
+            started_at=started_at,
+            finished_at=finished_at,
+            callback_ok=callback_ok,
+            error=error_msg
+        )
+        return true
+    end
+
+    previous = result.previous
     log_conductor_event(
-        "TASK_DONE";
+        "DONE_IGNORED";
         task_id=task_id,
         node_name=node.name,
         node_ip=node.IP,
         node_port=node.port,
         job_id=job_id,
         queue_len=queue_len(),
+        state_from=string(previous.state),
+        state_to=string(previous.state),
         status=status,
         started_at=started_at,
         finished_at=finished_at,
         callback_ok=callback_ok,
-        error=error_msg
+        error=string(
+            "reason=", result.reason,
+            " current_task_id=", previous.task_id,
+            " current_job_id=", previous.job_id,
+            " current_generation=", previous.generation,
+            " worker_error=", error_msg
+        )
     )
+    return false
 end
 
 function task_label(task::ConductorTask)::String

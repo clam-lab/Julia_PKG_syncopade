@@ -510,7 +510,7 @@ nodeの右優先選択とtask ID付き予約が一つのlock区間になり、�
 
 ---
 
-## Step 4: DONEをtask IDとjob IDで照合する — 未着手
+## Step 4: DONEをtask IDとjob IDで照合する — 完了
 
 ### 目的
 
@@ -536,13 +536,80 @@ nodeの右優先選択とtask ID付き予約が一つのlock区間になり、�
 3. 同じDONEを2回送っても解放logとtask終端が1回だけであることを確認する。
 4. 既存DONE/log試験を実行する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- `handle_done_payload`がendpointだけで無条件idle化する処理を廃止し、node recordの現在割当てと受信task/job IDを同じ`node_states_lock`区間で照合する専用DONE遷移へ置き換える。
+- 通常は現在recordが`NODE_BUSY`、task ID一致、job ID一致の場合だけ割当てを解放する。
+- workerはACK送信後すぐ計算taskを開始するため、非常に短いjobではconductorがACKからjob IDを保存する前にDONE処理が先行し得る。現在recordが`NODE_RESERVED`、task ID一致、job ID未確定の場合は、DONEの非空job IDをその予約のjob IDとして受理して直接完了できる早期DONE経路を設ける。
+- 早期DONE後にACK処理が戻った場合、Step 3の`mark_node_running!`は失敗するが、worker受付済みとして再投入せず`DISPATCH_ASSIGNMENT_CONFLICT`へ記録する既存方針を維持する。
+- endpointのruntime recordなし、割当てなし、task不一致、job不一致、状態不一致、重複DONEはnode状態を変更せず`DONE_IGNORED`へ理由と現在recordを記録する。
+- 正常DONEだけを既存`TASK_DONE`へ記録する。無視したDONEは`TASK_DONE`として数えず、conductor serverからworkerへの`OK|DONE_ACK`自体は返して再送loopを起こさない。
+- `handle_done_payload`は正常適用を`true`、無視を`false`で返す内部契約にし、既存callerは戻り値を無視できる。
+- networkなしの回帰試験で、task A正常完了後にtask Bを割り当て、遅延A、Bの誤job、未知endpoint、正常B、重複Bを順に与える。Bを解放できるのは正常Bだけとする。
+- 同じ試験で早期DONEも与え、予約task一致なら完了でき、後続ACK相当のmarkが成立しないことを確認する。
+- task lifecycle全体のterminal管理はStep 7へ残し、このStepはnode割当て解放とDONE監査だけを扱う。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### `apply_done_to_node!(node::NODES, task_id::String, job_id::String)::NamedTuple`
+
+- 戻り値は`released::Bool`、`reason::Symbol`、`previous::NodeRuntimeState`を持つ。
+- `node_states_lock`内でendpoint recordの存在、現在state、task ID、job IDを照合する。
+- `NODE_BUSY`でtask/job IDが完全一致した場合、`NODE_IDLE`、空task/job、generation + 1へ置換し、`released=true, reason=:matched`を返す。
+- `NODE_RESERVED`でtask ID一致、現在job ID空、受信job ID非空の場合は早期DONEとして同じ解放を行い、`released=true, reason=:early_done`を返す。
+- recordなしは`:untracked_endpoint`、割当てなしは`:no_assignment`、task不一致は`:task_mismatch`、空または不一致jobは`:job_mismatch`、上記以外のstateは`:state_mismatch`とする。
+- 不成立時はrecordを変更せず、`released=false`と判定時のprevious snapshotを返す。
+- 解放成功時だけ既存`NODE_STATE_CHANGED`を記録する。queue、retry、network I/Oは変更しない。
+
+#### `handle_done_payload(payload::String)::Bool`
+
+- 既存10 fields以上の`DONE`形式を維持し、task ID、job ID、worker IPを具体的な`String`、portを`Int`へ変換する。
+- 形式不足またはport不正は従来どおり例外とし、node stateとlogを変更しない。
+- `apply_done_to_node!`成功時は既存fieldsで`TASK_DONE`を1件記録して`true`を返す。
+- 不成立時は`DONE_IGNORED`を1件記録して`false`を返す。
+- `DONE_IGNORED`は受信task/job ID、endpoint、現在stateを通常列に持ち、`error`へ`reason`、現在task/job ID、現在generation、worker error本文を記録する。
+- conductor serverは戻り値にかかわらず、parseが成功したDONEへ既存`OK|DONE_ACK`を返す。
+
+#### 回帰試験
+
+- file: `test/regression_conductor_done_identity.jl`。
+- task A正常DONEでAを解放した後、task Bを同nodeへ予約・running化する。
+- 遅延task A DONE、task Bの誤job DONE、未登録endpoint DONEでtask B recordが完全一致のまま変わらないことを確認する。
+- task B正常DONEだけがidle化し、同じDONEの再送は`:no_assignment`で無視されることを確認する。
+- task Cはreserved/job未確定のまま同task ID・非空job IDのDONEを送り、早期DONEとしてidle化する。その後の`mark_node_running!`は`false`とする。
+- logは`TASK_DONE=3`、`DONE_IGNORED=4`で、無視理由`task_mismatch`、`job_mismatch`、`untracked_endpoint`、`no_assignment`を各1件含む。
+- malformed DONEが例外になり、状態を変えないことも確認する。
+- 一時logを使い、終了時にwriter、node state、task queueをcleanupする。
+
+### Phase 3: 実装する — 完了
+
+- node recordの存在、state、task ID、job IDを一つのlock区間で照合する`apply_done_to_node!`を追加した。
+- 通常のbusy完全一致と、reserved/task一致/job未確定に対する早期DONEを成功経路として実装した。
+- `handle_done_payload`を具体的な`String` fieldsへ変換し、成功を`TASK_DONE`、不成立を理由付き`DONE_IGNORED`へ分け、Boolを返すよう変更した。
+- 未登録endpoint、割当てなし、task不一致、job不一致、state不一致ではnode recordを変更しない。
+- conductor serverの既存`OK|DONE_ACK`応答は変更していない。
+- `test/regression_conductor_done_identity.jl`を追加し、正常A、遅延A、誤job B、未知endpoint、正常B、重複B、早期C、malformed payloadを固定順で検査する構造を実装した。
+- task lifecycle、terminal通知、callback形式は変更していない。
+- `git diff --check`で検査できる範囲のwhitespace不整合はない。機能検証はPhase 4で行う。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+- `julia --startup-file=no --project=. test/regression_conductor_done_identity.jl`を2回連続実行し、いずれもexit `0`、`33 / 33 pass`、marker `STEP4_RESULT=PASS_DONE_IDENTITY`。
+- task Aとtask Bの正常DONEだけが各割当てを解放した。
+- task B実行中の遅延task A DONE、task Bの誤job DONE、未登録endpoint DONEはtask B recordを変更しなかった。
+- task B正常DONE後の重複DONEは割当てなしとして無視された。
+- task Cのreserved/job未確定状態へ同task ID・非空job IDのDONEを与え、早期DONEとしてidle化した。後続ACK相当の`mark_node_running!`は`false`となった。
+- 一時logは`TASK_DONE=3`、`DONE_IGNORED=4`で、理由`task_mismatch`、`job_mismatch`、`untracked_endpoint`、`no_assignment`を各1件含んだ。
+- malformed DONEは`ArgumentError`となり、node recordを変更しなかった。
+- `test/unit_conductor_dispatch_reservation.jl`: exit `0`、`29 / 29 pass`。
+- `test/regression_conductor_stale_idle.jl`: exit `0`、`26 / 26 pass`、artifact `/tmp/syncopade-step4-stale.JNJbF7`。
+- `test/unit_conductor_node_state.jl`: exit `0`、`55 / 55 pass`。
+- `git diff --check`はerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のままで、先生の既存差分を変更していない。
+
+### Step 4結論
+
+DONEはendpointだけでnodeをidle化せず、現在のtask/job割当てと対応する場合だけ解放する。古い・不一致・重複DONEは監査logへ分離され、ACK保存前の正しい早期DONEも失われないことを確認した。
 
 ---
 
