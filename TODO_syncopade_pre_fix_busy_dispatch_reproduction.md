@@ -429,7 +429,7 @@
 
 ---
 
-## Step 4: TASK_DROPPED後に親へ終了通知がないことを再現する — 未着手
+## Step 4: TASK_DROPPED後に親へ終了通知がないことを再現する — 完了
 
 ### 目的
 
@@ -459,13 +459,84 @@ conductorが受付済みtask IDを破棄した後、親のcallback listenerへ�
 4. task ID、queue、log、listener結果を一つのreceiptへ記録する。
 5. listener、非同期task、portを必ず終了する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- Step 3のBUSY配送は繰り返さず、`requeue_with_retry!`の上限超過分岐だけを直接検証する。
+- loopbackの自動割当てportで親callback listenerを先に起動する。
+- 親が保持する固定task IDと、retry `3`の`ConductorTask.task_id`を一致させる。
+- listenerの`accept`を非同期に開始してから`requeue_with_retry!(task; max_retry=3)`を呼ぶ。
+- queue length 0と、一時CSVの`TASK_DROPPED/max_retry_exceeded` 1件を確認する。
+- `0.5 s`のbounded waitでaccept taskが未完了、すなわちcallback接続なしであることを確認する。
+- listenerを閉じてaccept taskを終了させ、portへ再bindできることを確認する。
+- 「通知なし」はこの関数経路の事実として記録し、親の長時間timeoutや実MDO taskは使用しない。
+- testは独立processで実行し、repository外log、bounded cleanup、既存log不変を維持する。
+- production source、既存test、`test/runtests.jl`は変更しない。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### 再現test entrypoint
+
+- file: `test/reproduction_conductor_silent_drop.jl`
+- command: `SYNCOPADE_TEST_ARTIFACT_DIR=<repository外path> julia --project=. test/reproduction_conductor_silent_drop.jl`
+- conductor log: `<artifact>/conductor_events.csv`
+- expected marker: `STEP4_RESULT=PASS_REPRODUCED_SILENT_DROP`。
+
+#### 固定taskと親listener
+
+- accepted task ID: `controlled-silent-drop-task`。
+- task retry: `3`、max retry: `3`。
+- coordinator IP: `127.0.0.1`。
+- coordinator port: loopback listenerの自動割当てport。
+- source/module/function: `controlled_source:ControlledModule:controlled_function`。
+- parent側の待機対象集合は上記task IDを1件だけ保持する。
+
+#### Dropと無通知の判定
+
+1. task queueとnode stateを空にする。
+2. callback listenerのaccept taskを開始する。
+3. `requeue_with_retry!`を呼ぶ。
+4. queue length 0、親の待機対象にtask IDが残ることを確認する。
+5. log writerをflushし、`TASK_DROPPED` 1件、retry `3`、`max_retry_exceeded`を確認する。
+6. `0.5 s`待ってもaccept taskが完了しないことを確認する。
+
+#### Cleanupと副作用
+
+- listener close後、accept taskがbounded wait内に終了し、接続socketを返していないことを確認する。
+- 同じportへの再bindを確認する。
+- `finally`でlistener、accept task、conductor log writer、task queue、node stateをcleanupする。
+- repository外artifact以外を生成せず、repository log SHA-1を維持する。
+- callbackが1件でも来た場合、drop log不一致、cleanup失敗ではPASS markerを出さない。
+
+### Phase 3: 実装する — 完了
+
+- `test/reproduction_conductor_silent_drop.jl`を追加した。
+- loopback自動portの親listenerと、同じcoordinator endpoint/task IDを持つretry上限taskを作成した。
+- `requeue_with_retry!`後のqueue length 0、親の待機集合に残るtask ID、drop log 1件を検査する。
+- drop後0.5秒のbounded waitでcallback接続がないことを検査する。
+- listener closeでaccept taskを終了し、接続socketを受け取っていないこととport再bindを検査する。
+- `try/finally`でlistener、accept task、log writer、task queue、node stateをcleanupする。
+- production source、既存test、`test/runtests.jl`は変更していない。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+- 再現testを2回連続実行し、どちらも`9 / 9 pass`。
+- result: `STEP4_RESULT=PASS_REPRODUCED_SILENT_DROP`。
+- 両実行でretry `3`の同一task IDがqueueへ戻らず、queue length 0となった。
+- 両実行の一時CSVは`TASK_DROPPED`を1件だけ含み、retry `3`、`max_retry_exceeded`と一致した。
+- 親listenerはdrop前から起動していたが、drop後0.5秒のbounded wait内にcallback接続はなかった。
+- 親の待機対象集合には`controlled-silent-drop-task`が残った。
+- listener close後、accept taskは接続socketを返さず終了し、同じportへ再bindできた。
+- 1回目artifact: `/tmp/syncopade-silent-drop-step4.zTpKRz/`。
+- 1回目CSV SHA-1: `e3ede1e7c643f1b4d2f9338ef4460898cc096c5b`。
+- 2回目artifact: `/tmp/syncopade-silent-drop-step4-repeat.JBJSBv/`。
+- 2回目CSV SHA-1: `b95f397d8dcea6144bc034b8b40da19cc31df2b2`。
+- cleanup後、callback listenerとJulia processは残らなかった。
+- `git diff --check`と新規testのwhitespace checkはerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のまま。
+
+### Step 4結論
+
+現行`requeue_with_retry!`の上限超過分岐はtaskをqueueから消してdrop logを残すだけで、親のcallback endpointへ接続しない。親が受付済みtask IDを待機対象として保持したままになる経路を、workerやMDOを使わず2回再現した。
 
 ---
 
