@@ -30,23 +30,14 @@ function receive_callback(listener::Sockets.TCPServer)
         line = readline(sock)
         checksum_ok, payload = verify_checksum(line)
         checksum_ok || error("invalid callback checksum: $line")
-
-        parts = split(payload, '|')
-        length(parts) >= 4 || error("malformed callback payload: $payload")
-        parts[1] == "RESULT" || error("unexpected callback type: $(parts[1])")
-
-        job_id = parts[2]
-        status = parts[3]
-        if status == "OK"
-            return (job_id=job_id, ok=true, payload=join(parts[4:end], "|"))
-        elseif status == "ERROR" && length(parts) >= 5
-            return (
-                job_id=job_id,
-                ok=false,
-                payload=parts[4] * "|" * join(parts[5:end], "|"),
-            )
-        end
-        error("unexpected callback status: $payload")
+        message = parse_syncopade_result_payload(payload)
+        return (
+            protocol=message.protocol,
+            task_id=message.task_id,
+            job_id=message.job_id,
+            ok=message.ok,
+            payload=message.payload,
+        )
     finally
         sock === nothing || close_quietly(sock)
         close_quietly(listener)
@@ -215,7 +206,7 @@ function main(args::Vector{String}=ARGS)
     conductor_port = parse_int_arg(args, 2, 9030)
     server_ip = length(args) >= 3 ? args[3] : "192.168.100.30"
     server_port = parse_int_arg(args, 4, 8030)
-    task_count = parse_int_arg(args, 5, 20)
+    task_count = parse_int_arg(args, 5, 4)
     callback_base_port = parse_int_arg(args, 6, 9200)
     sleep_seconds = parse_float_arg(args, 7, 3.0)
     timeout = parse_float_arg(args, 8, 90.0)
@@ -289,6 +280,14 @@ function main(args::Vector{String}=ARGS)
 
         wait_for_tasks(receiver_tasks, timeout, "callbacks")
         callbacks = [fetch(task) for task in receiver_tasks]
+        all(callback -> callback.protocol == :task_result, callbacks) ||
+            error("one or more callbacks used the legacy result protocol")
+        for index in eachindex(task_ids)
+            callbacks[index].task_id == task_ids[index] || error(
+                "callback task ID mismatch at index $index: " *
+                "submitted=$(task_ids[index]) callback=$(callbacks[index].task_id)"
+            )
+        end
         all(callback -> callback.ok, callbacks) || error("one or more callbacks returned ERROR")
         job_ids = String[callback.job_id for callback in callbacks]
         length(unique(job_ids)) == task_count || error("worker job IDs are not unique")
@@ -303,6 +302,9 @@ function main(args::Vector{String}=ARGS)
         fixture_intervals = [(probe.started_ns, probe.finished_ns) for probe in probes]
         fixture_overlap_count = count_interval_overlaps(fixture_intervals)
         max_active = maximum(probe.max_active for probe in probes)
+        all(probe -> probe.active_at_entry == 1, probes) ||
+            error("one or more probes entered while another job was active")
+        max_active == 1 || error("max_active=$max_active, expected 1")
 
         events = wait_for_conductor_events(conductor_log_path, task_ids, timeout)
         conductor_intervals = validate_conductor_events(
@@ -314,13 +316,46 @@ function main(args::Vector{String}=ARGS)
         )
         conductor_overlap_count = count_interval_overlaps(conductor_intervals)
 
+        statuses = ConductorTaskStatus[
+            query_conductor_task_status(
+                conductor_ip,
+                task_id;
+                conductor_port=conductor_port
+            )
+            for task_id in task_ids
+        ]
+        for index in eachindex(statuses)
+            status = statuses[index]
+            status isa KnownConductorTaskStatus ||
+                error("conductor forgot task $(task_ids[index])")
+            status.state == :terminal ||
+                error("task $(task_ids[index]) state was $(status.state)")
+            status.terminal_kind == "WORKER_DONE_OK" || error(
+                "task $(task_ids[index]) terminal kind was $(status.terminal_kind)"
+            )
+            status.job_id == callbacks[index].job_id ||
+                error("task status job ID mismatch at index $index")
+        end
+
         final_status = query_server_status(server_ip, server_port)
         final_status == "STATUS|idle" || error("server did not return idle: $final_status")
-        max_active >= 2 || error("overlap not reproduced: max_active=$max_active")
-        fixture_overlap_count >= 1 || error("fixture intervals did not overlap")
-        conductor_overlap_count >= 1 || error("conductor intervals did not overlap")
+        fixture_overlap_count == 0 || error("fixture intervals overlapped")
+        conductor_overlap_count == 0 || error("conductor intervals overlapped")
 
-        println("STEP3_RESULT=PASS_REPRODUCED")
+        event_count(name::String) = count(
+            event -> event["event"] == name,
+            events
+        )
+        event_count("TASK_DONE") == task_count || error("TASK_DONE count mismatch")
+        event_count("TASK_DROPPED") == 0 || error("a conductor task was dropped")
+        event_count("TASK_TERMINAL") == 0 ||
+            error("a conductor-side failure terminal was observed")
+        dispatch_busy_event_count = event_count("DISPATCH_BUSY")
+        task_requeued_busy_event_count = event_count("TASK_REQUEUED_BUSY")
+        task_dropped_event_count = event_count("TASK_DROPPED")
+        conductor_failure_terminal_event_count = event_count("TASK_TERMINAL")
+
+        println("STEP11_RESULT=PASS_LAN100_EXCLUSIVE_TERMINAL")
         println("conductor_endpoint=$(conductor_ip):$(conductor_port)")
         println("server_endpoint=$(server_ip):$(server_port)")
         println("callback_ip=$(callback_ip)")
@@ -331,10 +366,15 @@ function main(args::Vector{String}=ARGS)
         println("callbacks=$(length(callbacks))")
         println("unique_task_ids=$(length(unique(task_ids)))")
         println("unique_job_ids=$(length(unique(job_ids)))")
+        println("task_terminal_statuses=$(count(status -> status.state == :terminal, statuses))")
         println("submit_gate_opened_ns=$(submit_gate_opened_ns)")
         println("max_active=$(max_active)")
         println("fixture_overlap_pairs=$(fixture_overlap_count)")
         println("conductor_overlap_pairs=$(conductor_overlap_count)")
+        println("dispatch_busy_events=$(dispatch_busy_event_count)")
+        println("task_requeued_busy_events=$(task_requeued_busy_event_count)")
+        println("task_dropped_events=$(task_dropped_event_count)")
+        println("conductor_failure_terminal_events=$(conductor_failure_terminal_event_count)")
         println("final_status=$(final_status)")
         println("conductor_log=$(conductor_log_path)")
         for index in 1:task_count

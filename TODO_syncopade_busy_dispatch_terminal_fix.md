@@ -1401,7 +1401,7 @@ worker job IDが発行されないままconductorがtaskをterminalにした場�
 
 ---
 
-## Step 11: 修正後回帰試験を統合しlan100で確認する — 未着手
+## Step 11: 修正後回帰試験を統合しlan100で確認する — 完了
 
 ### 目的
 
@@ -1433,13 +1433,90 @@ worker job IDが発行されないままconductorがtaskをterminalにした場�
 5. task ID、job ID、callback、DONE、terminal状態、実行区間を照合する。
 6. server/conductor終了後に使用portを再bindし、残留processがないことを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- `test/runtests.jl`は各test fileを同一moduleへ`include`せず、独立Julia processで順に実行する。conductor/server定義とtest helperのglobal名衝突、状態registry、ENV、log writerをtest間で共有しないためである。
+- 自動suiteには既存baseline 2件とSteps 1〜10のunit・決定的regression 13件を登録する。外部server/conductorを要求するmanual integrationは混ぜない。
+- 各子processは`--startup-file=no --project=<repository> --threads=4`で起動し、stdout/stderrとexit codeを親testが回収する。repository既定logを使う古いqueue testにもsuite専用一時logを与える。
+- `unit_conductor_queue.jl`のretry fixtureは、Step 7以降の正規lifecycleどおりenqueue、pop、reservedを経てからrequeueするよう直し、未登録taskを直接requeueする旧前提を除く。
+- lan100の既存`integration_conductor_node_exclusivity.jl`は、修正前のoverlap成功条件を正方向へ反転する。4 tasksを既定値にし、task-aware callback、conductor task status、DONE log、worker区間をtask ID/job ID単位で照合する。
+- 実TCP試験ではLISTが`192.168.100.30:8030`だけであることを投入前にfail-closedで確認し、4 tasks全てについて正常callback、`WORKER_DONE_OK` terminal、重複なし、実行区間overlap 0、`max_active == 1`を要求する。
+- BUSY時のtask保持は決定的`regression_conductor_busy_wait.jl`、実server排他は`integration_server_busy_rejection.jl`、4 taskの終端性はconductor integrationで別々に確認し、自然raceの発生自体は成功条件にしない。
+- wrapper processのstdout/stderrとconductor CSVはrepository外の一時artifactへ置く。serverは`q`、conductorはSIGINTでbounded終了し、最後に使用port再bind、対象process不在、repository log不変を確認する。
+- `docs/TESTING.md`へ自動suite、lan100正方向integration、task-aware callback/statusの確認項目とcleanup手順を反映する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### 自動suite
+
+- `ISOLATED_TEST_FILES::Vector{String}`は`unit_client_protocol`、`unit_conductor_queue`、`unit_conductor_node_state`、`regression_conductor_stale_idle`、`unit_conductor_dispatch_reservation`、`regression_conductor_done_identity`、`unit_controlled_worker_fixture`、`regression_conductor_busy_wait`、`unit_conductor_task_lifecycle`、`regression_conductor_queue_deadline`、`regression_conductor_dispatch_timeout`、`unit_result_protocol`、`unit_server_admission_state`、`regression_conductor_terminal_callback`、`unit_conductor_terminal_callback`の15件とする。
+- `run_isolated_test(test_file, artifact_dir)`は子processのstdout、stderr、exit codeを返す。親はstdoutを表示し、exit code 0とstderr空を各fileでassertする。
+- suite用`SYNCOPADE_CONDUCTOR_LOG`は`artifact_dir/<test basename>.csv`とし、`finally`でsuite一時directoryを削除する。
+
+#### lan100 integration harness
+
+- `receive_callback(listener)`はchecksum検証後、正本`parse_syncopade_result_payload`を呼び、`task_id`、`job_id`、`ok`、`payload`を返す。
+- `main`の既定task countは4、sleepは3秒、timeoutは90秒とする。callback portはbase portから4件を先にbindし、同じgateから4 SUBMITを解放する。
+- callbackは全て`:task_result`、`callback.task_id == submitted task_id`、非空かつ一意なjob ID、成功payloadのlabel一致を要求する。
+- `wait_for_conductor_events`は各task IDの`DISPATCH_OK`と`TASK_DONE`を待つ。各行のworker endpoint、task ID、job ID、status、callback成否を照合する。
+- event確認後、`query_conductor_task_status`で4件全てが`KnownConductorTaskStatus`、state `:terminal`、kind `WORKER_DONE_OK`、callbackと同じjob IDであることを要求する。
+- fixture nanosecond区間とconductor DONE時刻区間はともにoverlap pair 0、全probeの`active_at_entry == 1`かつ`max_active == 1`を要求する。
+- stdout markerは`STEP11_RESULT=PASS_LAN100_EXCLUSIVE_TERMINAL`とし、4組のtask ID/job ID、BUSY/requeue/drop/terminal件数、区間を出力する。
+
+#### 実processとcleanup
+
+- conductor: profile `lan100`、wired prefix `192.168.100.`、一時CSVを指定して`scripts/run_conductor.jl`を起動する。
+- server: 同じprofile/prefixと`SYNCOPADE_MOUNT_ROOT_UNIX=<repository>/test/fixtures`を指定して`scripts/run_server.jl`を起動する。
+- readinessは各10秒以内の`STATUS|idle`、`NODES|192.168.100.30:8030`。不一致ならtaskを投入しない。
+- integration commandは`julia --startup-file=no --project=. test/integration_conductor_node_exclusivity.jl 192.168.100.30 9030 192.168.100.30 8030 4 <callback_base> 1.0 30.0 <conductor_csv>`。
+- 終了後は8030、9030、4 callback portsを再bindし、server/conductor process終了、repository log hash不変、stderr内容、CSV hashを記録する。
+
+### Phase 3: 実装する — 完了
+
+- `test/runtests.jl`を15 test fileの独立process runnerへ変更し、各processのexit code 0とstderr空を親testで検査するようにした。suite用log directoryは終了時に削除する。
+- `test/unit_conductor_queue.jl`へ一時logとcleanupを追加し、retry fixtureをenqueue/reserved経由の正規task lifecycleへ修正した。
+- `test/integration_conductor_node_exclusivity.jl`を4 taskの正方向試験へ反転し、Step 9 parserによるtask-aware callback、task ID/job ID、terminal status、DONE log、排他的実行区間を照合するようにした。
+- 修正前の`PASS_REPRODUCED`、overlap必須条件、既定20 tasksを除き、`STEP11_RESULT=PASS_LAN100_EXCLUSIVE_TERMINAL`、overlap 0、`max_active == 1`を成功条件にした。
+- `docs/TESTING.md`へ独立process suiteの実行方法、lan100のserver/conductor/4-task command、task-aware確認項目、cleanup手順を追記した。
+- integration harnessの初回includeで文字列補間内の引用符によるParseErrorを検出した。検証値を事前変数へ分離する局所修正後、include-onlyは`STEP11_HARNESS_INCLUDE_OK`、exit code 0となった。Todo・前提・仕様変更はない。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 全自動suite
+
+- command: `julia --startup-file=no --project=. --threads=4 test/runtests.jl`。
+- 15個の独立子processは全てexit code 0、stderr 0 byte。子testは合計654/654 assertions pass、親runnerは30/30 assertions pass。
+- BUSY決定試験は同じtask ID/retry 0のまま3回`ERROR|BUSY`を受け、4回目に正常受理してDONEへ到達した。48/48 pass。
+- retry上限、queue timeout、dispatch unknown、callback不通、遅延BUSY deadlineを含むterminal callback試験は70/70 pass。
+- suite配下へ子artifactを集約する補正後に全体を再実行し、suite一時directoryの削除を確認した。
+
+#### lan100 preflightと実server BUSY
+
+- このPCが`192.168.12.2`と`192.168.100.30`を保持し、開始前に8030、9030、9141〜9143、9261〜9264のlistenerと既存Syncopade processがないことを確認した。
+- server `192.168.100.30:8030`は`STATUS|idle`、conductor `192.168.100.30:9030`のLISTは`NODES|192.168.100.30:8030`だけだった。起動時stderrは両方0 byte。
+- `integration_server_busy_rejection.jl`はexit code 0、stderr 0 byte、`PASS_BUSY_REJECTED`と`PASS_NORMAL_RECOVERY`。job A中のBは`ERROR|BUSY`でjob ID/callbackなし、終了後のjob Cは正常受理された。
+- job A/Cは`active_at_entry=1`、`max_active=1`、実行区間overlapなし。最終server状態は`STATUS|idle`。
+
+#### conductor経由4 tasks
+
+- result: `STEP11_RESULT=PASS_LAN100_EXCLUSIVE_TERMINAL`、exit code 0、stderr 0 byte。
+- submitted 4、task-aware callbacks 4、`KnownConductorTaskStatus(:terminal)` 4、`TASK_DONE` 4、drop 0、conductor failure terminal 0。
+- task/job mapping:
+  - `291e0045-55e1-486c-aef4-30a8c2e5e8a7` -> `9bf402bd-d608-42d0-8229-20b4ea062837` (`run-0001`)
+  - `0af25f7c-8d31-4e80-86f8-df5bfe2f7108` -> `56af2b4c-982f-4117-a611-83c6d92fe375` (`run-0002`)
+  - `e76c4c31-6cfc-4164-bef4-b48f5cec37a7` -> `75dbbaf8-171c-4126-955f-a62ff20ec026` (`run-0003`)
+  - `152634b4-4306-4a4a-ac14-10337f0fa2fe` -> `8618ea6d-63f0-4aa2-b96a-54e8b7913606` (`run-0004`)
+- 4 taskとも`WORKER_DONE_OK`、callback/status/DONEのtask IDとjob IDが一致した。`active_at_entry=1`、`max_active=1`、fixture/conductor区間overlap pairはともに0。
+- この実行では`DISPATCH_BUSY=0`、`TASK_REQUEUED_BUSY=0`だった。自然raceを必須にせず、BUSY保持は上記48/48の決定試験、実server排他は直接BUSY試験で確認した。
+
+#### cleanupとevidence
+
+- serverは`q`でexit code 0。conductorは試験完了後のSIGINTで停止し、stderr 2292 byteは`signal 2: Interrupt`の終了traceだけで、試験中runtime errorではない。
+- 8030、9030、9141〜9143、9261〜9264は停止後すべて再bind成功。対象Syncopade processは残っていない。
+- repository logは試験前後ともSHA-1 `b42bd0dc80df7523ceaaf760fa11e8f36fcaac1b`で、先生の既存4行差分を変更・stageしていない。
+- evidence SHA-256: BUSY stdout `764318fbbad58f4c0a46643e3fcfab0010b3ecb5da7204daf74dd97adc816307`、4-task stdout `c4cf45a461a3d582c98c9bbcb93ec3a3e4db76ccfd97582263b002a2b0074945`、conductor CSV `4a2d95ddbd11f833ebf177b09ab2dbd3aad952b00a0109a2f0c0a91c26302b16`。
+- repository外artifact `/tmp/syncopade-step11-lan100.MYvdVS`はhash記録後に削除し、不在を確認した。
+- harness include時の引用符ParseErrorと、監査shellでzsh予約配列`path`を上書きしたcommand errorは、どちらも灯子の局所ミスだった。仕様・実験結果を変えずに修正して再実行し、最終結果は上記のとおり全てpassした。
 
 ---
 
@@ -1455,3 +1532,14 @@ worker job IDが発行されないままconductorがtaskをterminalにした場�
 - sibling repository側で必要な最小変更
 - local HEAD、`origin/master`、commit一覧
 - version更新・tag・releaseは別途先生の指示を待つ
+
+### 実績
+
+- 原因は、node観測と予約の世代管理不足、dispatch前の非原子的選択、BUSYと通信失敗の未分類、task lifecycle/受付期限/親terminal通知の欠落が重なっていたこと。node reservation、task state machine、期限、task-aware result、first-write-wins terminal callbackへ分離して修正した。
+- 保持する不変条件は、1 nodeに同時に1 taskだけを予約すること、stale観測でactive assignmentを上書きしないこと、BUSYでretry countを増やさずtaskを保持すること、受付成否不明では同じtaskを再送しないこと、terminal callbackを最大1回だけ送ること。
+- 公開client APIは`ConductorTaskStatus`、`KnownConductorTaskStatus`、`UnknownConductorTaskStatus`、`query_conductor_task_status`、`SyncopadeResultMessage`、`parse_syncopade_result_payload`。SUBMITには任意の`ACCEPTANCE_TIMEOUT_SECONDS`を追加した。
+- wire callbackはworker受理後の`TASK_RESULT|task_id|job_id|OK/ERROR|...`と、worker未受理terminalの`TASK_RESULT|task_id||ERROR|terminal_kind|reason`。legacy `RESULT` parserと3引数handlerは互換維持する。
+- sibling repositoryはSyncopade依存をこの修正版へ更新し、可能なら4引数result handler `(task_id, job_id, ok, payload)`または`submit_conductor_task_and_wait`を使う。長時間taskは900秒固定にせず、実行時間を含む十分な`acceptance_timeout_seconds`を明示する。
+- 実稼働へ反映する際はconductor/serverを同じrevisionへ更新して再起動し、task code更新を伴う場合は全node cache clearで`failed_nodes == 0`かつ`success_nodes == total_nodes`を確認してから投入する。
+- Step別commitは`974158d`、`6f8429b`、`e8e25b`、`d29c2b`、`bf2fbfa`、`a26386c`、`2a240ad`、`68cc929`、`ecd2e59`、`871c35a`。Step 11 commit/hashはpush後の最終報告へ記載する。
+- version更新、tag、release、sibling repositoryの変更は行っていない。
