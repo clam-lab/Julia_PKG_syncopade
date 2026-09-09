@@ -750,7 +750,7 @@ workerの正常受理、BUSY未受理、protocol異常、transport失敗、受�
 
 ---
 
-## Step 6: BUSYでtaskを失わず、空いた後に1回だけ配送する — 未着手
+## Step 6: BUSYでtaskを失わず、空いた後に1回だけ配送する — 完了
 
 ### 目的
 
@@ -760,6 +760,7 @@ workerのBUSY拒否を故障再試行から外し、taskとnodeを正しい状�
 
 - `syncopadeConductor.jl`
 - `test/reproduction_conductor_busy_drop.jl`（修正後回帰試験へ変更・改名候補）
+- `test/unit_conductor_dispatch_reservation.jl`
 - `test/fixtures/conductor_controlled_worker.jl`
 - このTodo
 
@@ -778,13 +779,102 @@ workerのBUSY拒否を故障再試行から外し、taskとnodeを正しい状�
 3. workerをidleへ変更後、同じtask IDが1回だけ`OK|STARTED`へ到達することを確認する。
 4. nodeがBUSYで`down`にならず、最終DONE後にidleへ戻ることを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- `dispatch_to_worker`のBoolを、少なくともaccepted、BUSY未受理、通常失敗を区別する内部`DispatchOutcome`へ変更する。Step 8で受付成否不明を追加できる形にする。
+- BUSY時は現在の`NODE_RESERVED/task_id/job_id空`を同じlock区間で`NODE_BUSY/task_id空/job_id空`へ置換する専用遷移を追加する。Step 1の通常解放契約は変更しない。
+- BUSY専用遷移が成立した場合、nodeはdownでなく「外部で使用中と観測された未割当てbusy」となる。後続STATUSは割当てなしなのでStep 2の世代照合を通ってidleへ戻せる。
+- BUSY専用遷移が不成立でも他taskのrecordを変更しない。現在recordを`BUSY_RESERVATION_RELEASE_FAILED`へ記録する。
+- BUSYは`DISPATCH_FAILED`ではなく`DISPATCH_BUSY`へ記録し、例外本文`ERROR|BUSY`と分類`busy`を残す。通常の通信・protocol失敗は従来の`DISPATCH_FAILED`を維持する。
+- `dispatch_queued_tasks`はBUSY outcomeで元の`ConductorTask`を変更せずqueueへ1回戻し、`TASK_REQUEUED_BUSY`を記録してそのcycleをreturnする。`retry_count`は増やさない。
+- accepted outcomeは従来どおり次のqueued taskへ進み、通常失敗outcomeだけが`requeue_with_retry!`を呼ぶ。
+- 修正前BUSY試験を`test/regression_conductor_busy_wait.jl`へ改名し、BUSY 3回の各cycleでqueue 1件/retry 0/node busy/no dropを確認後、idle観測と正常ACK 1回で同taskを受理する期待へ反転する。
+- 正常ACK後は同task/jobのDONEを与え、nodeがidleへ戻るところまで確認する。worker requestはBUSY 3件＋正常受付1件の計4件で、正常受付は1件だけとする。
+- Step 6では待機期限をまだ導入しない。BUSY taskの期限付き終端はStep 8、task lifecycleはStep 7へ残す。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### `DispatchOutcome`
+
+- internal enumとして`DISPATCH_ACCEPTED`、`DISPATCH_BUSY_REJECTED`、`DISPATCH_FAILED`、後続Step用`DISPATCH_OUTCOME_UNKNOWN`を定義する。
+- `dispatch_to_worker`は必ずこのいずれかを返し、Boolへ暗黙変換しない。
+
+#### `mark_node_busy_after_rejection!(node::NODES, task_id::String)::Bool`
+
+- 空でないtask IDを要求する。
+- `node_states_lock`内で現在recordが`NODE_RESERVED`、task ID一致、job ID空の場合だけ、`NODE_BUSY`、空task/job、generation + 1へ置換する。
+- 成功時は`NODE_STATE_CHANGED`の`reserved -> busy`を記録して`true`を返す。
+- 条件不一致ではrecordを変えず`false`を返す。
+- queue、retry、network I/Oは変更しない。
+
+#### `dispatch_to_worker`のBUSY分岐
+
+- 正常ACKは`DISPATCH_ACCEPTED`を返す。
+- catchした例外分類が`:busy`なら`mark_node_busy_after_rejection!`を呼ぶ。
+- 遷移不成立時だけ`BUSY_RESERVATION_RELEASE_FAILED`へ現在state、task/job ID、generationを記録する。
+- BUSYは`DISPATCH_BUSY`を1件記録し、status `busy`、raw例外本文を残して`DISPATCH_BUSY_REJECTED`を返す。
+- BUSY経路では`DISPATCH_FAILED`、node down、failure retryを行わない。
+- BUSY以外の例外は自予約をdownへ解放し、既存`DISPATCH_FAILED`を記録して`DISPATCH_FAILED` outcomeを返す。
+- timeout分類はStep 6ではBUSY以外の既存失敗経路に残し、Step 8で`DISPATCH_OUTCOME_UNKNOWN`へ接続する。
+
+#### `dispatch_queued_tasks`のoutcome処理
+
+- `DISPATCH_ACCEPTED`はqueue loopを継続する。
+- `DISPATCH_BUSY_REJECTED`は元taskをそのまま`enqueue_task!`し、`TASK_REQUEUED_BUSY`を1件記録してreturnする。
+- `DISPATCH_FAILED`だけが`requeue_with_retry!`を呼ぶ。
+- 未接続の`DISPATCH_OUTCOME_UNKNOWN`を受けた場合はsilent fallthroughせず`ArgumentError`とする。Step 8で正式処理へ置き換える。
+
+#### 修正後回帰試験
+
+- fileを`test/reproduction_conductor_busy_drop.jl`から`test/regression_conductor_busy_wait.jl`へ改名する。
+- 固定task IDとretry `0`で開始し、3 cyclesだけ制御workerへ`ERROR|BUSY`を返す。
+- 各cycle後はnode `busy`かつ割当てなし、queue 1件、同じtask ID、retry `0`とする。
+- 4 cycle目の前にnodeをidleへ戻し、`OK|STARTED|controlled-job-after-busy`を返す。
+- 正常受付後はqueue 0、node `busy/task_id/job_id`とし、同task/jobのDONE後はidleとする。
+- worker履歴はjob request/response各4件、BUSY 3件、正常ACK 1件、正常job ID 1種類とする。
+- logは`DISPATCH_BUSY=3`、`TASK_REQUEUED_BUSY=3`、`DISPATCH_OK=1`、`TASK_DONE=1`、`DISPATCH_FAILED=0`、`TASK_REQUEUED=0`、`TASK_DROPPED=0`とする。
+- 一時log、bounded worker cleanup、queue/node state cleanup、repository log不変を維持する。
+
+### Phase 3: 実装する — 完了
+
+- `DispatchOutcome` enumと、BUSY拒否時に自予約を割当てなしbusyへ移す`mark_node_busy_after_rejection!`を追加した。
+- `dispatch_to_worker`をtyped outcomeへ変更し、BUSYだけを`DISPATCH_BUSY`と`DISPATCH_BUSY_REJECTED`へ分離した。
+- BUSY専用状態遷移が失敗した場合は他割当てを変更せず、現在recordを`BUSY_RESERVATION_RELEASE_FAILED`へ記録するようにした。
+- `dispatch_queued_tasks`はBUSY taskをretry増加なしで1回queueへ戻し、`TASK_REQUEUED_BUSY`を記録して同cycleを終了するよう変更した。
+- 正常ACKと通常失敗の既存分岐はそれぞれ`DISPATCH_ACCEPTED`、`DISPATCH_FAILED`へ接続した。timeout unknownの正式処理はStep 8へ残した。
+- `test/reproduction_conductor_busy_drop.jl`を削除し、正方向の`test/regression_conductor_busy_wait.jl`を追加した。
+- Step 3の予約単体試験も、BUSY後にdown/retry 1でなくbusy/割当てなし/retry 0を期待するよう追従させた。
+- task lifecycle、待機期限、terminal通知は変更していない。
+- `git diff --check`で検査できる範囲のwhitespace不整合はない。機能検証はPhase 4で行う。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 初回検証と強化C補正
+
+- `test/regression_conductor_busy_wait.jl`は初回からexit `0`、`48 / 48 pass`となった。
+- 周辺回帰を並列実行した際、既存の`test/unit_conductor_queue.jl`と`test/unit_conductor_node_state.jl`がrepository logを一時pathへ切り替えないため、灯子の試験手順ミスで`logs/conductor_events.csv`へ試験由来5行が追加された。
+- 追加時刻と内容が今回の試験出力に一致する5行だけを除去し、先生の既存差分4行は維持した。補正後のrepository log SHA-1が事前値と一致することを確認した。
+- これは製品コードの前提変更ではない。該当2試験のlog隔離改定はこのStepへ混ぜず、Step 11の全回帰実行時に対象と検証範囲を見直す。
+
+#### 最終検証
+
+- `test/regression_conductor_busy_wait.jl`を合計3回実行し、すべてexit `0`、`48 / 48 pass`、`STEP6_RESULT=PASS_BUSY_WAIT_AND_ACCEPT`となった。
+- 3回のBUSY後もqueueは同じtask ID 1件、retry `0`を維持した。4回目だけ`controlled-job-after-busy`を受理し、同task/jobのDONE後にnodeがidleへ戻った。
+- 永続artifactは`/tmp/syncopade-step6-final.vOQbWX/conductor_events.csv`、SHA-1は`2dc591989be1f3aa611925d440c13b4b65d7fb72`。
+- artifact logは`DISPATCH_START=4`、`DISPATCH_BUSY=3`、`TASK_REQUEUED_BUSY=3`、`DISPATCH_OK=1`、`TASK_DONE=1`、`DISPATCH_FAILED=0`、`TASK_REQUEUED=0`、`TASK_DROPPED=0`を満たした。
+- `test/unit_conductor_dispatch_reservation.jl`: exit `0`、`29 / 29 pass`。
+- `test/unit_client_protocol.jl`: exit `0`、`23 / 23 pass`。
+- `test/unit_controlled_worker_fixture.jl`: exit `0`、`23 / 23 pass`。
+- `test/regression_conductor_done_identity.jl`: exit `0`、`33 / 33 pass`。
+- `test/regression_conductor_stale_idle.jl`: exit `0`、`26 / 26 pass`、artifact `/tmp/syncopade-step6-stale.ZkZbKR`。
+- `test/unit_conductor_node_state.jl`: exit `0`、`55 / 55 pass`。
+- `test/unit_conductor_queue.jl`: exit `0`、`17 / 17 pass`。
+- `git diff --check`はerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`に復帰し、先生の既存差分4行だけを保持している。
+
+### Step 6結論
+
+workerがBUSYを返してもnodeをdownへ落とさず、taskはretryを消費せずqueueに残る。workerがidleになった後の正常ACKは1回だけrunning割当てとなり、対応するDONEで解放される。
 
 ---
 

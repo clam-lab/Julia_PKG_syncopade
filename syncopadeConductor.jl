@@ -31,6 +31,13 @@ const NODE_BUSY = :busy
 const NODE_DOWN = :down
 const NODE_RESERVED = :reserved
 
+@enum DispatchOutcome begin
+    DISPATCH_ACCEPTED
+    DISPATCH_BUSY_REJECTED
+    DISPATCH_FAILED
+    DISPATCH_OUTCOME_UNKNOWN
+end
+
 struct NodeRuntimeState
     state::Symbol
     generation::UInt64
@@ -914,7 +921,27 @@ function idle_node_endpoints()::Vector{String}
     end
 end
 
-function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
+function mark_node_busy_after_rejection!(node::NODES, task_id::String)::Bool
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    transitioned = false
+    lock(node_states_lock) do
+        key = (node.IP, node.port)
+        current = get(node_states, key, default_node_runtime_state())
+        if current.state == NODE_RESERVED && current.task_id == task_id && isempty(current.job_id)
+            node_states[key] = NodeRuntimeState(
+                NODE_BUSY,
+                current.generation + UInt64(1),
+                "",
+                ""
+            )
+            transitioned = true
+        end
+    end
+    transitioned && log_node_state_change(node, NODE_RESERVED, NODE_BUSY)
+    return transitioned
+end
+
+function dispatch_to_worker(task::ConductorTask, node::NODES)::DispatchOutcome
     node_reserved_for_task(node, task.task_id) || throw(ArgumentError(
         "node $(node.IP):$(node.port) is not reserved for task $(task.task_id)"
     ))
@@ -988,9 +1015,45 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
             job_id=jobId,
             queue_len=queue_len()
         )
-        return true
+        return DISPATCH_ACCEPTED
     catch e
         error_kind = classify_worker_start_error(e)
+        if error_kind == :busy
+            transitioned = mark_node_busy_after_rejection!(node, task.task_id)
+            if !transitioned
+                current = get_node_runtime_state(node)
+                log_task_event(
+                    "BUSY_RESERVATION_RELEASE_FAILED",
+                    task;
+                    node_name=node.name,
+                    node_ip=node.IP,
+                    node_port=node.port,
+                    job_id=current.job_id,
+                    queue_len=queue_len(),
+                    state_from=string(current.state),
+                    state_to=string(NODE_BUSY),
+                    status=string(error_kind),
+                    error=string(
+                        "current_generation=", current.generation,
+                        " current_task_id=", current.task_id,
+                        " worker_error=", sprint(showerror, e)
+                    )
+                )
+            end
+            println("Dispatch busy ", task_label(task), " worker=", node.name)
+            log_task_event(
+                "DISPATCH_BUSY",
+                task;
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                status=string(error_kind),
+                error=sprint(showerror, e),
+                queue_len=queue_len()
+            )
+            return DISPATCH_BUSY_REJECTED
+        end
+
         released = release_node_assignment!(
             node,
             task.task_id,
@@ -1026,7 +1089,7 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::Bool
             error=sprint(showerror, e),
             queue_len=queue_len()
         )
-        return false
+        return DISPATCH_FAILED
     end
 end
 
@@ -1044,9 +1107,15 @@ function dispatch_queued_tasks(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY
             return
         end
 
-        ok = dispatch_to_worker(task, node)
-        if !ok
+        outcome = dispatch_to_worker(task, node)
+        if outcome == DISPATCH_BUSY_REJECTED
+            enqueue_task!(task)
+            log_task_event("TASK_REQUEUED_BUSY", task; queue_len=queue_len())
+            return
+        elseif outcome == DISPATCH_FAILED
             requeue_with_retry!(task; max_retry=max_retry)
+        elseif outcome == DISPATCH_OUTCOME_UNKNOWN
+            throw(ArgumentError("DISPATCH_OUTCOME_UNKNOWN is not handled before Step 8"))
         end
     end
 end

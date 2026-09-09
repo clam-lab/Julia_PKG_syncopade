@@ -94,20 +94,20 @@ try
         @test success_state.job_id == "job-success"
 
         reset_dispatch_reservation_state!()
-        failure_task = make_dispatch_test_task("task-failure")
+        busy_task = make_dispatch_test_task("task-busy")
         set_node_state!(worker_node, NODE_IDLE)
-        enqueue_task!(failure_task)
+        enqueue_task!(busy_task)
         respond_job!(worker, "ERROR|BUSY")
         run_dispatch_cycle!([worker_node])
-        failure_state = get_node_runtime_state(worker_node)
-        @test failure_state.state == NODE_DOWN
-        @test isempty(failure_state.task_id)
-        @test isempty(failure_state.job_id)
+        busy_state = get_node_runtime_state(worker_node)
+        @test busy_state.state == NODE_BUSY
+        @test isempty(busy_state.task_id)
+        @test isempty(busy_state.job_id)
         @test queue_len() == 1
-        retried = pop_task!()
-        @test retried !== nothing
-        @test retried.task_id == failure_task.task_id
-        @test retried.retry_count == 1
+        queued_busy = pop_task!()
+        @test queued_busy !== nothing
+        @test queued_busy.task_id == busy_task.task_id
+        @test queued_busy.retry_count == 0
 
         stop_conductor_log_writer!()
         log_lines = readlines(ENV["SYNCOPADE_CONDUCTOR_LOG"])
@@ -121,11 +121,11 @@ try
             log_lines
         )
         @test any(
-            line -> occursin("\"NODE_RESERVED\",\"task-failure\"", line),
+            line -> occursin("\"NODE_RESERVED\",\"task-busy\"", line),
             log_lines
         )
         @test any(
-            line -> occursin("\"DISPATCH_FAILED\",\"task-failure\"", line),
+            line -> occursin("\"DISPATCH_BUSY\",\"task-busy\"", line),
             log_lines
         )
 
