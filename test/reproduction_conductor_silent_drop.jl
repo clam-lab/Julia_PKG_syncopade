@@ -42,6 +42,9 @@ end
         lock(node_states_lock) do
             empty!(node_states)
         end
+        lock(task_runtime_states_lock) do
+            empty!(task_runtime_states)
+        end
 
         task = ConductorTask(
             SILENT_DROP_TASK_ID,
@@ -54,6 +57,8 @@ end
             3,
         )
 
+        @test mark_task_queued!(task.task_id)
+        @test mark_task_reserved!(task.task_id)
         requeue_with_retry!(task; max_retry=3)
         @test queue_len() == 0
         @test SILENT_DROP_TASK_ID in accepted_task_ids
@@ -87,6 +92,9 @@ end
         end
         lock(node_states_lock) do
             empty!(node_states)
+        end
+        lock(task_runtime_states_lock) do
+            empty!(task_runtime_states)
         end
     end
 

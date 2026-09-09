@@ -878,7 +878,7 @@ workerがBUSYを返してもnodeをdownへ落とさず、taskはretryを消費�
 
 ---
 
-## Step 7: conductor taskの寿命と状態照会を実装する — 未着手
+## Step 7: conductor taskの寿命と状態照会を実装する — 完了
 
 ### 目的
 
@@ -888,8 +888,10 @@ workerがBUSYを返してもnodeをdownへ落とさず、taskはretryを消費�
 
 - `syncopadeConductor.jl`
 - `syncopadeClient.jl`
+- `src/Syncopade.jl`
 - `test/unit_conductor_task_lifecycle.jl`（新規候補）
 - `test/unit_client_protocol.jl`
+- `test/reproduction_conductor_silent_drop.jl`（lifecycle前提へのfixture追従のみ）
 - このTodo
 
 ### 完了条件
@@ -907,13 +909,113 @@ workerがBUSYを返してもnodeをdownへ落とさず、taskはretryを消費�
 3. terminal状態を重ねて更新しても最初の終端内容が保持されることを確認する。
 4. 状態照会がqueue順序、node状態、callbackを変更しないことを確認する。
 
-### Phase 1: 実装方針をまとめる — 未着手
+### Phase 1: 実装方針をまとめる — 完了
 
-### Phase 2: 関数仕様・入出力・副作用をまとめる — 未着手
+- conductor内にnode状態とは別のtask lifecycle registryを置き、task IDからimmutableな現在状態を引けるようにする。保存はprocess memory内だけとし、再起動永続化は追加しない。
+- lifecycle stateは`queued`、`reserved`、`running`、`dispatch_unknown`、`terminal`の5種に固定する。worker job ID、terminal種別、理由も同じrecordへ保持する。
+- queue投入をlifecycleの入口にする。新規taskは`queued`として登録し、BUSYまたは通常retryの再投入は`reserved -> queued`、idle nodeなしの再投入は`queued -> queued`として扱う。
+- node予約成功時にtaskを`reserved`、正常start ACK時にjob ID付き`running`へ進める。retry上限超過と受理済みDONEは`terminal`へ進める。
+- `dispatch_unknown`への実際の遷移はStep 8で接続するが、状態表と許可遷移はこのStepで定義し、後続Stepがterminalを巻き戻さず接続できる形にする。
+- terminal recordは最初の1件を正本とし、重複DONEや後着ACKを含む全更新を拒否する。node側の世代管理と同様、task側もlock下で比較と更新を完結させる。
+- conductor commandへ`TASK_STATUS|task_id`を追加する。既知taskはstate、job ID、terminal種別、理由を返し、未知taskは正常な別応答として返す。
+- client側には状態応答の具体型、未知task応答の具体型、純粋parser、TCP query関数を追加する。未知taskを通信・protocol errorとして潰さない。
+- 状態照会はregistryのsnapshotを読むだけとし、queue、node state、callback、logを変更しない。
+- 単体試験は全許可遷移、禁止遷移、terminal first-write-wins、照会前後のqueue/node不変、全wire応答と未知taskを確認する。既存のdispatch/DONE回帰も再実行する。
 
-### Phase 3: 実装する — 未着手
+### Phase 2: 関数仕様・入出力・副作用をまとめる — 完了
 
-### Phase 4: テストまたは検証を行う — 未着手
+#### `TaskRuntimeState`
+
+- fieldsは`state::Symbol`、`generation::UInt64`、`job_id::String`、`terminal_kind::String`、`reason::String`とする。
+- 非terminalでは`terminal_kind`と`reason`を空にする。`running`だけは非空job IDを必須とし、`queued`、`reserved`、`dispatch_unknown`は空job IDとする。
+- terminalでは非空`terminal_kind`を必須とし、job IDはworker受理済みなら保持、未受理なら空を許す。
+
+#### task lifecycle registry
+
+- `task_runtime_states::Dict{String,TaskRuntimeState}`を`task_runtime_states_lock`で保護する。
+- `get_task_runtime_state(task_id)::Union{Nothing,TaskRuntimeState}`はlock下のsnapshotを返し、未知IDは`nothing`とする。空task IDは`ArgumentError`。
+- `transition_task_state!(task_id, next_state; job_id="", terminal_kind="", reason="")::Bool`はvalidationと比較更新を同じlock内で行う。
+- 未登録からは`queued`だけを許可する。許可遷移は`queued -> reserved|terminal`、`reserved -> queued|running|dispatch_unknown|terminal`、`running -> terminal`、`dispatch_unknown -> running|terminal`とする。
+- `queued -> queued`だけはqueueへ戻す操作のidempotent successとして許可し、recordとgenerationを変えない。
+- terminalからの全遷移と上記以外は`false`を返し、既存recordを変更しない。不正state、空ID、stateとfieldの不整合は`ArgumentError`。
+- terminal化でjob IDを省略した場合は現在recordのjob IDを引き継ぐ。最初のterminal化だけがrecordとgenerationを更新し、2回目以降はkindやreasonが異なっても拒否する。
+
+#### lifecycle wrapperと既存経路への接続
+
+- `mark_task_queued!`、`mark_task_reserved!`、`mark_task_running!`、`mark_task_dispatch_unknown!`、`mark_task_terminal!`は上のprimitiveへ委譲する。
+- `enqueue_task!`はqueueへpushする前に`mark_task_queued!`を行い、禁止遷移なら例外として重複配送を止める。
+- node予約成功後に`mark_task_reserved!`、正常start ACK後に`mark_task_running!`を呼ぶ。task遷移が競合した場合は他taskの状態を上書きせず、監査eventを残す。
+- retry上限超過は`terminal_kind=MAX_RETRY_EXCEEDED`、`reason=max_retry_exceeded`とする。
+- 一致DONEはstatus `OK`なら`WORKER_DONE_OK`、それ以外なら`WORKER_DONE_ERROR`としてterminal化し、DONEのerror fieldをreason、job IDをterminal recordへ保存する。
+- 不一致または重複DONEは従来どおり`DONE_IGNORED`とし、task lifecycleも変更しない。
+- `mark_task_dispatch_unknown!`はこのStepで単体検証可能にするが、dispatch timeout経路への接続はStep 8まで行わない。
+
+#### conductor状態照会protocol
+
+- request payloadは`TASK_STATUS|task_id`。
+- 既知応答は`TASK_STATUS|KNOWN|task_id|state|job_id|terminal_kind|reason`。reason内の`|`は末尾field列として保持し、client parserがjoinして復元する。
+- 未知応答は`TASK_STATUS|UNKNOWN|task_id`。未知はserver errorにしない。
+- command field数不正または空task IDは従来のserver error処理へ流す。
+- `task_status_response_payload(task_id)::String`はregistry snapshotだけからpayloadを作り、logや他stateを変更しない。
+
+#### client公開API
+
+- abstract `ConductorTaskStatus`と、既知用`KnownConductorTaskStatus(task_id, state, job_id, terminal_kind, reason)`、未知用`UnknownConductorTaskStatus(task_id)`を定義する。
+- `parse_conductor_task_status_response(payload)::ConductorTaskStatus`は上記2形式だけを受理し、未知state、field不足、空task ID、未知tagは`SyncopadeWorkerProtocolError`ではなくconductor応答用`ArgumentError`として拒否する。
+- `query_conductor_task_status(conductor_ip, task_id; conductor_port=9000)::ConductorTaskStatus`はchecksum付きrequestを1件送信し、checksum検証後にparser結果を返す。socketは成功・失敗とも`finally`で閉じる。
+- positional port overloadも既存query APIと同じ形で提供する。
+
+#### 試験
+
+- 新規`test/unit_conductor_task_lifecycle.jl`で許可遷移、禁止遷移、generation、field validation、terminal first-write-winsをnetworkなしで確認する。
+- 同試験で状態照会の前後にtask queue、node runtime state、repository外callback受信数が変わらないことを確認する。
+- `test/unit_client_protocol.jl`で全5状態、terminalのdelimiter付きreason、未知task、malformed応答を確認する。
+- 既存のBUSY待機、予約、DONE identity回帰を再実行する。
+
+### Phase 3: 実装する — 完了
+
+- `TaskRuntimeState`、5状態定数、task registry、専用lockをconductorへ追加した。
+- field validation、許可遷移表、比較更新primitive、状態別wrapper、snapshot取得を実装した。
+- `enqueue_task!`を新規登録と再queueの共通入口にし、node予約、正常ACK、retry上限超過、一致DONEをtask lifecycleへ接続した。
+- terminalは最初の更新だけを保存し、retry上限を`MAX_RETRY_EXCEEDED`、DONEを`WORKER_DONE_OK/ERROR`として記録するようにした。
+- node割当てとtask lifecycleの片側だけが競合した場合は`TASK_LIFECYCLE_CONFLICT`を記録し、他taskやterminal recordを上書きしない。
+- conductorへ`TASK_STATUS|task_id` commandとread-only payload生成を追加した。
+- clientへ既知・未知の状態応答型、純粋parser、checksum検証付きTCP query、positional port overloadを追加した。
+- `test/unit_conductor_task_lifecycle.jl`を新設し、遷移表、retry terminal、DONE terminal、first-write-wins、照会副作用を検証する構成にした。
+- `test/unit_client_protocol.jl`へ全状態、未知、malformed、delimiter付きreason、実TCP queryを追加した。
+- client query追加時の最初のpatchは周辺空行の指定が現行文脈と一致せず未適用だった。灯子のpatch位置指定ミスで実装差分は入っていなかったため、強化Cの局所補正として一致する関数境界へ適用した。
+- `syncopadeConductor.jl`のinclude smokeはexit `0`、`STEP7_INCLUDE_OK`。`git diff --check`もerrorなし。機能検証はPhase 4で行う。
+
+### Phase 4: テストまたは検証を行う — 完了
+
+#### 初回検証と強化C補正
+
+- 新規lifecycle試験は初回からexit `0`、`120 / 120 pass`、client protocolも初回からexit `0`、`63 / 63 pass`となった。
+- 差分監査で、関数実装はあるが`src/Syncopade.jl`のexport一覧に新しい状態型、parser、queryがないことを検出した。既存の「公開client API」完了条件を満たすための局所的な実装漏れとして5 symbolをexportし、対象ファイル欄へ同fileを追記した。
+- lifecycle試験へ全5状態の遷移行列25組を追加し、試験artifact pathを外部指定できるようにした後、Phase 4を最初から再実行した。
+- `test/reproduction_conductor_silent_drop.jl`は初回にexit `1`、`0 pass / 1 error`となった。原因は製品経路でなく、同試験だけが未登録taskへ`requeue_with_retry!`を直接呼ぶfixtureだったため、retry terminalへの遷移が拒否されたことだった。
+- 同fixtureへ実配送と同じ`queued -> reserved`準備とregistry cleanupを追加した。callbackなしでdropする再現条件や期待結果は変更せず、Step 10の通知改定も先取りしていない。
+
+#### 最終検証
+
+- `test/unit_conductor_task_lifecycle.jl`: exit `0`、`145 / 145 pass`、`STEP7_RESULT=PASS_TASK_LIFECYCLE`。
+- 永続artifactは`/tmp/syncopade-step7-final.SBa5Q0/conductor_events.csv`、SHA-1は`9c15acfd139c46b4f4f50686fdcfa4f9902bfe6d`。
+- 25組の遷移行列、全許可経路、禁止経路、generation、field validation、terminal first-write-wins、retry terminal、DONE terminalを確認した。
+- status payload生成前後でqueue、node、task snapshotが一致し、loopback callback listenerへの接続がないことを確認した。
+- `test/unit_client_protocol.jl`: exit `0`、`63 / 63 pass`。5状態、未知task、malformed 7種、reason内`|`復元、checksum付き実TCP queryを確認した。
+- package loadとexport smokeはexit `0`、`STEP7_PUBLIC_API=PASS`。
+- `test/regression_conductor_busy_wait.jl`: exit `0`、`48 / 48 pass`。
+- `test/unit_conductor_dispatch_reservation.jl`: exit `0`、`29 / 29 pass`。
+- `test/regression_conductor_done_identity.jl`: exit `0`、`33 / 33 pass`。
+- `test/regression_conductor_stale_idle.jl`: exit `0`、`26 / 26 pass`、artifact `/tmp/syncopade-step7-stale-final.ZvLTPR`。
+- `test/reproduction_conductor_silent_drop.jl`: fixture補正後exit `0`、`11 / 11 pass`、artifact `/tmp/syncopade-step7-silent-final.bAH2HI`。callbackなしという修正前現象は維持された。
+- `test/unit_conductor_queue.jl`: repository外logを指定してexit `0`、`17 / 17 pass`。
+- `git diff --check`はerrorなし。
+- repository log SHA-1は`528443adeeff16bfcd482c552458584d7a080e99`のままで、先生の既存差分4行を変更していない。
+
+### Step 7結論
+
+conductorはtaskをqueueから消した後もprocess存続中はtask ID単位で追跡し、正常実行、retry打切り、未知taskを区別して照会できる。terminal recordは後着更新で巻き戻らない。dispatch timeoutを`dispatch_unknown`へ接続する処理は予定どおりStep 8へ残した。
 
 ---
 

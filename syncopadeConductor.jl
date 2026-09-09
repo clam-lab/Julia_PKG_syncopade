@@ -7,6 +7,7 @@ using UUIDs
 # shared state for conductor
 const node_states_lock = ReentrantLock()
 const task_queue_lock = ReentrantLock()
+const task_runtime_states_lock = ReentrantLock()
 const dispatch_lock = ReentrantLock()
 
 struct NODES
@@ -51,8 +52,30 @@ struct NodeObservation
     expected_generation::UInt64
 end
 
+struct TaskRuntimeState
+    state::Symbol
+    generation::UInt64
+    job_id::String
+    terminal_kind::String
+    reason::String
+end
+
 const node_states = Dict{Tuple{String,Int},NodeRuntimeState}()
 const task_queue = ConductorTask[]
+const task_runtime_states = Dict{String,TaskRuntimeState}()
+
+const TASK_QUEUED = :queued
+const TASK_RESERVED = :reserved
+const TASK_RUNNING = :running
+const TASK_DISPATCH_UNKNOWN = :dispatch_unknown
+const TASK_TERMINAL = :terminal
+const TASK_RUNTIME_STATES = (
+    TASK_QUEUED,
+    TASK_RESERVED,
+    TASK_RUNNING,
+    TASK_DISPATCH_UNKNOWN,
+    TASK_TERMINAL,
+)
 
 const DEFAULT_POLL_INTERVAL = 2.0  # seconds
 const DEFAULT_STATUS_TIMEOUT = 0.2  # seconds (per node)
@@ -353,6 +376,29 @@ function handle_done_payload(payload::String)::Bool
     node = find_node_by_endpoint(worker_ip, worker_port)
     result = apply_done_to_node!(node, task_id, job_id)
     if result.released
+        terminal_kind = status == "OK" ? "WORKER_DONE_OK" : "WORKER_DONE_ERROR"
+        lifecycle_recorded = mark_task_terminal!(
+            task_id,
+            terminal_kind,
+            error_msg;
+            job_id=job_id
+        )
+        if !lifecycle_recorded && get_task_runtime_state(task_id) !== nothing
+            current_task_state = get_task_runtime_state(task_id)
+            log_conductor_event(
+                "TASK_LIFECYCLE_CONFLICT";
+                task_id=task_id,
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                job_id=job_id,
+                queue_len=queue_len(),
+                state_from=string(current_task_state.state),
+                state_to=string(TASK_TERMINAL),
+                status=terminal_kind,
+                error="DONE matched node but task transition was rejected"
+            )
+        end
         log_conductor_event(
             "TASK_DONE";
             task_id=task_id,
@@ -585,6 +631,143 @@ function parse_submit_task(payload::String)::ConductorTask
     )
 end
 
+function validate_task_runtime_fields(
+    state::Symbol,
+    job_id::String,
+    terminal_kind::String,
+    reason::String
+)::Nothing
+    state in TASK_RUNTIME_STATES || throw(ArgumentError(
+        "unsupported task runtime state: $state"
+    ))
+    if state == TASK_RUNNING
+        isempty(job_id) && throw(ArgumentError("running task requires job_id"))
+        (!isempty(terminal_kind) || !isempty(reason)) && throw(ArgumentError(
+            "running task must not contain terminal fields"
+        ))
+    elseif state == TASK_TERMINAL
+        isempty(terminal_kind) && throw(ArgumentError(
+            "terminal task requires terminal_kind"
+        ))
+    elseif !isempty(job_id) || !isempty(terminal_kind) || !isempty(reason)
+        throw(ArgumentError("$state task contains incompatible fields"))
+    end
+    return nothing
+end
+
+function task_transition_allowed(current::Symbol, next_state::Symbol)::Bool
+    current == TASK_QUEUED && return next_state in (TASK_RESERVED, TASK_TERMINAL)
+    current == TASK_RESERVED && return next_state in (
+        TASK_QUEUED,
+        TASK_RUNNING,
+        TASK_DISPATCH_UNKNOWN,
+        TASK_TERMINAL,
+    )
+    current == TASK_RUNNING && return next_state == TASK_TERMINAL
+    current == TASK_DISPATCH_UNKNOWN && return next_state in (TASK_RUNNING, TASK_TERMINAL)
+    return false
+end
+
+function transition_task_state!(
+    task_id::String,
+    next_state::Symbol;
+    job_id::String="",
+    terminal_kind::String="",
+    reason::String=""
+)::Bool
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    next_state in TASK_RUNTIME_STATES || throw(ArgumentError(
+        "unsupported task runtime state: $next_state"
+    ))
+
+    return lock(task_runtime_states_lock) do
+        current = get(task_runtime_states, task_id, nothing)
+        resolved_job_id = next_state == TASK_TERMINAL &&
+            isempty(job_id) && current !== nothing ? current.job_id : job_id
+        validate_task_runtime_fields(
+            next_state,
+            resolved_job_id,
+            terminal_kind,
+            reason
+        )
+
+        if current === nothing
+            next_state == TASK_QUEUED || return false
+            task_runtime_states[task_id] = TaskRuntimeState(
+                TASK_QUEUED,
+                UInt64(1),
+                "",
+                "",
+                ""
+            )
+            return true
+        end
+
+        if current.state == TASK_QUEUED && next_state == TASK_QUEUED
+            return true
+        end
+        task_transition_allowed(current.state, next_state) || return false
+        task_runtime_states[task_id] = TaskRuntimeState(
+            next_state,
+            current.generation + UInt64(1),
+            resolved_job_id,
+            terminal_kind,
+            reason
+        )
+        return true
+    end
+end
+
+function get_task_runtime_state(task_id::String)::Union{Nothing,TaskRuntimeState}
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    return lock(task_runtime_states_lock) do
+        get(task_runtime_states, task_id, nothing)
+    end
+end
+
+mark_task_queued!(task_id::String)::Bool = transition_task_state!(task_id, TASK_QUEUED)
+mark_task_reserved!(task_id::String)::Bool = transition_task_state!(task_id, TASK_RESERVED)
+
+function mark_task_running!(task_id::String, job_id::String)::Bool
+    return transition_task_state!(task_id, TASK_RUNNING; job_id=job_id)
+end
+
+function mark_task_dispatch_unknown!(task_id::String)::Bool
+    return transition_task_state!(task_id, TASK_DISPATCH_UNKNOWN)
+end
+
+function mark_task_terminal!(
+    task_id::String,
+    terminal_kind::String,
+    reason::String;
+    job_id::String=""
+)::Bool
+    return transition_task_state!(
+        task_id,
+        TASK_TERMINAL;
+        job_id=job_id,
+        terminal_kind=terminal_kind,
+        reason=reason
+    )
+end
+
+function task_status_response_payload(task_id::String)::String
+    state = get_task_runtime_state(task_id)
+    state === nothing && return "TASK_STATUS|UNKNOWN|$task_id"
+    return join(
+        String[
+            "TASK_STATUS",
+            "KNOWN",
+            task_id,
+            string(state.state),
+            state.job_id,
+            state.terminal_kind,
+            state.reason,
+        ],
+        "|"
+    )
+end
+
 function queue_len()::Int
     lock(task_queue_lock) do
         return length(task_queue)
@@ -592,6 +775,9 @@ function queue_len()::Int
 end
 
 function enqueue_task!(task::ConductorTask)
+    mark_task_queued!(task.task_id) || throw(ArgumentError(
+        "task $(task.task_id) cannot transition to queued"
+    ))
     lock(task_queue_lock) do
         push!(task_queue, task)
     end
@@ -608,6 +794,13 @@ function requeue_with_retry!(task::ConductorTask; max_retry=DEFAULT_MAX_RETRY)
     next_retry = task.retry_count + 1
     if next_retry > max_retry
         println("Drop task ", task.task_id, " after retries=", task.retry_count)
+        mark_task_terminal!(
+            task.task_id,
+            "MAX_RETRY_EXCEEDED",
+            "max_retry_exceeded"
+        ) || throw(ArgumentError(
+            "task $(task.task_id) cannot transition to terminal after retry exhaustion"
+        ))
         log_task_event("TASK_DROPPED", task; queue_len=queue_len(), error="max_retry_exceeded")
         return
     end
@@ -986,6 +1179,7 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::DispatchOutcome
         dispatch_result.error === nothing || throw(dispatch_result.error)
         jobId = String(dispatch_result.job_id)
         assignment_recorded = mark_node_running!(node, task.task_id, jobId)
+        lifecycle_recorded = mark_task_running!(task.task_id, jobId)
         if !assignment_recorded
             current = get_node_runtime_state(node)
             log_task_event(
@@ -1003,6 +1197,21 @@ function dispatch_to_worker(task::ConductorTask, node::NODES)::DispatchOutcome
                     " current_task_id=", current.task_id,
                     " current_job_id=", current.job_id
                 )
+            )
+        end
+        if !lifecycle_recorded
+            current_task_state = get_task_runtime_state(task.task_id)
+            log_task_event(
+                "TASK_LIFECYCLE_CONFLICT",
+                task;
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                job_id=jobId,
+                queue_len=queue_len(),
+                state_from=current_task_state === nothing ? "unknown" : string(current_task_state.state),
+                state_to=string(TASK_RUNNING),
+                error="worker accepted but task transition was rejected"
             )
         end
         println("Dispatch OK ", task_label(task), " worker=", node.name, " jobId=", jobId)
@@ -1107,6 +1316,28 @@ function dispatch_queued_tasks(nodes::Vector{NODES}; max_retry=DEFAULT_MAX_RETRY
             return
         end
 
+        if !mark_task_reserved!(task.task_id)
+            released = release_node_assignment!(
+                node,
+                task.task_id,
+                "";
+                next_state=NODE_IDLE
+            )
+            current_task_state = get_task_runtime_state(task.task_id)
+            log_task_event(
+                "TASK_LIFECYCLE_CONFLICT",
+                task;
+                node_name=node.name,
+                node_ip=node.IP,
+                node_port=node.port,
+                queue_len=queue_len(),
+                state_from=current_task_state === nothing ? "unknown" : string(current_task_state.state),
+                state_to=string(TASK_RESERVED),
+                error="node_reserved=true node_released=$released"
+            )
+            return
+        end
+
         outcome = dispatch_to_worker(task, node)
         if outcome == DISPATCH_BUSY_REJECTED
             enqueue_task!(task)
@@ -1165,6 +1396,7 @@ end
 
 # Conductor server commands (checksum required):
 # - LIST
+# - TASK_STATUS|task_id
 # - SUBMIT|coordinator_ip|coordinator_port(optional)|source:module:function|arg1|arg2|...
 # - DONE|task_id|job_id|worker_ip|worker_port|status|started_at|finished_at|callback_ok|error_message
 # - CACHE_CLEAR_ALL
@@ -1190,6 +1422,11 @@ function conductor_server()
                     if cmd == "LIST"
                         idle_nodes = idle_node_endpoints()
                         println(sock, add_checksum("NODES|" * join(idle_nodes, "|")))
+                    elseif cmd == "TASK_STATUS"
+                        length(parts) == 2 && !isempty(parts[2]) || throw(ArgumentError(
+                            "Invalid TASK_STATUS format"
+                        ))
+                        println(sock, add_checksum(task_status_response_payload(String(parts[2]))))
                     elseif cmd == "SUBMIT"
                         println("SUBMIT payload = ", payload)
                         task = parse_submit_task(payload)

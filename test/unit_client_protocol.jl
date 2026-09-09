@@ -45,6 +45,52 @@ include(joinpath(@__DIR__, "..", "syncopadeClient.jl"))
     malformed = parse_conductor_nodes("ERROR|UNKNOWN_COMMAND")
     @test isempty(malformed)
 
+    for state in (:queued, :reserved, :dispatch_unknown)
+        parsed = parse_conductor_task_status_response(
+            "TASK_STATUS|KNOWN|task-$state|$state|||"
+        )
+        @test parsed isa KnownConductorTaskStatus
+        @test parsed.task_id == "task-$state"
+        @test parsed.state == state
+        @test isempty(parsed.job_id)
+        @test isempty(parsed.terminal_kind)
+        @test isempty(parsed.reason)
+    end
+
+    running_status = parse_conductor_task_status_response(
+        "TASK_STATUS|KNOWN|task-running|running|job-running||"
+    )
+    @test running_status isa KnownConductorTaskStatus
+    @test running_status.state == :running
+    @test running_status.job_id == "job-running"
+
+    terminal_status = parse_conductor_task_status_response(
+        "TASK_STATUS|KNOWN|task-terminal|terminal|job-terminal|WORKER_DONE_ERROR|TYPE|message"
+    )
+    @test terminal_status isa KnownConductorTaskStatus
+    @test terminal_status.state == :terminal
+    @test terminal_status.job_id == "job-terminal"
+    @test terminal_status.terminal_kind == "WORKER_DONE_ERROR"
+    @test terminal_status.reason == "TYPE|message"
+
+    unknown_status = parse_conductor_task_status_response(
+        "TASK_STATUS|UNKNOWN|missing-task"
+    )
+    @test unknown_status isa UnknownConductorTaskStatus
+    @test unknown_status.task_id == "missing-task"
+
+    for invalid_status in (
+        "TASK_STATUS|KNOWN||queued|||",
+        "TASK_STATUS|KNOWN|bad-state|invalid|||",
+        "TASK_STATUS|KNOWN|bad-running|running|||",
+        "TASK_STATUS|KNOWN|bad-queued-job|queued|job||",
+        "TASK_STATUS|KNOWN|bad-terminal|terminal|job||reason",
+        "TASK_STATUS|UNKNOWN|",
+        "TASK_STATUS|OTHER|task",
+    )
+        @test_throws ArgumentError parse_conductor_task_status_response(invalid_status)
+    end
+
     bind_ip = IPv4("127.0.0.1")
     server = listen(bind_ip, 0)
     _, port_u = getsockname(server)
@@ -72,4 +118,37 @@ include(joinpath(@__DIR__, "..", "syncopadeClient.jl"))
     fetch(server_task)
     @test received_payload[] == "CACHE_CLEAR_ALL"
     @test summary == (total_nodes=3, success_nodes=2, failed_nodes=1, cleared_functions=7)
+
+    status_server = listen(bind_ip, 0)
+    _, status_port_u = getsockname(status_server)
+    status_port = Int(status_port_u)
+    status_request = Ref("")
+    status_server_task = @async begin
+        sock = accept(status_server)
+        try
+            line = readline(sock)
+            request_ok, request_payload = verify_checksum(line)
+            request_ok || error("invalid test request checksum")
+            status_request[] = request_payload
+            println(
+                sock,
+                add_checksum("TASK_STATUS|KNOWN|query-task|running|query-job||")
+            )
+        finally
+            close(sock)
+            close(status_server)
+        end
+    end
+
+    queried_status = query_conductor_task_status(
+        "127.0.0.1",
+        "query-task";
+        conductor_port=status_port
+    )
+    fetch(status_server_task)
+    @test status_request[] == "TASK_STATUS|query-task"
+    @test queried_status isa KnownConductorTaskStatus
+    @test queried_status.task_id == "query-task"
+    @test queried_status.state == :running
+    @test queried_status.job_id == "query-job"
 end

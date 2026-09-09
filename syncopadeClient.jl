@@ -69,6 +69,23 @@ struct SyncopadeWorkerStartTimeoutError <: Exception
 end
 
 
+abstract type ConductorTaskStatus end
+
+
+struct KnownConductorTaskStatus <: ConductorTaskStatus
+    task_id::String
+    state::Symbol
+    job_id::String
+    terminal_kind::String
+    reason::String
+end
+
+
+struct UnknownConductorTaskStatus <: ConductorTaskStatus
+    task_id::String
+end
+
+
 function Base.showerror(io::IO, error_value::SyncopadeWorkerBusyError)
     print(io, "Unexpected response from server: ", error_value.raw_response)
 end
@@ -186,6 +203,52 @@ function verify_checksum(msg::String)::Tuple{Bool,String}
     payload = join(parts[1:end-1], '|')
     expected = checksum_hex(payload)
     return (checksum_str == expected, payload)
+end
+
+
+function parse_conductor_task_status_response(
+    response::AbstractString
+)::ConductorTaskStatus
+    payload = String(chomp(response))
+    parts = split(payload, '|'; keepempty=true)
+    if length(parts) == 3 &&
+       parts[1] == "TASK_STATUS" &&
+       parts[2] == "UNKNOWN" &&
+       !isempty(parts[3])
+        return UnknownConductorTaskStatus(String(parts[3]))
+    end
+
+    if length(parts) >= 7 &&
+       parts[1] == "TASK_STATUS" &&
+       parts[2] == "KNOWN" &&
+       !isempty(parts[3])
+        state = Symbol(parts[4])
+        state in (:queued, :reserved, :running, :dispatch_unknown, :terminal) ||
+            throw(ArgumentError("unsupported conductor task state: $(parts[4])"))
+        job_id = String(parts[5])
+        terminal_kind = String(parts[6])
+        reason = String(join(parts[7:end], "|"))
+
+        if state == :running && isempty(job_id)
+            throw(ArgumentError("running conductor task status requires job_id"))
+        elseif state != :running && state != :terminal && !isempty(job_id)
+            throw(ArgumentError("$state conductor task status must not contain job_id"))
+        elseif state == :terminal && isempty(terminal_kind)
+            throw(ArgumentError("terminal conductor task status requires terminal_kind"))
+        elseif state != :terminal && (!isempty(terminal_kind) || !isempty(reason))
+            throw(ArgumentError("non-terminal conductor task status contains terminal fields"))
+        end
+
+        return KnownConductorTaskStatus(
+            String(parts[3]),
+            state,
+            job_id,
+            terminal_kind,
+            reason
+        )
+    end
+
+    throw(ArgumentError("unexpected conductor task status response: $payload"))
 end
 
 
@@ -450,6 +513,52 @@ Positional-argument overload of `query_conductor_nodes`.
 """
 function query_conductor_nodes(conductor_ip::String, conductor_port::Int)
     return query_conductor_nodes(conductor_ip; conductor_port=conductor_port)
+end
+
+"""
+    query_conductor_task_status(
+        conductor_ip::String,
+        task_id::String;
+        conductor_port::Int=9000
+    ) -> ConductorTaskStatus
+
+Read one conductor task lifecycle snapshot without changing the task or node state.
+
+# Returns
+- `KnownConductorTaskStatus` for a task retained by the conductor.
+- `UnknownConductorTaskStatus` when the conductor does not retain `task_id`.
+"""
+function query_conductor_task_status(
+    conductor_ip::String,
+    task_id::String;
+    conductor_port::Int=9000
+)::ConductorTaskStatus
+    isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
+    sock = connect(conductor_ip, conductor_port)
+    try
+        println(sock, add_checksum("TASK_STATUS|$task_id"))
+        response = readline(sock)
+        ok, payload = verify_checksum(response)
+        ok || throw(ArgumentError(
+            "invalid checksum from conductor task status response: $response"
+        ))
+        return parse_conductor_task_status_response(payload)
+    finally
+        close(sock)
+    end
+end
+
+
+function query_conductor_task_status(
+    conductor_ip::String,
+    conductor_port::Int,
+    task_id::String
+)::ConductorTaskStatus
+    return query_conductor_task_status(
+        conductor_ip,
+        task_id;
+        conductor_port=conductor_port
+    )
 end
 
 """
