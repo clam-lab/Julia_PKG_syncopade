@@ -16,6 +16,124 @@ struct NODES
     name::String
 end
 
+struct ConductorMaintenanceBusyError <: Exception end
+Base.showerror(io::IO, ::ConductorMaintenanceBusyError) = print(io, "conductor maintenance is active; request not accepted")
+
+mutable struct ConductorRestartOperation
+    operation_id::String
+    targets::Vector{NODES}
+    status::Symbol
+    results::Dict{Tuple{String,Int},ServerRestartResult}
+end
+
+const conductor_mutation_lock = ReentrantLock()
+const conductor_mutation_owner = Ref{Union{Nothing,Tuple{Symbol,String}}}(nothing)
+const conductor_restart_operations = Dict{String,ConductorRestartOperation}()
+
+conductor_submissions_paused_unlocked() = conductor_mutation_owner[] !== nothing && conductor_mutation_owner[][1] == :restart
+conductor_submissions_paused() = lock(conductor_submissions_paused_unlocked, conductor_mutation_lock)
+
+function restart_result_succeeded(result::ServerRestartResult)::Bool
+    info = result.runtime
+    return result.status == :success && info !== nothing && info.ready &&
+        valid_management_uuid(result.old_listener_id) && valid_management_uuid(result.old_server_id) &&
+        info.listener_id == result.old_listener_id && info.server_id != result.old_server_id
+end
+
+function restart_operation_snapshot(operation::ConductorRestartOperation)
+    summary = if operation.status == :complete
+        total = length(operation.targets)
+        successes = count(restart_result_succeeded, values(operation.results))
+        (total_nodes=total, success_nodes=successes, failed_nodes=total - successes,
+            overall_success=total > 0 && successes == total)
+    else
+        nothing
+    end
+    return (operation_id=operation.operation_id, status=operation.status, targets=copy(operation.targets),
+        results=copy(operation.results), summary=summary)
+end
+
+function get_restart_operation(operation_id::String)
+    lock(conductor_mutation_lock) do
+        operation = get(conductor_restart_operations, operation_id, nothing)
+        return operation === nothing ? nothing : restart_operation_snapshot(operation)
+    end
+end
+
+function begin_restart_operation!(operation_id::String, nodes::Vector{NODES})
+    valid_management_uuid(operation_id) || throw(ArgumentError("operation_id must be a canonical UUID"))
+    lock(conductor_mutation_lock) do
+        existing = get(conductor_restart_operations, operation_id, nothing)
+        existing === nothing || return (status=:existing, operation=restart_operation_snapshot(existing))
+        conductor_mutation_owner[] === nothing || return (status=:busy, operation=nothing)
+        active_tasks = lock(task_runtime_states_lock) do
+            any(state -> state.state != TASK_TERMINAL, values(task_runtime_states))
+        end
+        active_queue = lock(task_queue_lock) do
+            !isempty(task_queue)
+        end
+        assignments = lock(node_states_lock) do
+            any(state -> !isempty(state.task_id) || !isempty(state.job_id), values(node_states))
+        end
+        active_tasks || active_queue || assignments || begin
+            seen = Set{Tuple{String,Int}}()
+            targets = NODES[]
+            for node in nodes
+                key = (node.IP, node.port)
+                key in seen && continue
+                push!(seen, key)
+                push!(targets, node)
+            end
+            operation = ConductorRestartOperation(operation_id, targets, :running, Dict{Tuple{String,Int},ServerRestartResult}())
+            conductor_restart_operations[operation_id] = operation
+            conductor_mutation_owner[] = (:restart, operation_id)
+            return (status=:accepted, operation=restart_operation_snapshot(operation))
+        end
+        return (status=:busy, operation=nothing)
+    end
+end
+
+function finish_restart_operation!(operation_id::String, results::AbstractDict)::Bool
+    lock(conductor_mutation_lock) do
+        conductor_mutation_owner[] == (:restart, operation_id) || return false
+        operation = get(conductor_restart_operations, operation_id, nothing)
+        operation !== nothing && operation.status == :running || return false
+        expected = Set((node.IP, node.port) for node in operation.targets)
+        Set(keys(results)) == expected || throw(ArgumentError("restart results must cover every target exactly once"))
+        operation.results = Dict{Tuple{String,Int},ServerRestartResult}(results)
+        operation.status = :complete
+        conductor_mutation_owner[] = nothing
+        return true
+    end
+end
+
+function begin_cache_clear_operation!()
+    lock(conductor_mutation_lock) do
+        conductor_mutation_owner[] === nothing || return nothing
+        owner = (:cache_clear, string(uuid4()))
+        conductor_mutation_owner[] = owner
+        return owner
+    end
+end
+
+function finish_conductor_mutation!(owner)::Bool
+    lock(conductor_mutation_lock) do
+        owner !== nothing && conductor_mutation_owner[] == owner && owner[1] == :cache_clear || return false
+        conductor_mutation_owner[] = nothing
+        return true
+    end
+end
+
+function with_conductor_cache_operation(action::Function)
+    owner = begin_cache_clear_operation!()
+    owner === nothing && throw(ConductorMaintenanceBusyError())
+    try
+        return action()
+    finally
+        finish_conductor_mutation!(owner)
+    end
+end
+
 struct ConductorTask
     task_id::String
     coordinator_ip::String
@@ -564,6 +682,12 @@ function clear_node_cache_with_timeout(node::NODES; timeout=DEFAULT_CACHE_CLEAR_
 end
 
 function clear_all_node_caches(nodes::Vector{NODES}; timeout=DEFAULT_CACHE_CLEAR_TIMEOUT)
+    return with_conductor_cache_operation() do
+        clear_all_node_caches_impl(nodes; timeout)
+    end
+end
+
+function clear_all_node_caches_impl(nodes::Vector{NODES}; timeout=DEFAULT_CACHE_CLEAR_TIMEOUT)
     start_generations = [get_node_runtime_state(node).generation for node in nodes]
     tasks = [@async clear_node_cache_with_timeout(node; timeout=timeout) for node in nodes]
 
@@ -1085,6 +1209,13 @@ function queue_len()::Int
 end
 
 function enqueue_task!(task::ConductorTask; now_ns::UInt64=time_ns())
+    lock(conductor_mutation_lock) do
+        conductor_submissions_paused_unlocked() && throw(ConductorMaintenanceBusyError())
+        return enqueue_task_unlocked!(task; now_ns)
+    end
+end
+
+function enqueue_task_unlocked!(task::ConductorTask; now_ns::UInt64=time_ns())
     normalize_acceptance_timeout_seconds(task.acceptance_timeout_seconds)
     mark_task_queued!(task.task_id) || throw(ArgumentError(
         "task $(task.task_id) cannot transition to queued"
@@ -1322,6 +1453,13 @@ function apply_observed_node_state!(
 end
 
 function try_reserve_node!(node::NODES, task_id::String)::Bool
+    lock(conductor_mutation_lock) do
+        conductor_submissions_paused_unlocked() && return false
+        return try_reserve_node_unlocked!(node, task_id)
+    end
+end
+
+function try_reserve_node_unlocked!(node::NODES, task_id::String)::Bool
     isempty(task_id) && throw(ArgumentError("task_id must not be empty"))
     reserved = false
     lock(node_states_lock) do
@@ -1489,6 +1627,16 @@ function pick_idle_node_right_to_left(nodes::Vector{NODES})::Union{Nothing,NODES
 end
 
 function reserve_idle_node_right_to_left!(
+    nodes::Vector{NODES},
+    task_id::String
+)::Union{Nothing,NODES}
+    lock(conductor_mutation_lock) do
+        conductor_submissions_paused_unlocked() && return nothing
+        return reserve_idle_node_right_to_left_unlocked!(nodes, task_id)
+    end
+end
+
+function reserve_idle_node_right_to_left_unlocked!(
     nodes::Vector{NODES},
     task_id::String
 )::Union{Nothing,NODES}
@@ -1942,6 +2090,7 @@ function dispatch_queued_tasks(
     dispatch_timeout_seconds::Real=DEFAULT_DISPATCH_TIMEOUT,
     monotonic_clock::Function=time_ns
 )
+    conductor_submissions_paused() && return nothing
     expire_waiting_tasks!(; now_ns=UInt64(monotonic_clock()))
     while true
         task = pop_task!()
@@ -2123,7 +2272,7 @@ function conductor_server()
             catch e
                 println("Conductor server error: ", e)
                 try
-                    println(sock, add_checksum("ERROR|SERVER_ERROR"))
+                    println(sock, add_checksum(e isa ConductorMaintenanceBusyError ? "ERROR|BUSY|MAINTENANCE" : "ERROR|SERVER_ERROR"))
                 catch
                 end
             finally

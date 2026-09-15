@@ -595,10 +595,30 @@ client / conductor
 - **検証方法:** networkなしの試験でqueued/reserved/running/dispatch_unknownの各状態、
   投入と操作開始の両順序、同じIDの再照会、別IDの重複操作、例外時の終了処理を検証する。
   既存queue・予約試験でも通常投入の挙動が変わらないことを確認する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — operation record・対象確定・lock・照会の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - 新しい変更操作lockで、投入登録・node予約・一斉操作開始を同期する。通信中は保持しない。
+    queueからpop済みでもtask状態がqueued/reservedとして残るため、配送途中の空queueだけで操作を開始しない。
+    既存dispatch lock/generationは維持。状態照会・monitorは止めない。
+- [x] Phase 2 — operation record・対象確定・lock・照会の仕様
+  - `begin_restart_operation!(operation_id, nodes)`はUUIDを検査し、既存IDならexisting、
+    他操作/queue/非terminal task/有効node割当てがあればbusy、それ以外はacceptedとrecord copyを返す。
+    endpoint重複除去は先に出た設定名を保持。recordはID/対象copy/status/resultsをconductor存続中保持する。
+  - `get_restart_operation`はunknownならnothing、既知ならcopy。未完の集計は未確定としてnothing。
+    `finish_restart_operation!(id, results)`は全対象が一度ずつ揃うことと所有IDを確認して確定・制限解除。
+    確定時だけtotal/success/failedを返し、target>0かつ全成功をoverall_successとする。
+  - `enqueue_task!`と2種のnode予約入口を同じ変更操作lockで囲み、再起動操作中は登録/予約しない。
+    SUBMITには`ERROR|BUSY|MAINTENANCE`を返す。dispatch入口も休止を確認する。
+    既存task/node lockは各snapshot中だけ取得し、変更操作lockを後から取りに戻る経路を作らない。
+  - `begin_cache_clear_operation!/finish_conductor_mutation!`でCACHE_CLEAR_ALLも変更操作同士を排他。
+    cache clear内部はtry/finallyで所有状態を解放し、例外でも次操作を妨げない。nodeへの再起動送信はまだしない。
+- [x] Phase 3 — 実装
+  - 一斉操作record/所有lock、投入・node予約の排他、cache操作finally解放を追加。
+    public SUBMITは操作中に未受付BUSYを返す。node再起動送信は未接続。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/unit_conductor_restart_operation.jl`: exit 0、30+21+51=102/102。
+    24回の投入/操作開始競合は片方だけ成立。queued/reserved/running/dispatch_unknownとnode割当てを拒否。
+    同じ操作IDの再参照、対象重複除去、結果copy、0対象非成功、cache例外時解放を確認。
+    既存queue20/20、dispatch予約29/29、cache51/51もexit 0。diff成功。対象のみcommit/push。
 
 ## Step 13: 全nodeへの並行指示と結果集計を作る
 
