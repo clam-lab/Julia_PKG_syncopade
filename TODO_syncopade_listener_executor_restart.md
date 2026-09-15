@@ -756,10 +756,30 @@ client / conductor
   一斉操作は1台の旧子を待機点で止めて並行指示を確認し、両台の更新後に軽量taskを投入する。
   接続不能な第3endpointを加える部分失敗caseでも、2台の成功と1台の失敗を漏れなく返すことを確認する。
   Steps 12〜14で定義した範囲を超える製品仕様変更が必要なら、Todo全体を見直す。
-- [ ] Phase 1 — 試験方針・メモ
-- [ ] Phase 2 — fixture・投入・結果照合の仕様
-- [ ] Phase 3 — 試験実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 試験方針・メモ
+  - 実受付/実計算子と、loopback専用conductor子processを接続する。
+    単体試験はconductorの状態観測後・配送前を試験fixtureだけで保持し、再起動中BUSYを決定的に作る。
+    その後4 taskの一度だけの実行とterminalを照合する。一斉試験は2受付の更新と第3到達不能endpointを分離する。
+- [x] Phase 2 — fixture・投入・結果照合の仕様
+  - local conductor fixtureに観測後の配送gateとmonitor開始gateを追加（製品コードには追加しない）。
+    旧子STOP待機→stale idleからの投入でDISPATCH_BUSYを作り、CSV retry=0とqueued維持を確認する。
+    旧子停止解除後は通常executorを起動し、4ラベルtaskのcallback/task/job/terminalと実行traceを照合する。
+    別caseで実行中子消失→TASK_RESULT ERROR→conductor terminalを確認する。
+  - 一斉試験は2受付の同UUID package V1をロード→fixture package V2へ変更→一斉再起動→両V2を確認。
+    片方のSTOPを試験専用の子functionで待機点へ固定し、他方の新子起動を先に確認する。
+    受付情報は両台不変、操作中SUBMIT拒否、解除後batch4件の正常終了を確認する。
+    到達不能第3endpointのcaseでは実2台成功+1失敗を保持する。既存server/conductorには接続しない。
+- [x] Phase 3 — 試験実装
+  - 試験専用STOP frame gate、local listener processと回収helper、conductor観測/monitor gateを追加。
+    単体4 task/異常終了、一斉2受付process/2計算子/1conductor、版更新後4 task、第3到達不能を実装した。
+    最初の単体caseの動作確認は67/67。正式なPhase 4では両試験と既存回帰をまとめて再確認する。
+- [x] Phase 4 — 検証・結果・commit/push
+  - 単体結合49+18=67/67、一斉実process82/82、controlled一斉81/81、既存stale idle26/26、
+    DONE identity33/33、terminal callback19/19すべてexit 0（各`julia --startup-file=no --project=. --threads=4 test/<file>.jl`）。
+    実受付PID54885/54896、旧子54895/54906→新子54915/54914。conductorを含む5 PIDの独立性をassertした。
+    両受付ID/PID/port不変、両package V2、解除後4 task一度ずつ/max_active=1、到達不能込み2成功/1失敗を確認。
+    単体BUSY時CSV retry=0と保持、子消失の両終端通知も確認。全子正常回収、diff・既存log hash不変。
+    対象のみcommit/push。
 
 ## Step 17: wrapper起動と終了を確認する
 

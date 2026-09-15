@@ -56,7 +56,7 @@ function normal_listener_stderr(text)
     all(split(text, '\n'; keepempty=false)) do line
         occursin(r"^WARNING: replacing module (ListenerProbe|PackageTask|StandaloneTask)\.$", line) ||
             line == "Precompiling packages..." ||
-            occursin(r"^\s*\d+(?:\.\d+)? ms\s+✓ (?:UUIDs|ReloadProbe)(?: \(serial\))?$", line) ||
+            occursin(r"^\s*\d+(?:\.\d+)? ms\s+✓ (?:UUIDs|ReloadProbe|Dates|Printf|Unicode)(?: \(serial\))?$", line) ||
             occursin(r"^  \d+ dependenc(?:y|ies) successfully precompiled in \d+ seconds$", line)
     end
 end
