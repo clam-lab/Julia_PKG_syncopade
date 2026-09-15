@@ -43,8 +43,8 @@ function wait_listener_state(handle, state; timeout=10.0)
 end
 
 function listener_task_payload(callback, function_name, args=String[]; conductor=nothing, task_id="",
-    fixture=joinpath(@__DIR__, "fixtures", "listener_probe.jl"))
-    fields = vcat(["127.0.0.1", string(getsockname(callback)[2]), "$fixture:ListenerProbe:$function_name"], args)
+    fixture=joinpath(@__DIR__, "fixtures", "listener_probe.jl"), module_name="ListenerProbe")
+    fields = vcat(["127.0.0.1", string(getsockname(callback)[2]), "$fixture:$module_name:$function_name"], args)
     if conductor !== nothing
         append!(fields, [META_TASK_ID_PREFIX * task_id, META_CONDUCTOR_IP_PREFIX * "127.0.0.1",
             META_CONDUCTOR_PORT_PREFIX * string(getsockname(conductor)[2])])
@@ -54,7 +54,7 @@ end
 
 function normal_listener_stderr(text)
     all(split(text, '\n'; keepempty=false)) do line
-        line == "WARNING: replacing module ListenerProbe." ||
+        occursin(r"^WARNING: replacing module (ListenerProbe|PackageTask|StandaloneTask)\.$", line) ||
             line == "Precompiling packages..." ||
             occursin(r"^\s*\d+(?:\.\d+)? ms\s+✓ (?:UUIDs|ReloadProbe)(?: \(serial\))?$", line) ||
             occursin(r"^  \d+ dependenc(?:y|ies) successfully precompiled in \d+ seconds$", line)

@@ -716,10 +716,26 @@ client / conductor
   全期間でlistener ID・受付PID・公開portは一定。通常task間では子を再利用し、再起動時だけ交換する。
 - **検証方法:** 各段階のmarker、実際のpackage読込path、listener/server ID、PID、cache件数を照合する。
   複数taskでも新子を再利用することを確認する。通常設定とprecompile無効条件を独立processで検証する。
-- [ ] Phase 1 — 試験方針・メモ
-- [ ] Phase 2 — 観測項目・成功判定・副作用の仕様
-- [ ] Phase 3 — 試験実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 試験方針・メモ
+  - Step 1の同UUID package素材を実受付へ投入する。上書き/別配置の2条件を、それぞれ通常/compiled-modules=noの
+    独立Juliaで試す。別配置fixtureは自身のdirectoryをLOAD_PATH先頭に置き、配置先選択を明示する。
+    関数cache消去とprocess交換の効果を同じ公開portで順に観測する。
+- [x] Phase 2 — 観測項目・成功判定・副作用の仕様
+  - `deployment_task.jl`はStep 1と同じReloadProbeを読み、marker/PID/pathを返す。LOAD_PATH操作は試験子だけ。
+    公開task投入→RESULT読取りで観測し、公開RUNTIME/RESTART APIでID・PID・readyを検査する。
+  - 単独task V1→clear→V2を先に確認しcacheを空にする。その後package V1→変更→clear前後V1→
+    restart→V2→再度V2。上書き時clear件数1、別配置時は2 path分の2件。
+    旧package pathと新配置path、受付ID/PID/socket/port不変、新子ID/PID変更、通常task間子再利用をassertする。
+  - 親driverは4条件を子processで同期実行しexit 0を検査。fixture/DEPOT/作業fileは一時directoryへ隔離し、
+    すべて所有子をwaitして回収する。アプリのrevision配布機能を追加したとは扱わない。
+- [x] Phase 3 — 試験実装
+  - 共通fixtureを使う公開経路4条件の試験を追加。試験helperにtask module指定を追加した。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/integration_restart_package_reload.jl`: exit 0。
+    通常overwrite42/42、switch43/43、precompile無効overwrite42/42、switch43/43、親4/4。
+    子PIDは順に54715→54722、54727→54734、54739→54740、54742→54743。
+    各listener ID/PID/port不変、旧/新package path一致、clear後V1・再起動後V2・新版子再利用を確認。
+    auditの起動ID/PID/pathは標準出力へ出力、所有process/port/fixture/DEPOTは回収。diff成功。対象のみcommit/push。
 
 ## Step 16: conductor・複数node・一斉操作の接続を確認する
 
