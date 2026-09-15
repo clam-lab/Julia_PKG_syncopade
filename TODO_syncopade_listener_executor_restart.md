@@ -523,10 +523,30 @@ client / conductor
   同時要求や古いIDの要求で二重交換しない。停止/起動失敗は成功扱いにしない。
 - **検証方法:** 正常交換、task予約との競合、二重再起動、旧子停止失敗、新子起動失敗、
   成功応答を失った後の旧ID再送を試す。交換中も同じ公開portで状態照会できることを確認する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — 状態照会・再起動command・失敗応答の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - RUNTIME照会で現在IDと状態を返し、RESTARTは期待IDを照合して予約する。
+    STOP確認→新server UUID→READYの順を守り、失敗は新規投入不可のまま返す。
+    応答socket切断でも受理済み交換は最後まで処理し、旧IDによる再送は二重交換しない。
+- [x] Phase 2 — 状態照会・再起動command・失敗応答の仕様
+  - checksum付き`RUNTIME`要求→`RUNTIME|1|listener_id|server_id|state|listener_pid|server_pid|julia_version|syncopade_version|ready`。
+    応答にも既存checksumを付ける。子不在PIDは0、版は空、readyはprocess存続かつidle/busyのときtrue。
+  - 要求`RESTART|1|expected_listener_id|expected_server_id`、不正field/UUIDはchecksum付きERROR。
+    応答`RESTART|1|status|old_listener_id|old_server_id|`の後にRUNTIMEのID以降8 field、最後にreasonとchecksum。
+    statusはsuccess/busy/id_mismatch/stop_failed/startup_failed。old IDは要求された期待値、new側は現在snapshot。
+  - `restart_listener_executor!`が状態予約→stop→ID交換→launchを担当。成功は新子READY時だけ。
+    `listener_runtime_info`は診断用copyを返す。管理応答の理由文字列は%/pipe/改行/CRをpercent escapeする。
+    既存build_payloadは単純joinなので加工を任せず、既存task/result形式は変更しない。
+    同時再起動・busy予約・交換中task・停止/起動失敗・応答喪失後再送を試験する。
+- [x] Phase 3 — 実装
+  - RUNTIME/RESTARTを公開受付へ追加。期待ID照合と旧子停止後の交換を接続。
+    停止待機点fixtureと成功/失敗/重複/応答喪失の実受付試験を追加。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/integration_executor_restart.jl`: exit 0、28+24+27=79/79。
+    listener 0c48c6bc-1f23-43bf-b22f-fcfc97cd17ba/PID54201/port62113を維持、子PID54204→54208。
+    同時4要求で交換1回、応答喪失後の旧ID再送拒否、unavailable復旧、交換中STATUS/BUSY、停止/起動失敗を確認。
+    cache回帰51/51もexit 0。最初/最後の子両方の回収をhelperで検査。diff成功。対象のみcommit/push。
+  - 初回は意図した停止timeoutによるSIGTERM表示を通常stderr扱いした試験ミス。
+    当該fixtureだけ、所有PIDと終了signalを照合した終了表示を除いて通常stderr検査し、全件再実行した。
 
 ## Step 11: 公開APIと1 node用CLIを用意する
 

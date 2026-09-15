@@ -168,6 +168,19 @@ function handle_server_connection!(handle::ListenerHandle, socket::TCPSocket)
         elseif message == "CACHE_CLEAR"
             println(socket, clear_listener_cache!(handle))
             return nothing
+        elseif message == "RUNTIME"
+            println(socket, server_management_response(vcat(["RUNTIME", "1"], listener_runtime_fields(listener_runtime_info(handle)))))
+            return nothing
+        elseif startswith(message, "RESTART|")
+            fields = String.(split(message, '|'))
+            if length(fields) != 4 || fields[2] != "1" || !ExecutorProtocol.valid_uuid(fields[3]) || !ExecutorProtocol.valid_uuid(fields[4])
+                println(socket, server_management_response(["ERROR", "INVALID_RESTART_REQUEST"]))
+                return nothing
+            end
+            result = restart_listener_executor!(handle, fields[3], fields[4])
+            println(socket, server_management_response(vcat(["RESTART", "1", string(result.status), fields[3], fields[4]],
+                listener_runtime_fields(result.runtime), [result.reason])))
+            return nothing
         end
         job = convMSG2JOB(message)
         job_id = string(uuid4())
@@ -214,6 +227,49 @@ function clear_listener_cache!(handle::ListenerHandle)
     finally
         runtime_finish_cache_clear!(runtime, reservation)
     end
+end
+
+function listener_runtime_info(handle::ListenerHandle)
+    supervisor = handle.supervisor
+    lock(supervisor.runtime.mutex) do
+        snapshot = runtime_snapshot_unlocked(supervisor.runtime)
+        child = supervisor.child
+        matching_child = child !== nothing && child.listener_id == snapshot.listener_id && child.server_id == snapshot.server_id
+        return (listener_id=snapshot.listener_id, server_id=snapshot.server_id, state=snapshot.state,
+            listener_pid=getpid(), server_pid=matching_child ? child.pid : 0,
+            julia_version=matching_child ? child.julia_version : "",
+            syncopade_version=matching_child ? child.syncopade_version : "",
+            ready=matching_child && process_running(child.process) && snapshot.state in (:idle, :busy))
+    end
+end
+
+listener_runtime_fields(info) = [info.listener_id, info.server_id, string(info.state), string(info.listener_pid),
+    string(info.server_pid), info.julia_version, info.syncopade_version, string(info.ready)]
+
+function server_management_response(fields::Vector{String})
+    escaped = [replace(field, "%" => "%25", "|" => "%7C", "\n" => "%0A", "\r" => "%0D") for field in fields]
+    payload = join(escaped, '|')
+    return payload * "|" * checksum_hex(payload)
+end
+
+function restart_listener_executor!(handle::ListenerHandle, listener_id::String, server_id::String)
+    supervisor = handle.supervisor
+    runtime = supervisor.runtime
+    reservation = runtime_reserve_restart!(runtime, listener_id, server_id)
+    if reservation != :accepted
+        return (status=reservation, reason=string(reservation), runtime=listener_runtime_info(handle))
+    end
+    executor_audit(supervisor, "restart_reserved", runtime_snapshot(runtime))
+    stopped = stop_executor!(supervisor)
+    if !stopped.ok
+        return (status=:stop_failed, reason=stopped.message, runtime=listener_runtime_info(handle))
+    end
+    replacement = runtime_replace_server_id!(runtime, listener_id, server_id)
+    if replacement === nothing
+        return (status=:stop_failed, reason="runtime stopped before replacement", runtime=listener_runtime_info(handle))
+    end
+    launched = launch_executor!(supervisor)
+    return (status=launched.ok ? :success : :startup_failed, reason=launched.message, runtime=listener_runtime_info(handle))
 end
 
 function execute_listener_job!(handle::ListenerHandle, job, reservation)

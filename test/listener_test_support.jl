@@ -52,7 +52,16 @@ function listener_task_payload(callback, function_name, args=String[]; conductor
     return join(fields, '|')
 end
 
-function with_test_listener(test; extra_env=Dict{String,String}(), config_options...)
+function normal_listener_stderr(text)
+    all(split(text, '\n'; keepempty=false)) do line
+        line == "WARNING: replacing module ListenerProbe." ||
+            line == "Precompiling packages..." ||
+            occursin(r"^\s*\d+(?:\.\d+)? ms\s+✓ (?:UUIDs|ReloadProbe)(?: \(serial\))?$", line) ||
+            occursin(r"^  \d+ dependenc(?:y|ies) successfully precompiled in \d+ seconds$", line)
+    end
+end
+
+function with_test_listener(test; extra_env=Dict{String,String}(), stderr_check=nothing, config_options...)
     mktempdir() do dir
         audit = IOBuffer()
         output = open(joinpath(dir, "stdout"), "w+")
@@ -70,9 +79,11 @@ function with_test_listener(test; extra_env=Dict{String,String}(), config_option
             owned = handle.supervisor.child
             test(handle, dir, audit)
         finally
+            final_child = handle.supervisor.child
             stopped = stop_listener!(handle)
             @test stopped.ok
             @test owned === nothing || process_exited(owned.process)
+            @test final_child === nothing || process_exited(final_child.process)
             @test !isopen(handle.socket)
             close(output)
             close(errors)
@@ -80,13 +91,11 @@ function with_test_listener(test; extra_env=Dict{String,String}(), config_option
         rebound = listen(ip"127.0.0.1", handle.port)
         @test isopen(rebound)
         close(rebound)
-        warnings = split(read(joinpath(dir, "stderr"), String), '\n'; keepempty=false)
-        isempty(warnings) || println("LISTENER_CHILD_STDERR ", repr(join(warnings, '\n')))
-        @test all(warnings) do line
-            line == "WARNING: replacing module ListenerProbe." ||
-                line == "Precompiling packages..." ||
-                occursin(r"^\s*\d+(?:\.\d+)? ms\s+✓ (?:UUIDs|ReloadProbe)(?: \(serial\))?$", line) ||
-                occursin(r"^  \d+ dependenc(?:y|ies) successfully precompiled in \d+ seconds$", line)
+        text = read(joinpath(dir, "stderr"), String)
+        if stderr_check === nothing
+            @test normal_listener_stderr(text)
+        else
+            @test stderr_check(text, owned)
         end
     end
 end
