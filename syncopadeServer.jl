@@ -202,10 +202,12 @@ function execute_listener_job!(handle::ListenerHandle, job, reservation)
     callback_ok = false
     error_message = ""
     try
+        runtime_job_is_current(runtime, reservation) || return nothing
         child === nothing && throw(EOFError())
         request = ExecutorMessage("EXECUTE", reservation.listener_id, reservation.server_id, job_id,
             vcat([job.file_name, job.module_name, job.function_name], job.args))
         result = executor_exchange(child, request, "RESULT")
+        runtime_job_is_current(runtime, reservation) || return nothing
         if result.data[1] == "OK"
             exec_status = "OK"
             callback_ok = send_result(job, job_id, true; result=result.data[2])
@@ -214,20 +216,25 @@ function execute_listener_job!(handle::ListenerHandle, job, reservation)
             callback_ok = send_result(job, job_id, false; errType=result.data[2], errMsg=result.data[3])
         end
     catch error
+        runtime_job_is_current(runtime, reservation) || return nothing
         runtime_mark_unavailable!(runtime, reservation.listener_id, reservation.server_id)
         error_message = "EXECUTOR_UNAVAILABLE|" * sprint(showerror, error)
         callback_ok = send_result(job, job_id, false; errType="EXECUTOR_UNAVAILABLE",
             errMsg="Executor result unavailable; task side effects may have occurred: " * sprint(showerror, error))
     finally
-        try
-            send_done_notification(job, job_id, string(handle.bind_ip), handle.port;
-                status=exec_status, started_at,
-                finished_at=Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss"),
-                callback_ok, error_message)
-        finally
-            runtime_finish_job!(runtime, reservation.listener_id, reservation.server_id, job_id)
-            executor_audit(supervisor, "job_finished", reservation;
-                pid=child === nothing ? 0 : child.pid, reason="job_id=$job_id status=$exec_status callback_ok=$callback_ok")
+        if runtime_job_is_current(runtime, reservation)
+            try
+                send_done_notification(job, job_id, string(handle.bind_ip), handle.port;
+                    status=exec_status, started_at,
+                    finished_at=Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss"),
+                    callback_ok, error_message)
+            finally
+                runtime_finish_job!(runtime, reservation.listener_id, reservation.server_id, job_id)
+                executor_audit(supervisor, "job_finished", reservation;
+                    pid=child === nothing ? 0 : child.pid, reason="job_id=$job_id status=$exec_status callback_ok=$callback_ok")
+            end
+        else
+            executor_audit(supervisor, "stale_job_ignored", reservation; reason="job_id=$job_id")
         end
     end
     return nothing

@@ -454,10 +454,26 @@ client / conductor
   計算の副作用が既に起きた可能性は残るため「未実行」とは報告しない。
 - **検証方法:** 試験所有の子だけを待機点で終了させる。
   実行前/中、結果受信直後、古いIDの遅延結果を試し、通知と状態を照合する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — 異常分類・一度だけの終端確定の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - 子exit監視は状態をunavailableにするだけで、callback/DONEを送らない。
+    終端通知の所有者は受付済みjob task一つに限定する。結果適用前に現在の3 IDを再照合する。
+    明示STOPの子exitは監視が異常扱いしない。古い子/古いjobの応答は監査して捨てる。
+- [x] Phase 2 — 異常分類・一度だけの終端確定の仕様
+  - child handleへexpected_exit/monitor taskを追加。`monitor_executor_exit!`はwait後、現在の子だけを
+    unavailableにし専用接続を閉じる。通知中jobは残す。正常STOPはexpected_exitを先に立てる。
+  - `runtime_job_is_current(runtime, reservation)`でlistener/server/jobとbusy/unavailableをlock内照合。
+    受付jobは実行前・結果受信後・例外処理・DONE前で検査し、不一致なら通知/解放をしない。
+    監視と通信EOFが両方来てもcallback/DONEの所有者を増やさない。
+  - 試験はidle exit、実行中exit、結果受信後/DONE ack待ち中exit、内部状態を切替えた遅延結果を分離。
+    強制終了は試験所有子へのSIGKILLのみ。副作用の可能性をERRORに残し、再実行しない。
+- [x] Phase 3 — 実装
+  - 子exit監視と現在job照合を追加。監視は終端通知を送らず、遅延結果は通知前に破棄する。
+    idle/実行中/結果後の子消失と、古い応答による別job解放防止の試験を追加。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/regression_executor_failure.jl`: exit 0、35+12+12=59/59。
+    予約直後/実行前の子消失も境界を固定して確認。通知1回、再起動/再実行なし、遅延結果では別job不変。
+    lifecycle120/120、公開実行29/29もexit 0。試験所有の子/portは全回収。diff検査・既存log hash不変。
+    起動ID/PID/終端件数は試験内auditとassertionで照合。対象のみcommit/push。
 
 ## Step 9: CACHE_CLEARを計算子に届ける
 

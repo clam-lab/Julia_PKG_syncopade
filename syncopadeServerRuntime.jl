@@ -96,6 +96,13 @@ function runtime_request_stop!(runtime::ServerRuntime)
     end
 end
 
+function runtime_job_is_current(runtime::ServerRuntime, reservation)::Bool
+    lock(runtime.mutex) do
+        return runtime_ids_match(runtime, reservation.listener_id, reservation.server_id) &&
+            !isempty(reservation.job_id) && runtime.job_id == reservation.job_id && runtime.state in (:busy, :unavailable)
+    end
+end
+
 runtime_public_state(runtime::ServerRuntime) = begin
     state = runtime_snapshot(runtime).state
     state == :idle ? :idle : state == :unavailable ? :down : :busy
@@ -142,6 +149,8 @@ mutable struct ExecutorHandle
     julia_version::String
     syncopade_version::String
     rpc_lock::ReentrantLock
+    expected_exit::Bool
+    monitor::Union{Nothing,Task}
 end
 
 mutable struct ExecutorSupervisor
@@ -161,6 +170,24 @@ ExecutorSupervisor(runtime::ServerRuntime; config=ExecutorLaunchConfig(), audit=
 function executor_audit(supervisor::ExecutorSupervisor, event::String, snapshot; pid=0, reason="")
     println(supervisor.audit, "EXECUTOR event=$event listener_id=$(snapshot.listener_id) server_id=$(snapshot.server_id) pid=$pid reason=$(repr(reason))")
     flush(supervisor.audit)
+end
+
+function monitor_executor_exit!(supervisor::ExecutorSupervisor, child::ExecutorHandle)
+    child.monitor = @async begin
+        wait(child.process)
+        unexpected = lock(supervisor.runtime.mutex) do
+            if !child.expected_exit && supervisor.child === child &&
+                runtime_ids_match(supervisor.runtime, child.listener_id, child.server_id)
+                runtime_mark_unavailable!(supervisor.runtime, child.listener_id, child.server_id)
+                return true
+            end
+            return false
+        end
+        unexpected && close(child.socket)
+        executor_audit(supervisor, "exited", child; pid=child.pid,
+            reason="unexpected=$unexpected exit=$(child.process.exitcode) signal=$(child.process.termsignal)")
+    end
+    return nothing
 end
 
 struct ExecutorControlTimeout <: Exception
@@ -246,13 +273,14 @@ function launch_executor!(supervisor::ExecutorSupervisor)
             parse(Int, ready.data[1]) == pid || throw(ArgumentError("READY PID does not match owned child"))
             process_running(process) || throw(ArgumentError("child exited before READY acceptance"))
             child = ExecutorHandle(snapshot.listener_id, snapshot.server_id, process, socket, pid,
-                ready.data[2], ready.data[3], ReentrantLock())
+                ready.data[2], ready.data[3], ReentrantLock(), false, nothing)
             lock(supervisor.runtime.mutex) do
                 runtime_mark_ready!(supervisor.runtime, snapshot.listener_id, snapshot.server_id) ||
                     throw(ArgumentError("runtime changed before READY acceptance"))
                 supervisor.child = child
                 supervisor.pending_process = nothing
             end
+            monitor_executor_exit!(supervisor, child)
             accepted = true
             executor_audit(supervisor, "ready", snapshot; pid)
             return (ok=true, reason=:ready, message="", pid)
@@ -292,6 +320,9 @@ function stop_executor!(supervisor::ExecutorSupervisor)
         child === nothing && return (ok=true, reason=:already_stopped, message="", pid=0)
         config = supervisor.config
         executor_audit(supervisor, "stopping", child; pid=child.pid)
+        lock(supervisor.runtime.mutex) do
+            child.expected_exit = true
+        end
         try
             if !process_exited(child.process)
                 id = string(uuid4())
@@ -302,12 +333,14 @@ function stop_executor!(supervisor::ExecutorSupervisor)
                 wait(child.process)
             end
             close(child.socket)
+            child.monitor === nothing || wait(child.monitor)
             supervisor.child = nothing
             executor_audit(supervisor, "stopped", child; pid=child.pid)
             return (ok=true, reason=:stopped, message="", pid=child.pid)
         catch error
             close(child.socket)
             reaped = reap_failed_executor!(child.process, config.cleanup_timeout)
+            reaped && child.monitor !== nothing && wait(child.monitor)
             reaped && (supervisor.child = nothing)
             runtime_mark_unavailable!(supervisor.runtime, child.listener_id, child.server_id)
             message = sprint(showerror, error)
