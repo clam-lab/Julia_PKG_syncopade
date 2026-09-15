@@ -1,4 +1,9 @@
 # Task loading and function cache. Including this file does not start a process.
+using Sockets
+if !isdefined(@__MODULE__, :ExecutorProtocol)
+    include("syncopadeExecutorProtocol.jl")
+end
+using .ExecutorProtocol
 const DEFAULT_UNIX_MOUNT_ROOT = "/Volumes/syncopade_nfs"
 const DEFAULT_WINDOWS_MOUNT_ROOT = raw"\\192.168.100.96\syncopade_nfs"
 const DEFAULT_FUNCTION_CACHE_SIZE = 10
@@ -155,4 +160,67 @@ function call_func(file_name::String, module_name::String, func_name::String, ar
     end
 
     return Base.invokelatest(f, args...) 
+end
+
+function executor_error_type(error)::String
+    error isa LoadError && return "LOAD_ERROR"
+    error isa UndefVarError && return "NAME_ERROR"
+    error isa MethodError && return "METHOD_ERROR"
+    error isa ArgumentError && return "ARG_ERROR"
+    return "RUNTIME_ERROR"
+end
+
+function executor_package_version()::String
+    for line in eachline(joinpath(@__DIR__, "Project.toml"))
+        matched = match(r"^version\s*=\s*\"([^\"]+)\"", line)
+        matched === nothing || return String(matched[1])
+    end
+    throw(ArgumentError("Syncopade version missing"))
+end
+
+"""Run a single executor on a private connection; never send public callbacks."""
+function run_executor_loop(io::IO, listener_id::String, server_id::String)
+    write_executor_message(io, ExecutorMessage("READY", listener_id, server_id, "",
+        [string(getpid()), string(VERSION), executor_package_version()]))
+    while true
+        message = try
+            read_executor_message(io)
+        catch error
+            error isa EOFError && return nothing
+            rethrow()
+        end
+        expect_executor_message(message, message.kind, listener_id, server_id, message.request_id)
+        if message.kind == "EXECUTE"
+            data = try
+                value = call_func(message.data[1], message.data[2], message.data[3], message.data[4:end])
+                ["OK", string(value)]
+            catch error
+                ["ERROR", executor_error_type(error), sprint(showerror, error)]
+            end
+            write_executor_message(io, ExecutorMessage("RESULT", listener_id, server_id, message.request_id, data))
+        elseif message.kind == "CLEAR"
+            write_executor_message(io, ExecutorMessage("CLEARED", listener_id, server_id, message.request_id,
+                [string(clear_function_cache!())]))
+        elseif message.kind == "STOP"
+            write_executor_message(io, ExecutorMessage("STOPPED", listener_id, server_id, message.request_id, String[]))
+            return nothing
+        else
+            throw(ArgumentError("unexpected executor request: $(message.kind)"))
+        end
+    end
+end
+
+function executor_main(args=ARGS)
+    length(args) == 3 || throw(ArgumentError("executor requires port, listener ID, server ID"))
+    port = parse(Int, args[1])
+    0 < port <= 65535 || throw(ArgumentError("invalid executor port"))
+    # Validate IDs before opening a connection.
+    ExecutorProtocol.validate_message(ExecutorMessage("READY", args[2], args[3], "", [string(getpid()), string(VERSION), executor_package_version()]))
+    socket = connect(ip"127.0.0.1", port)
+    try
+        run_executor_loop(socket, args[2], args[3])
+    finally
+        close(socket)
+    end
+    return nothing
 end

@@ -338,10 +338,26 @@ client / conductor
   cache clear・停止にも応答し、stdoutへの大量出力が制御通信を壊さない。
 - **検証方法:** 軽量task2件、例外task、後続成功taskを実processで順に実行。
   親接続切断時に待受中の子が終了し、socket/processが残らないことも確認する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — 子entrypoint・実行loop・例外の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - 子はloopbackへ接続しREADYを送信、1件ずつEXECUTE/CLEAR/STOPを処理する。
+    計算例外だけをRESULT ERRORに変換し、通信/不正protocolの失敗は子を終了させる。
+    親切断は待受中にEOFとして正常終了する。通信socketと標準出力は完全に分離する。
+- [x] Phase 2 — 子entrypoint・実行loop・例外の仕様
+  - `executor_main(args)`のargsはport/listener UUID/server UUIDの3個。接続先は127.0.0.1固定。
+    socketはfinallyでclose。`run_executor_loop(io, listener_id, server_id)`はREADYから開始し、
+    EXECUTEのfile/module/func/String argsをcall_funcへ渡す。結果はstring化、例外分類は現行serverと同じ。
+    CLEARはclear_function_cache!の件数、STOPはSTOPPED送信後return。EOFはreturn。
+  - `scripts/run_executor.jl`は直接実行時だけexecutor_mainを呼ぶ。
+    fixtureはecho/PID/明示例外/256 KiB stdout関数。試験は2子を順に所有し正常STOPと親切断を検証。
+    起動/試験通信のwatchdogは20秒、計算時間の製品制限ではない。終了後exit/stderr/portを検査する。
+- [x] Phase 3 — 実装
+  - 子loop・entrypointと独立実process試験を追加。taskエラー分類を関数化した。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/integration_executor_loop.jl`: exit 0、33/33。
+    正常STOP子PID 52800、親切断子PID 52825、いずれもexit 0・再bind可能。
+    loading回帰31/31もexit 0。diff検査成功。対象のみcommit/push。
+  - 初回は警告が必ず3行という灯子の試験誤り（32成功/1失敗）。独立include2回で
+    moduleは交換されるがJulia 1.12.3では警告0行と確認し、既知警告だけ許す検査へ修正・再検証した。
 
 ## Step 6: 子の起動と終了を受付側で管理する
 
