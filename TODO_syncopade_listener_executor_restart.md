@@ -7,6 +7,9 @@
   単体再起動→一斉操作管理→並行送信→公開操作→統合検証の順に全体を18 Stepへ組み直した。
 - このTodoの作成・確認はStep 1にも、そのPhase 1にも含めない。
 - 進行方式: 強化C。検証済みStepごとにcommit/pushし、前提変更が必要なら停止する。
+- 現在: Step 1–16は検証・commit/push済み（`3f7884f`まで）。Step 17のSIGINT試験失敗で一度停止。
+  先生の「直す方針あるなら直して進めて」により、終了入口・子への割込み伝搬・試験後始末の見直しと再開を承認。
+  Step 17は改訂後の検証に合格。対象差分をcommit/push後、Step 18へ進む。version/tag・本番LAN操作は引き続き対象外。
 - 作成時HEAD: `ce9d69c2ba06d701a8abc9957d8bf481ade7e4d2`、`master`、`v0.1.4`。
 - 既存の完了Todoはすべて`history/`にあるため、今回の作成時に移動するTodoはない。
 - 作成時の既存差分: `logs/conductor_events.csv`の4行追加。
@@ -785,7 +788,8 @@ client / conductor
 
 - **目的:** 過去の「run_serverがすぐ終了する」回帰を防ぎ、子も回収する。
 - **対象:** `scripts/run_server.jl`、`syncopadeServer.jl`、
-  `test/integration_server_wrapper_entrypoint.jl`、`test/integration_listener_shutdown.jl`（新規）、このTodo。
+  `syncopadeServerRuntime.jl`（承認済みの子の割込み分離）、`syncopadeServerSignals.jl`（CLI終了要求の受信）、
+  `test/integration_server_wrapper_entrypoint.jl`、`test/integration_listener_shutdown.jl`（新規）、関連終了fixture、このTodo。
 - **方針:** 直接起動・wrapper起動・include-onlyの3つを区別する。
 - **完了条件:** 直接/wrapper起動は受付と子が存続し、include-onlyでは起動しない。
   idle時とbusy時のq/EOF/通常割込みが定義した終了順序に従う。
@@ -793,10 +797,101 @@ client / conductor
 - **検証方法:** 起動commandを実processで試し、q・EOF・通常割込み後のexit codeとprocess回収を確認。
   busy時は制御可能な軽量fixtureを使う。受付の異常終了時は、子がidleの場合の接続切断終了も確認する。
   実行中の任意コード・孫processを含む強制回収まで検証したと主張しない。
-- [ ] Phase 1 — 実装・試験方針とメモ
-- [ ] Phase 2 — entrypoint・終了処理・resource回収の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装・試験方針とメモ
+  - mainのfinallyで受付と子を回収し、q/EOF/通常SIGINTは実行中計算と通知の完了を待つ。
+    wrapperは直接実行時だけmainを呼び、include-onlyは起動しない。
+    実scriptをLANなしで試すため、従来の引数なし動作を維持したまま明示`--bind/--port`を受け付ける。
+    既存lan100手動wrapper試験は維持し、新しいloopback終了試験をsuiteへ登録する方針。
+- [x] Phase 2 — entrypoint・終了処理・resource回収の仕様
+  - `server_entrypoint_options(args)`は引数なしなら既存profile、明示時は`--bind IP --port PORT`の両方を必須とし、
+    不正値・重複・未知の引数はsocket作成前に拒否する。port 0はOSによる空きport割当。
+    `main(args=ARGS)`はhandleを保持し、q/EOF/通常SIGINTでfinallyから`stop_listener!`を呼ぶ。
+    SIGINTをInterruptExceptionとして受け、最初の終了要求では計算と通知完了を待つ（計算期限なし）。
+    後始末失敗は正常終了とせず例外。二度目の強制割込み・孫processの回収は保証外。
+  - wrapperは`PROGRAM_FILE`が自身の場合だけmainを呼ぶ。includeは定義のみ。
+    直接/wrapper×idle/busy×q/EOF/SIGINTをloopbackの実processで検証し、終了code・通知・子PID消滅・port再利用を確認。
+    idleの親強制終了も専用の所有processで確認し、子のIPC EOF終了を観測する。
+- [x] Phase 3 — 実装
+  - mainの引数検証・finally cleanup・SIGINT捕捉とwrapperの直接実行guardを追加。
+    `integration_listener_shutdown.jl`で実entrypointの存続、通知完了後の終了、子PID消滅、port再利用を検査。
+    各caseはloopbackの動的portと一時DEPOTを使い、既存LAN手動試験・設定は変更していない。
+- [x] Phase 4 — 検証・結果・commit/push（初回停止後、下記改訂Phaseで完了）
+  - **停止記録:** `julia --startup-file=no --project=. --threads=4 test/integration_listener_shutdown.jl`。
+    引数検証とdirect/wrapperのinclude-onlyは17/17。direct起動のidle/busyそれぞれのq/EOFは通過。
+    ただしSIGINTは未達。Julia 1.12.3 / macOS / `--threads=4`で次を観測した。
+    - idle親PID 55128・子PID 55129・公開port 65209:
+      親exit 1、stderr `fatal: error thrown and no exception handler available. InterruptException()`。
+      stackは`task_done_hook`→`wait`→`ijl_task_get_next`。mainのcatch/finallyの終了logなし。
+    - busy親PID 55142・子PID 55143・公開port 65388:
+      listener `562d3ca2-b1b9-4981-ac2f-1efba53a3011`、server `0dfdabd3-358f-4e5c-9043-0b3d4c1ca79f`。
+      SIGINT後も受付が閉じず、結果受信がInterruptExceptionとなり`EXECUTOR_UNAVAILABLE` callbackとERROR DONEを返した。
+      job `95cb032c-0c2c-4915-8717-96eb766f9869`、task `99bdbf00-ceaa-4657-ab5a-429a71170766`。
+      計算を完了させて通常通知を待つという完了条件を満たさない。
+  - 推論: `Base.exit_on_sigint(false)`はmainへの配信先固定ではないため、mainのtry/catchだけでは
+    非同期処理を持つ受付の終了順序を保証できない。local Julia Baseの`c.jl:184–203`も配信先固定を保証していない。
+    誤字修正では済まないので、強化Cの停止条件に従い終了方式の再設計・相互確認を待つ。
+    候補はJuliaの終了hookによる回収等だが、計算・通知の継続可否を検証するまでは採用しない。
+  - 試験側にも、終了待ちtimeoutのassertion失敗後に無期限`wait`へ進む問題があった。
+    試験driver PID 55110を所有確認後にSIGTERMで中断（exit 143）。stdinが閉じ、親55142と子55143も終了。
+    3 PIDの消滅と残存公開port/制御portのlistenなしを確認。wrapper起動の終了caseと親突然死caseは未実施。
+    次の見直しでは試験のtimeout後にも確実にfinally回収へ進むことを含める。
+    未成功のStep 17はcommit/pushせず、Step 18へ進めていない。
+
+### Step 17 改訂Phase（終了処理の見直しを承認後に再開）
+
+- [x] Phase 1 — 方針
+  - 受付/計算子の2 process構成・ID・再起動API・全node一斉指示は変更しない。
+    mainでInterruptExceptionを捕捉する前提を撤回。Juliaの終了hookを第一候補として、
+    既存の非同期結果受信・通知を壊さず待機できるかを先に最小fixtureで確認し、その結果を実装方式の根拠にする。
+    q/EOFと割込みの終了処理は一つに集約し、二重回収や途中終了の成功扱いを防ぐ。
+  - 子は別process groupで起動して端末Ctrl-Cの直接伝搬を分離する。受付は明示STOP・process waitの所有者を維持。
+    親だけへのSIGINTと端末相当のgroup SIGINTを分けて試し、親異常終了時のidle子EOF終了も再確認する。
+    試験の期限切れでは無条件waitへ進まずfinallyへ入り、試験所有processを回収する。
+  - Step追加・順序変更はなし。Step 17完了後にStep 18の全体回帰・運用文書を行う。
+- [x] Phase 2 — 関数仕様・副作用・検証条件
+  - 先行fixture `shutdown_hook_probe.jl`は親driverの一時directoryを受け取り、制御可能な非同期処理を起動。
+    SIGINT時の終了hookでその処理を待ち、release後の完了markerとhook完了markerが両方あるか確認。
+    driverはhook到達/終了に上限を設け、自己待機・scheduler停止の有無を観測する。失敗を成功扱いしない。
+  - 本体は終了要求を一度だけ扱い、`stop_listener!`の受付停止→実行/通知待機→子STOP/回収という順序を維持。
+    終了hook採用時はq/EOFのfinallyと共通の終了ownerを使う。hook中の非同期処理継続が成立しなければ
+    signal受信だけを終了要求へ変換する方式を同じ終了入口の範囲で検討し、根拠と関数仕様を追記してから実装する。
+  - 子起動の`Cmd(...; detach=true)`でprocess groupを分離。loopback試験の受付自体も専用groupで起動し、
+    group IDが所有する受付PIDと一致することを確認してからgroup SIGINTを送る。他のgroupへ送らない。
+    q/EOFはexit 0、SIGINTは後始末の完了を必須とし、OSの割込み終了codeを保持する方式も許容する。
+    stderr検査は既知のsignal終了出力を所有PIDと照合する場合だけ局所化し、suite全体の検査は弱めない。
+  - 終了試験は最初の失敗で後始末へ進む。実行期限は試験driverだけに置き、実計算には設けない。
+  - 先行確認: PID57934の終了hookは中断された仕事と同じJulia Task上で実行された（`self_wait=true`）。
+    WORK_DONE/HOOK_DONEはfalse、signal 2終了。hookから同じTaskを待てないため本体には採用しない。
+    Julia v1.12.3 `signals-unix.c:533–539`と`base/initdefs.jl:435–440`の実装経路にも対応する。
+  - 採用仕様: Julia内蔵libuvの`uv_signal_start`でSIGINTをイベントとして受ける。
+    `ListenerInterrupt`はnative handleと原子的なrequested/closed flagを所有。
+    callbackはrequested=trueにするだけで、例外・停止・通信・待機を行わない。
+    `start_listener_interrupt()`はCLI mainだけで呼ぶ。include/API利用ではsignal設定を変えない。
+    `close_listener_interrupt!()`はuv_close callback完了後だけrootを解放し、再呼出しを安全に扱う。
+    全native handle操作はJuliaのI/O lock内、callbackはevent loop上で実行。新しい依存package・別processは追加しない。
+    根拠: https://docs.libuv.org/en/v1.x/signal.html 、 https://docs.libuv.org/en/v1.x/handle.html 。
+  - `main`はstdin読取りを専用Taskにし、終了入力またはrequested flagを待つ。
+    どちらからでもfinallyの一か所で`stop_listener!`を呼び、未完了stdin読取りも閉じて回収する。
+    signal watcherは後始末完了まで維持し、繰り返しCtrl-Cも同じ依頼へ集約する。
+    正常なq/EOFは0、SIGINT依頼後の後始末成功は130を返し、直接/wrapper guardがexit codeへ反映。
+    回収失敗は例外（非0）で成功logを出さない。CLI専用のprocess-wide signal設定であり、REPL内mainの利用は保証しない。
+- [x] Phase 3 — 実装
+  - signal event受信を独立ファイルへ隔離。native callbackはflag更新のみとし、終了ownerはmainのまま。
+    正の先行fixtureはself_wait=false、仕事と後始末完了、exit 0/stderr空を確認してから本体へ接続した。
+    不採用の終了hook fixtureは原因の再確認用として保存し、通常suiteには登録しない。
+  - 実entrypoint試験は引数なしthread数/4 threads、direct/wrapper、idle/busy、q/EOF/親SIGINT/group SIGINTを網羅。
+    子group分離、繰返し割込み、GC後のsignal handle寿命、二重close、期限切れ後の確実な回収も検査する。
+- [x] Phase 4 — 検証・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/integration_listener_shutdown.jl`はexit 0。
+    引数/include-only17、signal独立処理9、実起動終了576、親消失5、合計607/607。
+    direct/wrapper×thread未指定/4×idle/busy×q/EOF/親SIGINT/group SIGINTの32 caseを確認。
+    q/EOF exit 0、SIGINT exit 130・termsignal 0、全caseで子終了・port再利用・stderr既知成功出力のみ。
+    busy割込みを2回送っても結果/ DONEはOK。例: wrapper 4 threads group SIGINTの親58358・子58359・port57929。
+  - `integration_executor_lifecycle.jl`120/120、`integration_executor_restart.jl`79/79もexit 0。
+    起動失敗回収・停止失敗・旧ID拒否・受付不変の既存検証を維持。
+    `scripts/run_server.jl --help`はexit 0。diff check、既存log SHA-256不変を確認。
+    実環境はJulia 1.12.3/macOS。Windows console・他Julia版の実機検証を実施したとは主張しない。
+    対象8ファイルのみcommit/push。過去の停止記録は削除せず残す。
 
 ## Step 18: 全体回帰と運用文書を整える
 

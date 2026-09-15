@@ -4,6 +4,7 @@ using Dates
 include("syncopadeNodeConfig.jl")
 include("syncopadeExecutor.jl")
 include("syncopadeServerRuntime.jl")
+include("syncopadeServerSignals.jl")
 
 const server_state = Ref(:idle)  # :idle or :busy
 const server_state_lock = ReentrantLock()
@@ -571,18 +572,76 @@ end
 # ---------------------------------------------------------------------
 # Runnable entrypoint
 # ---------------------------------------------------------------------
-function main()
-    syncopade_server()
-    println("Syncopade server is running. Type 'q' + Enter to quit.")
-    while true
-        if eof(stdin)
-            break
-        end
-        cmd = strip(readline(stdin))
-        lowercase(cmd) == "q" && break
+function server_entrypoint_options(args)
+    isempty(args) && return nothing
+    args == ["--help"] && return :help
+    length(args) == 4 || throw(ArgumentError("use --bind IP --port PORT, or no arguments for the configured profile"))
+    values = Dict{String,String}()
+    for index in (1, 3)
+        key = args[index]
+        key in ("--bind", "--port") || throw(ArgumentError("unknown option: $key"))
+        haskey(values, key) && throw(ArgumentError("duplicate option: $key"))
+        values[key] = args[index + 1]
     end
+    port = tryparse(Int, values["--port"])
+    port !== nothing && 0 <= port <= 65535 || throw(ArgumentError("port must be between 0 and 65535"))
+    return (ip=parse(IPAddr, values["--bind"]), port=port)
+end
+
+function main(args=ARGS)
+    options = server_entrypoint_options(args)
+    if options === :help
+        println("Usage: julia scripts/run_server.jl [--bind IP --port PORT]")
+        return 0
+    end
+    # SIGINT is a request, not an exception in whichever async task happened
+    # to run last. Only the CLI installs this process-wide signal watcher.
+    interrupt = start_listener_interrupt()
+    handle = nothing
+    input_task = nothing
+    interrupted = false
+    try
+        handle = options === nothing ? syncopade_server() : syncopade_server(options.ip, options.port)
+        println("Syncopade server is running. Type 'q' + Enter to quit.")
+        flush(stdout)
+        input_task = @async try
+            while !eof(stdin)
+                lowercase(strip(readline(stdin))) == "q" && break
+            end
+        catch
+            isopen(stdin) && rethrow()
+        end
+        while !istaskdone(input_task) && !interrupt.requested[]
+            sleep(0.02)
+        end
+        interrupted = interrupt.requested[]
+        if interrupted
+            println("Stopping Syncopade server after interrupt; waiting for accepted work.")
+            flush(stdout)
+        else
+            fetch(input_task)
+        end
+    finally
+        try
+            if handle !== nothing
+                stopped = stop_listener!(handle)
+                stopped.ok || error("Syncopade server cleanup failed: $(stopped.reason)")
+            end
+        finally
+            try
+                if input_task !== nothing && !istaskdone(input_task)
+                    close(stdin)
+                    wait(input_task)
+                end
+            finally
+                interrupted |= interrupt.requested[]
+                close_listener_interrupt!(interrupt)
+            end
+        end
+    end
+    return interrupted ? 130 : 0
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main()
+    exit(main())
 end

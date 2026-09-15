@@ -282,7 +282,9 @@ function launch_executor!(supervisor::ExecutorSupervisor)
         try
             port = getsockname(listener)[2]
             command = `$(Base.julia_cmd()) --startup-file=no --project=$(config.project) --threads=$(config.threads) $(config.script) $port $(snapshot.listener_id) $(snapshot.server_id)`
-            command = Cmd(command; dir=config.cwd, env=config.env)
+            # The listener owns shutdown. A terminal Ctrl-C must not interrupt
+            # the accepted calculation before the listener can drain it.
+            command = Cmd(command; dir=config.cwd, env=config.env, detach=true)
             process = run(pipeline(command; stdin=devnull, stdout=supervisor.output, stderr=supervisor.errors); wait=false)
             supervisor.pending_process = process
             pid = getpid(process)
