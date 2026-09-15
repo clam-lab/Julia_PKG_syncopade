@@ -369,10 +369,34 @@ client / conductor
   起動に失敗した子も回収し、停止完了はprocess終了で判定する。起動ID付きの起動・終了記録を残す。
 - **検証方法:** 正常子、起動前例外、起動応答なし、ID不一致のfixtureを使う。
   親の状態・子exit code・残留processとportを確認する。制御期限だけを短縮して試す。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — launch設定・期限・resource所有者の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - pure Runtimeとは別にSupervisorが起動設定・子handle・通信排他・監査出力を持つ。
+    状態lock内ではsnapshotと状態適用だけを行い、別のlifecycle lockで起動/停止を直列化する。
+    READY検証・process存続確認前はidleにしない。失敗時は所有子を終了/waitしunavailableにする。
+- [x] Phase 2 — launch設定・期限・resource所有者の仕様
+  - `ExecutorLaunchConfig`はactive Project directory、cwd、ENVのcopy、default/interactive thread数、
+    実行scriptを保持。同一`Base.julia_cmd()`に明示project/cwd/threadsとstartup-file=noを指定する。
+    起動30秒、停止10秒、失敗時回収はTERM/KILL各2秒を既定とし、
+    `SYNCOPADE_EXECUTOR_STARTUP_TIMEOUT/SHUTDOWN_TIMEOUT/CLEANUP_TIMEOUT`で正の有限秒へ変更可能。
+    計算exchangeにはtimeoutを追加しない。
+  - `ExecutorSupervisor(runtime; config, audit)`は子handleとlifecycle lockを所有。
+    `launch_executor!`はloopback listen→spawn→READY照合→PID/存続確認→idle、失敗時は回収してunavailable。
+    `stop_executor!`は再起動/終了/利用不可状態でSTOP→STOPPED→process wait、子handleを解放する。
+    停止期限超過は強制回収できても失敗として返し、勝手に新版を起動しない。
+  - `executor_exchange(child, message, expected_kind; timeout=nothing)`は専用通信を排他し、IDを照合する。
+    制御timeoutはsocketをcloseして読み待ちを解除。戻り値はmessage、例外は元のIO/検証例外または制御timeout。
+    起動/停止の戻り値はok/reason/message/pid。auditにはイベント・2 ID・PID・理由を出す。
+    fixtureの異常終了/READYなし/ID違いと停止無応答を試験し、試験所有の全子を回収する。
+- [x] Phase 3 — 実装
+  - Supervisor/config/制御timeoutと監査を追加。未接続の起動失敗子もprocess handleを保持し、
+    回収を確認できなければ次の起動を拒否する。設定継承・異常fixtureを追加。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/integration_executor_lifecycle.jl`: exit 0、120/120。
+    正常PID53269、起動前exit53270、例外53271、READYなし53272、ID違い53315、停止無応答53316。
+    全ケース子回収・制御port再bind成功、正常子exit 0。Project/cwd/ENV/2 thread継承を確認。
+    runtime状態試験153/153もexit 0。diff検査成功。対象のみcommit/push。
+  - 初回の灯子の試験誤りはmacOS `/var`と`/private/var`の文字列比較（101成功/1失敗）。
+    実体pathで比較するよう修正して全件再実行した。運用前提や仕様の変更はない。
 
 ## Step 7: 受付から子へ通常taskを接続する
 
