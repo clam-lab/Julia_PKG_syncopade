@@ -1,0 +1,527 @@
+# Todo: 受付を維持した計算用Juliaの分離・再起動
+
+## 状態
+
+- 2026-09-16作成、同日先生が18 Stepを承認し「強化C」で開始を指示。全Phaseを順番に記録する。
+- 2026-09-16改訂: 先生の指示でconductor経由の全node一斉再起動を追加。
+  単体再起動→一斉操作管理→並行送信→公開操作→統合検証の順に全体を18 Stepへ組み直した。
+- このTodoの作成・確認はStep 1にも、そのPhase 1にも含めない。
+- 進行方式: 強化C。検証済みStepごとにcommit/pushし、前提変更が必要なら停止する。
+- 作成時HEAD: `ce9d69c2ba06d701a8abc9957d8bf481ade7e4d2`、`master`、`v0.1.4`。
+- 既存の完了Todoはすべて`history/`にあるため、今回の作成時に移動するTodoはない。
+- 作成時の既存差分: `logs/conductor_events.csv`の4行追加。
+  SHA-256: `20f0129709ac36e64ec0191878ee18be2cc247104e74a5b54d46aedc305dbef0`。
+
+## 目的と根拠
+
+先生が計算コードを更新したとき、受付のIP・portと受付Juliaを維持しながら、
+読み込み済みpackageを持つ計算用Juliaだけを終了・再起動できるようにする。
+同じ計算用Juliaを複数taskで再利用し、明示された再起動時だけ交換する。
+単一nodeへの指定に加え、conductorへの1回の指示で設定された全nodeの計算Juliaへ
+並行して再起動を指示し、node別の結果をまとめて確認できるようにする。
+
+現行コードでは次の経路になっている。
+
+- `scripts/run_server.jl`が`syncopadeServer.jl`の`main()`を呼ぶ。
+- 同一Julia内の受付処理が`call_func`でtaskを実行する。
+- `call_func`は`(script_path, module_name, function_name)`をキーに関数を保持する。
+- `clear_function_cache!`はその辞書とLRU一覧を空にするだけである。
+- 再度`include`されるtaskから同じUUIDのpackageを読み込んでも、
+  そのJulia内に既にロードされているpackage moduleが再利用される。
+
+会話内の調査では、taskファイルの変更はcache clear後に反映された一方、
+依存packageの変更はcache clear後も旧値のまま、新規Juliaでは新値になることを確認した。
+この試験は一時コードによる観測で、リポジトリの回帰試験としては未保存。
+Step 1でassertion付きの再現試験にする。実運用の全事例の原因まで確定したとは扱わない。
+
+理論上の根拠は[Julia公式 Code Loading](https://docs.julialang.org/en/v1/manual/code-loading/)。
+`include`による再評価と、同じpackage identityへの`using/import`による再利用を区別する。
+`Base.invokelatest`はファイルやpackageを再ロードする操作ではない。
+
+## 今回の構成案
+
+```text
+client / conductor
+        |
+        | 既存の公開IP・port
+        v
+受付Julia  listener_id=L1
+        |
+        | 同じPC内だけの専用通信
+        v
+計算Julia  server_id=S1   --明示的な再起動-->   server_id=S2
+```
+
+### 役割とID
+
+| 対象 | 所有するもの | IDの寿命 |
+|---|---|---|
+| 受付Julia | 公開socket、受付状態、job予約、子process監視、callback・DONE送信 | `listener_id`: 受付起動ごとにUUIDを発行 |
+| 計算Julia | taskのinclude、関数cache、package、実計算 | `server_id`: 計算Julia起動ごとにUUIDを発行 |
+| conductor | 既存のqueue、task ID、node割当て、一斉再起動の対象と結果 | 既存taskの契約を維持。一斉操作には照会用`operation_id`を付ける |
+
+- 現行serverには、この意味の`server_id`はまだ存在しない。2つの起動IDを新設する。
+- nodeは既存のIP・port・設定名で指定する。新しい固定`node_id`は追加しない。
+- `task_id`、`job_id`は既存の意味を保つ。起動IDをそれらの代用にしない。
+- 起動IDは専用通信、状態照会、再起動要求、監査記録で照合する。
+- 受付側の記録には子の起動・終了・交換・失敗と、listener/server/job IDの対応を残す。
+  既存conductor CSVの形式は維持し、先生の既存logへ新しい列を混在させない。
+- 既存conductor内の状態更新用`generation`は維持する。
+  これと起動IDは用途が異なるため、今回まとめて置き換えない。
+
+### 簡潔にするための初版の範囲
+
+- **1受付につき計算Juliaは1本、同時実行taskは1件。**
+- 再起動操作は宛先IP・portを明示した単一node指定と、conductor経由の全node一斉指示を用意する。
+  それぞれ公開client APIとCLIを用意し、単体操作を作ってから一斉操作に接続する。
+- 再起動はbatchの切れ目で行う。投入元は投入を止め、先行taskの終端を確認してから要求する。
+- 計算中・予約中・結果通知処理中の再起動はBUSYで拒否する。終了待ち予約は作らない。
+- 受付が再起動を受理した後は、新規taskをBUSYで拒否する。
+  conductor経由のtaskは既存のBUSY待機処理で保持される。
+- queue内のtaskとコード版の対応付け、複数版の同居は対象外。
+  単体再起動中にqueueへ入ったtaskは、その後の計算Juliaで実行され得る。
+  全node一斉指示は以下の条件で投入・配送と排他にする。
+- 起動IDの変化はprocess交換を示す。アプリケーションの指定revisionをロードした保証にはしない。
+  Project/Manifestの配布・固定は従来どおり利用側の責務とする。
+
+### 全nodeへの一斉指示
+
+- 対象はconductorの選択中profileに設定された全endpointを、要求受理時に重複除去して固定する。
+  現行`LIST`はidle nodeだけを返すため、対象決定には使わない。
+  busy・down・未対応nodeを対象から黙って除かない。対象0件は成功としない。
+- 全台同時刻の切替は保証しない。1回の要求から各nodeへ並行して指示し、各nodeが独立して交換する。
+  成功したnodeを、別nodeの失敗に合わせて元へ戻す処理は追加しない。
+- conductorはqueueと予約・実行中・受付成否不明の割当てが空であることを確認し、
+  確認と一斉操作の開始を投入・配送に対して原子的に行う。空でなければ要求全体をBUSYで拒否し、
+  再起動指示を1件も送らない。実行中taskを待つ予約や強制終了は行わない。
+- 操作中の新規SUBMITは明示的な未受付エラーを返し、queueへ追加しない。
+  monitorの状態照会と既存taskの状態照会は継続し、配送は停止する。
+  他の一斉再起動と`CACHE_CLEAR_ALL`の変更操作も同時に開始しない。
+- nodeごとに起動IDを照会し、期待`listener_id/server_id`付きで再起動を要求する。
+  conductorが把握していない直接投入や別conductorの操作と競合した場合も、
+  各受付のbusy判定とID照合で拒否する。全nodeを予約する分散transactionは作らない。
+- node別結果は成功、BUSY拒否、ID不一致、接続/旧protocolの失敗、起動失敗、成否不明を区別する。
+  結果にはendpoint、名前、旧/新起動ID、確認できた状態、理由を含める。
+  `success_nodes`と`failed_nodes`を返し、BUSY拒否・成否不明も成功以外として後者に含める。
+  常に`total_nodes = success_nodes + failed_nodes = node別結果数`を満たす。
+- 全体成功は対象が1件以上で、全対象の受付ID不変・計算ID変更・新子readyを確認できた場合だけとする。
+  一部失敗時は部分成功として返し、成功したnodeも含む内訳を残す。失敗nodeを自動再実行しない。
+- callerが生成する`operation_id`で操作を登録し、同じIDの再送では再起動を重ねず現在の記録を返す。
+  これは一斉要求の照会番号であり、計算processの世代やコード版を管理するIDではない。
+  clientの接続断後もconductorは開始済み操作を収集し、操作IDによる状態照会で結果を回収できる。
+  保持期間はconductorの存続中とし、conductor再起動後は「記録不明」と返して自動再送しない。
+- 接続・照会・再起動待ちにはnode別の期限を設け、停止node1台で他nodeの処理を止めない。
+  期限切れの通信とtaskを回収し、要求送信後のtimeoutは「未実行」ではなく成否不明とする。
+  操作記録を確定した後の遅延応答で、後続操作や別jobの状態を上書きしない。
+- 全対象の結果が確定したら、一斉操作中の投入・配送制限を解除する。
+  成否不明nodeは旧idle観測だけで再利用せず、現在の起動IDとreadyを照会して整合するまで配送対象外とする。
+  再起動前と同じserver IDのidleだけでは除外を解除しない。要求の未受理が確定するか、
+  同じlistener IDの新しいserver IDとreadyを確認してから解除する。
+  一部成功は全体の更新完了を意味しない。利用側は全体成功を確認してから次batchを開始する。
+
+### 状態と排他
+
+- 受付内部の状態は`starting / idle / busy / restarting / unavailable / stopping`を基本案とする。
+- task予約と再起動予約は同じlockで判定・確定する。通信・process待機中はlockを保持しない。
+- `idle`への復帰は、現在の子の起動確認または現在のjobの終了処理だけが行う。
+- 起動確認では`listener_id`、`server_id`、protocol版、子processの存続を照合する。
+  PID・Julia版・Syncopade版は診断情報として返す。PIDは再利用され得るので識別の正本にしない。
+- 再起動要求には照会で得た期待`listener_id`と期待`server_id`を指定する。
+  古いIDによる要求は拒否し、応答を失った要求の再送で新しい子をもう一度止めない。
+- 子が異常終了した場合は`unavailable`にし、明示的な再起動で復旧する。
+  自動再起動・task自動再実行は行わない。
+
+### 互換性と通信
+
+- 公開portの所有者は受付のみとする。計算Juliaは公開LANで待ち受けない。
+- 親子通信はloopbackの動的portを使う専用socketを第一案とする。
+  接続先と起動IDを子起動時に渡し、対応する子だけを登録する。
+- taskの`stdout/stderr`を制御通信に使わない。`println`で通知が壊れない構成にする。
+- 文字列引数・結果・例外情報を運ぶ。Juliaアプリケーションの型付きオブジェクトは受付へ渡さない。
+- 旧`STATUS|idle` / `STATUS|busy`と、受付成功`OK|STARTED|job_id`を維持する。
+  `starting/restarting/stopping`は旧照会ではbusy、子が使えない場合はdownとして表す。
+- 再起動中の新規task拒否は既存の`ERROR|BUSY`を使う。
+  新しい`ERROR|RELOADING`分類をconductorへ追加しない。
+- 起動ID・詳細状態は新しい状態照会で取得する。既存STATUSや結果payloadにfieldを追加しない。
+- `RESULT`、`TASK_RESULT`、`DONE`の公開形式を維持する。
+  受付が子の結果を照合して、既存形式でcallbackとDONEを送信する。
+- `CACHE_CLEAR`は計算Juliaの関数cacheに転送する。計算Juliaの交換とは別操作として残す。
+  正常完了は従来の`CACHE|CLEARED|count`、転送不能・応答不明は成功として返さない。
+
+### 起動・終了とtimeout
+
+- `julia scripts/run_server.jl`と`julia syncopadeServer.jl`で受付と計算Juliaが起動する。
+- sourceの`include`だけではsocketや子processを作らない。
+- 子は同じJulia実行ファイルを用い、Project、作業directory、ENV、thread設定の扱いを仕様化する。
+  アプリケーションpackageは受付にロードしない。
+- 起動・停止の制御待ちには設定可能な期限を設ける。計算実行時間の上限は追加しない。
+  制御期限の数値はStep 6 Phase 2で固定し、過去の900秒を計算期限として流用しない。
+- 旧子の終了を確認してから新子を起動する。停止未確認・新子起動失敗では受付を利用不可に保つ。
+- 再起動の成功応答は新子の起動確認後だけに返す。
+  呼出し側timeoutは成否不明として状態照会で確認し、再起動要求を自動再送しない。
+- `q`、EOF、通常の割込み終了では新規受付を止め、実行中taskの扱いと子の回収を明示する。
+  通常終了は計算・通知完了を待って子を終了する方針とする。
+- 親が突然失われた場合、子は専用接続の切断を検出して次taskを受けない。
+  応答不能の計算やアプリケーション自身が起動した孫processを含めた強制回収は、今回の保証に含めない。
+
+## 共通運用と停止条件
+
+- 各Stepは目的、対象、完了条件、検証方法を持ち、一度に1 Step・1 Phaseだけ進める。
+- Phase 1: 実装方針とメモ。Phase 2: 関数名、引数、戻り値、例外、副作用、所有者、lock境界。
+  Phase 3: 実装。Phase 4: 検証と結果記録。各記録を省略・後付けで完了扱いにしない。
+- A進行はPhaseごと、B進行はStepごとに先生の指示を待つ。C進行は確認済みTodo内を順番に進める。
+- 強化Cでは、Todoの意味を変えない灯子の誤字・構文・Markdown等のミスだけ修正して同じ検証をやり直す。
+- 前提・仕様・Step順序・完了条件の変更が必要なら停止し、Todo全体の見直しを提案する。
+- Phase 4の成功後、各Stepの対象差分と記録をcommit/pushする。Todo作成だけで実装Stepを開始しない。
+- 試験は専用子process、一時directory、loopback、動的portで隔離する。
+  既存の実運用server/conductorへ接続しない。lan100試験もこのTodoには含めない。
+- 外部package取得やregistry更新を要しないローカルfixtureを使う。
+  fixture用packageはテスト材料であり、本Projectにローカル`path`依存を追加しない。
+- 起動したprocessとsocketの回収を検証する。失敗時の強制終了は試験が所有するprocessに限定する。
+- コマンド、exit code、assertion結果、ID/PIDの前後、関連logの場所を該当Phase 4に記録する。
+- `logs/conductor_events.csv`とsibling repositoryを変更・stage・復元しない。
+- version更新、tag、リリース、本番nodeへの展開は別途指示を受けて扱う。
+
+## Step一覧
+
+| Step | 独立して確認すること |
+|---|---|
+| 1 | 関数cache消去とpackage再ロードの違いを回帰試験にする |
+| 2 | 計算処理を受付から切り出し、既存の挙動を保つ |
+| 3 | 受付ID・計算IDと排他的な状態遷移を定義する |
+| 4 | 親子の専用通信の形式・ID照合を作る |
+| 5 | 計算用Juliaの実行ループを単独で動かす |
+| 6 | 受付による子の起動・起動確認・終了を作る |
+| 7 | 通常taskを子Juliaへ接続し、既存の結果を返す |
+| 8 | 子の異常終了を検出し、taskの失敗を回収する |
+| 9 | 既存CACHE_CLEARを子へ転送する |
+| 10 | idle時だけ子を交換する再起動操作を作る |
+| 11 | 起動ID照会・再起動の公開APIとCLIを用意する |
+| 12 | conductorの一斉操作と投入・配送を排他にする |
+| 13 | 全nodeへ並行して再起動を指示し、結果を集計する |
+| 14 | 一斉再起動・結果照会の公開APIとCLIを用意する |
+| 15 | 受付を維持したpackage更新反映を実証する |
+| 16 | conductor・複数node・一斉操作の接続を確認する |
+| 17 | 起動wrapperと通常終了の回帰を確認する |
+| 18 | 全体回帰と運用文書を整える |
+
+以下の新規ファイル名・関数名は配置案。各Step Phase 2で正確なinterfaceを固定する。
+
+## Step 1: cache clearで更新できる範囲を試験にする
+
+- **目的:** 原因と修正後の合格基準を保存する。
+- **対象:** `test/regression_package_reload_boundary.jl`、`test/fixtures/package_reload/`（新規）、このTodo。
+- **方針:** 現行`call_func`と`clear_function_cache!`を使う。製品コードは変更しない。
+- **完了条件:** task単体のV1→V2はclear後に反映し、同じUUIDのpackageは旧JuliaにV1が残り、新規JuliaでV2になる。
+  同一路径上書きと別の配置directoryへの切替を区別する。後者も同じUUIDで試す。
+- **検証方法:** 旧/新marker、module同一性、process IDをassertする。
+  `--compiled-modules=no`でも再現することを確かめ、ディスク上のprecompile cacheと切り分ける。
+  各条件を別子processで実行し、exit 0とfixture以外への書込みなしを確認する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — fixture・観測・入出力・副作用の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 2: task読込み・実行処理を切り出す
+
+- **目的:** 計算子が既存の読込み経路をそのまま利用できるようにする。
+- **対象:** `syncopadeServer.jl`、`syncopadeExecutor.jl`（新規）、Step 1試験、このTodo。
+- **方針:** path解決、関数cache、include、`call_func`を1つの正本へ移す。
+  このStepでは既存server内から同じ処理を呼ぶ状態を保つ。
+- **完了条件:** path解決の候補順、String引数、戻り値、例外、cache件数とLRU挙動が変わらない。
+  sourceのincludeは起動を伴わず、読込みロジックの複製がない。
+- **検証方法:** Step 1、既存server admission/result試験、cache有効/無効の小さい単体試験。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — 移動する関数と互換入口の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 3: 2つの起動IDと受付状態を定義する
+
+- **目的:** task投入と再起動のどちらか一方だけが予約を取れるようにする。
+- **対象:** `syncopadeServerRuntime.jl`、`test/unit_server_runtime_state.jl`（新規）、このTodo。
+- **方針:** networkから独立した状態操作を先に作る。現行serverへの接続はStep 7。
+- **完了条件:** listener IDは子交換で不変、server IDは子起動ごとに変わる。
+  `idle -> busy`と`idle -> restarting`は同時成立しない。
+  古い起動IDまたは不一致jobの完了通知では現在状態を変更できない。
+- **検証方法:** 遷移表、二重予約、期待ID不一致、unavailableからの明示復旧を決定的な順序で試す。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — 状態record・遷移・lock・戻り値の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 4: 親子の専用通信を作る
+
+- **目的:** ID、String引数、結果、例外、制御応答を混同せず渡す。
+- **対象:** `syncopadeExecutorProtocol.jl`、`test/unit_executor_protocol.jl`（新規）、このTodo。
+- **方針:** 起動確認、実行要求/結果、cache clear、終了要求/応答を定義する。
+  transport上のframe境界と長さ検証を決め、taskの標準出力とは別経路を使う。
+- **完了条件:** protocol版、listener/server/job IDを照合できる。
+  空文字、改行、`|`、Unicodeを損失なく送受信でき、不正frameは実行前に拒否する。
+- **検証方法:** IOBufferまたはloopbackで分割read、途中EOF、不正長、ID不一致を試す。
+  codecの往復だけでなく、未知の応答を状態へ適用しないことを確認する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — メッセージ・frame・失敗時の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 5: 計算子の実行ループを作る
+
+- **目的:** 常駐する1本のJuliaで複数taskを順に処理できるようにする。
+- **対象:** `syncopadeExecutor.jl`、`scripts/run_executor.jl`、
+  `test/integration_executor_loop.jl`（後2件は新規）、このTodo。
+- **方針:** 試験用の親から専用接続を作り、Step 2の実行処理を呼ぶ。
+  計算子は公開callback・DONEを送らない。
+- **完了条件:** 連続taskが同じPID/server IDで動く。成功と関数例外を親へ返し、例外後も次taskを実行できる。
+  cache clear・停止にも応答し、stdoutへの大量出力が制御通信を壊さない。
+- **検証方法:** 軽量task2件、例外task、後続成功taskを実processで順に実行。
+  親接続切断時に待受中の子が終了し、socket/processが残らないことも確認する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — 子entrypoint・実行loop・例外の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 6: 子の起動と終了を受付側で管理する
+
+- **目的:** 起動済みか不明な子をreadyとせず、確実に所有・回収する。
+- **対象:** `syncopadeServerRuntime.jl`、`test/integration_executor_lifecycle.jl`（新規）、このTodo。
+- **方針:** 子起動command、process handle、専用接続、起動確認、停止・waitを管理する。
+- **完了条件:** 同じJulia、Project、cwd、指定ENV・thread設定で子を起動できる。
+  正しい起動応答を得る前はidleにならず、起動失敗・応答期限超過を区別できる。
+  起動に失敗した子も回収し、停止完了はprocess終了で判定する。起動ID付きの起動・終了記録を残す。
+- **検証方法:** 正常子、起動前例外、起動応答なし、ID不一致のfixtureを使う。
+  親の状態・子exit code・残留processとportを確認する。制御期限だけを短縮して試す。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — launch設定・期限・resource所有者の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 7: 受付から子へ通常taskを接続する
+
+- **目的:** 公開serverを受付と計算に分離し、既存clientから計算できるようにする。
+- **対象:** `syncopadeServer.jl`、`syncopadeServerRuntime.jl`、
+  `test/integration_listener_execution.jl`（新規）、既存server admission/result試験、このTodo。
+- **方針:** job ID発行と予約は受付に残し、task読込み・実行だけを子へ移す。
+  結果照合、callback、DONE、最後の予約解放は受付が所有する。
+- **完了条件:** 受付PIDと計算PIDが異なり、受付にfixture packageがロードされない。
+  直接投入とconductor metadata付き投入の既存応答形式が保たれる。
+  同時実行最大1、予約前の成功応答なし、計算中も受付のSTATUSに応答できる。
+  jobとlistener/server IDの対応を記録し、旧子由来の応答を別jobへ適用しない。
+- **検証方法:** loopbackで成功・関数例外・並行投入を確認。
+  計算を待機点で保持し、受付の応答と排他を確認する。既存result/admission試験も通す。
+  CACHE_CLEARの子転送はStep 9で接続する。それまでは未対応を明示して拒否し、
+  親の空cacheを消して成功応答する経路は残さない。この中間状態を実運用へ投入しない。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — 受付・実行・通知・解放の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 8: 子の異常終了を回収する
+
+- **目的:** 子だけが落ちた場合に、受付済みtaskと受付状態が取り残されないようにする。
+- **対象:** `syncopadeServerRuntime.jl`、`syncopadeServer.jl`、
+  `test/regression_executor_failure.jl`（新規）、このTodo。
+- **方針:** 子exit、接続切断、結果受信との競合を受付の同一jobへ集約する。
+- **完了条件:** 関数例外とprocess消失を区別する。
+  受付済みjobの失敗をcallback・DONEへ反映し、終端を二重確定しない。
+  子消失後はunavailableとなり、自動再実行しない。
+  計算の副作用が既に起きた可能性は残るため「未実行」とは報告しない。
+- **検証方法:** 試験所有の子だけを待機点で終了させる。
+  実行前/中、結果受信直後、古いIDの遅延結果を試し、通知と状態を照合する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — 異常分類・一度だけの終端確定の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 9: CACHE_CLEARを計算子に届ける
+
+- **目的:** 現行の軽いcache clearを引き続き使えるようにする。
+- **対象:** `syncopadeServer.jl`、`syncopadeExecutor.jl`、
+  `test/integration_executor_cache_clear.jl`（新規）、このTodo。
+- **方針:** 子の関数cacheを消し、確認した件数だけ既存形式で返す。
+  再起動との同時実行を制御し、対象server IDを照合する。
+- **完了条件:** 成功時にlistener/server IDとPIDは変わらない。
+  taskファイル更新は反映され、packageのロード状態は残る。
+  子不在・再起動中・応答不明を`CLEARED`成功として返さない。
+- **検証方法:** Step 1のtask単体更新を公開CACHE_CLEAR経由で確認する。
+  busy中の制御応答・既存の1秒timeoutとの関係を試し、即時応答できる保証がないことを明示する。
+  conductorのcache clear集計へ正常/失敗が正しく伝わることも確認する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — cache制御の応答・競合・timeout仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 10: 計算子だけを再起動する
+
+- **目的:** 受付を維持して古いpackageを持つprocessを交換する。
+- **対象:** `syncopadeServerRuntime.jl`、`syncopadeServer.jl`、
+  `test/integration_executor_restart.jl`（新規）、このTodo。
+- **方針:** 期待する2つの起動IDを検証して再起動を予約し、旧子終了→新子起動→起動確認の順に処理する。
+  詳細状態照会と再起動commandを追加する。unavailableからも明示的に復旧できるようにする。
+- **完了条件:** listener ID・受付PID・公開socketを保ち、server IDが変わる。
+  busy中は拒否し、再起動中のtaskはBUSYで未受理とする。
+  同時要求や古いIDの要求で二重交換しない。停止/起動失敗は成功扱いにしない。
+- **検証方法:** 正常交換、task予約との競合、二重再起動、旧子停止失敗、新子起動失敗、
+  成功応答を失った後の旧ID再送を試す。交換中も同じ公開portで状態照会できることを確認する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — 状態照会・再起動command・失敗応答の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 11: 公開APIと1 node用CLIを用意する
+
+- **目的:** 先生がnodeを指定してIDを確認し、計算Juliaを交換できるようにする。
+- **対象:** `syncopadeClient.jl`、`src/Syncopade.jl`、`scripts/restart_server.jl`、
+  `test/unit_server_management_protocol.jl`、`test/integration_restart_cli.jl`（後3件は新規）、このTodo。
+- **方針:** 状態照会APIと期待ID付き再起動APIを公開する。CLIは照会→期待ID付き要求→結果確認を行う。
+- **完了条件:** 成功・BUSY拒否・ID不一致・起動失敗・成否不明を区別する。
+  CLIは宛先、旧/新ID、状態を表示し、全nodeへの暗黙の操作や要求の自動再送を行わない。
+  旧serverが新commandを扱えない場合も明示的に失敗する。
+- **検証方法:** parser試験とloopback実CLI試験。
+  応答timeout後の照会、空/不正ID、未知protocol、失敗時exit code、package export/docstringを確認する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — API名・引数・戻り値・CLI・終了codeの仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 12: 一斉操作と投入・配送を排他にする
+
+- **目的:** 全node再起動の開始時にtaskを取り残さず、一斉操作を識別・照会できるようにする。
+- **対象:** `syncopadeConductor.jl`、`test/unit_conductor_restart_operation.jl`（新規）、このTodo。
+- **方針:** 変更操作の所有状態とoperation recordを作り、queue・割当て確認、SUBMIT、
+  配送、一斉cache clearとの同期境界を定義する。このStepではnodeへの再起動は送らない。
+- **完了条件:** 非空queueまたは有効な割当てがあれば全体を拒否する。
+  操作開始とSUBMIT/配送予約の競合では片方だけが先に成立する。
+  操作中はSUBMITを未受付として返し、monitor照会は継続する。
+  同じoperation IDは既存操作を参照し、別の操作が重複して開始しない。
+- **検証方法:** networkなしの試験でqueued/reserved/running/dispatch_unknownの各状態、
+  投入と操作開始の両順序、同じIDの再照会、別IDの重複操作、例外時の終了処理を検証する。
+  既存queue・予約試験でも通常投入の挙動が変わらないことを確認する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — operation record・対象確定・lock・照会の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 13: 全nodeへの並行指示と結果集計を作る
+
+- **目的:** 1回の操作で全設定nodeに指示を行い、部分失敗も漏れなく回収する。
+- **対象:** `syncopadeConductor.jl`、`syncopadeClient.jl`、
+  `test/regression_conductor_restart_all.jl`、`test/fixtures/controlled_restart_listener.jl`（後2件は新規）、このTodo。
+- **方針:** Step 12の操作に、対象endpointの固定、起動ID照会、Step 11の再起動APIの並行呼出し、
+  node別結果保存、全体完了、公開commandとoperation照会を接続する。
+  成否不明nodeの配送除外と、照会による除外解除もここで接続する。
+- **完了条件:** 応答の遅いnodeを待つ前に他nodeへ要求が届く。
+  down/busy/旧protocol/ID不一致を除外せず集計し、対象0件を成功としない。
+  1台の失敗で他台の収集を打ち切らず、全node分の結果と旧/新IDを返す。
+  操作中のclient切断・node timeout後も二重再起動せず、遅延応答で現在状態を巻き戻さない。
+- **検証方法:** 応答順を制御できる複数受付fixtureで、全成功・混在結果・部分送信後の切断・
+  timeout・operation再照会を試す。件数の整合、未送信と送信後不明の区別、socket/task回収を確認する。
+  成否不明nodeにmonitorの旧idleを到着させ、配送除外が解除されないことも検証する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — 一斉command・node結果・期限・除外解除・logの仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 14: 一斉再起動の公開APIとCLIを用意する
+
+- **目的:** 先生がconductorへの1回の指示で全nodeを操作し、内訳まで確認できるようにする。
+- **対象:** `syncopadeClient.jl`、`src/Syncopade.jl`、`scripts/restart_conductor_servers.jl`、
+  `test/unit_conductor_restart_protocol.jl`、`test/integration_restart_all_cli.jl`（後3件は新規）、このTodo。
+- **方針:** 一斉操作開始・operation状態照会・完了待ちを公開APIにする。
+  CLIは操作IDと対象conductorを表示し、node別結果と合計を返す。
+- **完了条件:** 全成功、開始拒否、部分失敗、操作継続中、記録不明を区別する。
+  CLIは対象0件・失敗・成否不明で成功exitを返さない。
+  接続断後は同じoperation IDを照会し、新しい一斉再起動を黙って発行しない。
+  既存の単体再起動APIとCLIはそのまま利用できる。
+- **検証方法:** parserでnode件数・重複endpoint・欠落ID・不正集計を検証し、
+  loopback CLIで全成功と部分失敗の表示・exit code、操作IDによる結果回収を確認する。
+- [ ] Phase 1 — 実装方針・メモ
+- [ ] Phase 2 — 公開API・結果型・CLI・終了codeの仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 15: package更新反映を公開経路で確認する
+
+- **目的:** 今回の目的が受付を落とさず達成されたことを証明する。
+- **対象:** `test/regression_package_reload_boundary.jl`、`test/fixtures/package_reload/`、
+  `test/integration_restart_package_reload.jl`（新規）、このTodo。
+- **方針:** Step 1と同じfixtureを実受付・子・公開API経由で実行する。
+- **完了条件:** V1実行→V2へ変更/配置先切替→CACHE_CLEARではV1→子再起動後にV2、を確認する。
+  全期間でlistener ID・受付PID・公開portは一定。通常task間では子を再利用し、再起動時だけ交換する。
+- **検証方法:** 各段階のmarker、実際のpackage読込path、listener/server ID、PID、cache件数を照合する。
+  複数taskでも新子を再利用することを確認する。通常設定とprecompile無効条件を独立processで検証する。
+- [ ] Phase 1 — 試験方針・メモ
+- [ ] Phase 2 — 観測項目・成功判定・副作用の仕様
+- [ ] Phase 3 — 試験実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 16: conductor・複数node・一斉操作の接続を確認する
+
+- **目的:** process分離・交換後も既存のqueue、排他、終端通知を保つ。
+- **対象:** `test/integration_conductor_executor_restart.jl`（新規）、
+  `test/integration_conductor_restart_all.jl`（新規）、
+  `test/fixtures/conductor_controlled_worker.jl`、既存conductor regression試験、このTodo。
+- **方針:** 単体再起動はloopback上の1受付・1子・1conductor、
+  一斉再起動は2受付・2子・1conductorを使い、試験process内だけでnode一覧を固定する。
+  実機profileや本番conductorは使わない。
+- **完了条件:** 単体再起動中のBUSYでtaskを破棄せずretryを消費しない。
+  新子のready後に4件のtaskが各1回実行され、task/job IDとcallback・DONE・terminalが対応する。
+  子異常終了時も受理済みtaskの失敗がconductorと投入元へ伝わる。
+  一斉操作で2受付のID・PID・公開portを保ち、2子のIDが変わり、両nodeで新版markerを取得できる。
+  操作中のSUBMITは未受付として拒否され、全体成功後の新規batchは正常に完了する。
+- **検証方法:** 状態遷移を待機点で固定して通常完了、BUSY待機、子消失を別caseで確認する。
+  最大同時実行1、重複実行なし、遅延通知で別jobを解放しないことを検証する。
+  一斉操作は1台の旧子を待機点で止めて並行指示を確認し、両台の更新後に軽量taskを投入する。
+  接続不能な第3endpointを加える部分失敗caseでも、2台の成功と1台の失敗を漏れなく返すことを確認する。
+  Steps 12〜14で定義した範囲を超える製品仕様変更が必要なら、Todo全体を見直す。
+- [ ] Phase 1 — 試験方針・メモ
+- [ ] Phase 2 — fixture・投入・結果照合の仕様
+- [ ] Phase 3 — 試験実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 17: wrapper起動と終了を確認する
+
+- **目的:** 過去の「run_serverがすぐ終了する」回帰を防ぎ、子も回収する。
+- **対象:** `scripts/run_server.jl`、`syncopadeServer.jl`、
+  `test/integration_server_wrapper_entrypoint.jl`、`test/integration_listener_shutdown.jl`（新規）、このTodo。
+- **方針:** 直接起動・wrapper起動・include-onlyの3つを区別する。
+- **完了条件:** 直接/wrapper起動は受付と子が存続し、include-onlyでは起動しない。
+  idle時とbusy時のq/EOF/通常割込みが定義した終了順序に従う。
+  通常終了後は所有する子とsocketが残らない。
+- **検証方法:** 起動commandを実processで試し、q・EOF・通常割込み後のexit codeとprocess回収を確認。
+  busy時は制御可能な軽量fixtureを使う。受付の異常終了時は、子がidleの場合の接続切断終了も確認する。
+  実行中の任意コード・孫processを含む強制回収まで検証したと主張しない。
+- [ ] Phase 1 — 実装・試験方針とメモ
+- [ ] Phase 2 — entrypoint・終了処理・resource回収の仕様
+- [ ] Phase 3 — 実装
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## Step 18: 全体回帰と運用文書を整える
+
+- **目的:** 再起動機能の使い方と保証範囲を文書化し、既存機能と合わせて検証する。
+- **対象:** `test/runtests.jl`、`docs/TESTING.md`、`docs/EXECUTOR_RESTART.md`（新規）、このTodo。
+- **方針:** 外部LAN不要の新規試験を独立Julia子process単位でsuiteに登録する。
+  期待する子の例外はfixture内で検証・回収し、suiteのstderr検査を丸ごと緩めない。
+- **完了条件:** 既存回帰と新規suiteがexit 0。
+  単体/一斉操作例、対象profile、IDの寿命、通常cache clearとの差、busy拒否、
+  一斉操作中の投入制限、部分失敗、operation照会、batch切替手順が記載される。
+  単一process内packageを刷新した試験と、実MDO最適化の未実施範囲を区別する。
+- **検証方法:** `julia --startup-file=no --project=. --threads=4 test/runtests.jl`、
+  `git diff --check`、文書リンク・公開APIの照合、既存log差分の保全、残留process/port確認。
+  合計件数は実測し、過去の654件を今回の結果として転記しない。
+- [ ] Phase 1 — 統合・文書方針とメモ
+- [ ] Phase 2 — suite登録・文書構成・最終判定の仕様
+- [ ] Phase 3 — 実装・文書整理
+- [ ] Phase 4 — 検証・結果・commit/push
+
+## 相互確認の要点
+
+1. 受付を常駐させ、同じ計算Juliaを通常task間で使い回す。
+2. 2つの起動IDで受付と計算子を識別する。物理node IDや複数版管理は追加しない。
+3. batchの切れ目で単体指定または全node一斉指示を行う。計算中の強制再起動はしない。
+4. 公開のtask/result protocolを保ち、計算子の起動IDは管理用API・専用通信・logで扱う。
+5. 一斉操作は設定された全nodeを対象に、並行して要求し、node別の成否とIDを集計する。
+   1台でも失敗・成否不明があれば全体成功とせず、次batch開始前に対処する。
+6. 完了判定はlocalの複数process試験まで。本番nodeへの展開・version/tagは別作業とする。
+
+2026-09-16「じゃあ強化cで！」により相互確認完了。Step 1 Phase 1から順に進める。
