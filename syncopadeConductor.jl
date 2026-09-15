@@ -29,6 +29,20 @@ end
 const conductor_mutation_lock = ReentrantLock()
 const conductor_mutation_owner = Ref{Union{Nothing,Tuple{Symbol,String}}}(nothing)
 const conductor_restart_operations = Dict{String,ConductorRestartOperation}()
+const conductor_restart_tasks = Dict{String,Task}()
+
+struct RestartQuarantine
+    operation_id::String
+    listener_id::String
+    server_id::String
+end
+const restart_quarantine = Dict{Tuple{String,Int},RestartQuarantine}()
+
+function node_restart_quarantine(node::NODES)
+    lock(node_states_lock) do
+        return get(restart_quarantine, (node.IP, node.port), nothing)
+    end
+end
 
 conductor_submissions_paused_unlocked() = conductor_mutation_owner[] !== nothing && conductor_mutation_owner[][1] == :restart
 conductor_submissions_paused() = lock(conductor_submissions_paused_unlocked, conductor_mutation_lock)
@@ -132,6 +146,139 @@ function with_conductor_cache_operation(action::Function)
     finally
         finish_conductor_mutation!(owner)
     end
+end
+
+function restart_control_timeout(name::String, default::Float64)
+    value = tryparse(Float64, get(ENV, name, string(default)))
+    value !== nothing && isfinite(value) && value > 0 || throw(ArgumentError("$name must be positive finite seconds"))
+    return value
+end
+
+function restart_one_node(node::NODES; query_timeout::Real, restart_timeout::Real)
+    before = try
+        query_server_runtime(node.IP; server_port=node.port, timeout=query_timeout)
+    catch error
+        status = error isa ServerManagementProtocolError ? :unsupported : :transport_error
+        return ServerRestartResult(status, "", "", nothing, sprint(showerror, error), false)
+    end
+    try
+        return restart_server_executor(node.IP; server_port=node.port,
+            expected_listener_id=before.listener_id, expected_server_id=before.server_id, timeout=restart_timeout)
+    catch error
+        return ServerRestartResult(:unknown, before.listener_id, before.server_id, nothing, sprint(showerror, error), true)
+    end
+end
+
+function record_restart_node_result!(operation_id::String, node::NODES, result::ServerRestartResult)::Bool
+    recorded = lock(conductor_mutation_lock) do
+        conductor_mutation_owner[] == (:restart, operation_id) || return false
+        operation = conductor_restart_operations[operation_id]
+        key = (node.IP, node.port)
+        operation.status == :running && !haskey(operation.results, key) || return false
+        any(target -> (target.IP, target.port) == key, operation.targets) || return false
+        operation.results[key] = result
+        lock(node_states_lock) do
+            current = get(node_states, key, default_node_runtime_state())
+            state = NODE_DOWN
+            if restart_result_succeeded(result)
+                delete!(restart_quarantine, key)
+                state = result.runtime.state == :idle ? NODE_IDLE : NODE_BUSY
+            elseif result.status == :unknown && result.request_sent
+                restart_quarantine[key] = RestartQuarantine(operation_id, result.old_listener_id, result.old_server_id)
+            elseif result.status == :busy
+                state = NODE_BUSY
+            end
+            if isempty(current.task_id) && isempty(current.job_id)
+                node_states[key] = NodeRuntimeState(state, current.generation + UInt64(1), "", "")
+            end
+        end
+        return true
+    end
+    if recorded
+        new_ids = result.runtime === nothing ? "unconfirmed" : "$(result.runtime.listener_id)/$(result.runtime.server_id)"
+        log_conductor_event("RESTART_NODE_RESULT"; node_name=node.name, node_ip=node.IP, node_port=node.port,
+            status=string(result.status), error="operation_id=$operation_id old=$(result.old_listener_id)/$(result.old_server_id) new=$new_ids reason=$(result.reason)")
+    end
+    return recorded
+end
+
+function collect_conductor_restart!(operation_id::String; query_timeout::Real, restart_timeout::Real)
+    snapshot = get_restart_operation(operation_id)
+    snapshot === nothing && return nothing
+    workers = [@async restart_one_node(node; query_timeout, restart_timeout) for node in snapshot.targets]
+    results = Dict{Tuple{String,Int},ServerRestartResult}()
+    for (node, worker) in zip(snapshot.targets, workers)
+        result = try
+            fetch(worker)
+        catch error
+            ServerRestartResult(:unknown, "", "", nothing, sprint(showerror, error), true)
+        end
+        results[(node.IP, node.port)] = result
+        record_restart_node_result!(operation_id, node, result)
+    end
+    finish_restart_operation!(operation_id, results)
+    final = get_restart_operation(operation_id)
+    log_conductor_event("RESTART_ALL_COMPLETE"; status=string(final.summary.overall_success),
+        error="operation_id=$operation_id total=$(final.summary.total_nodes) success=$(final.summary.success_nodes) failed=$(final.summary.failed_nodes)")
+    return final
+end
+
+function start_conductor_restart!(operation_id::String, nodes::Vector{NODES};
+    query_timeout::Real=restart_control_timeout("SYNCOPADE_RESTART_QUERY_TIMEOUT", 5.0),
+    restart_timeout::Real=restart_control_timeout("SYNCOPADE_RESTART_TIMEOUT", 60.0))
+    all(value -> isfinite(value) && value > 0, (query_timeout, restart_timeout)) || throw(ArgumentError("restart control timeouts must be positive"))
+    started = begin_restart_operation!(operation_id, nodes)
+    if started.status == :accepted
+        task = @async collect_conductor_restart!(operation_id; query_timeout, restart_timeout)
+        lock(conductor_mutation_lock) do
+            conductor_restart_tasks[operation_id] = task
+        end
+        log_conductor_event("RESTART_ALL_ACCEPTED"; status=string(length(started.operation.targets)), error="operation_id=$operation_id")
+    end
+    return started
+end
+
+function reconcile_restart_quarantine!(node::NODES; timeout::Real=5.0)::Bool
+    expected = node_restart_quarantine(node)
+    expected === nothing && return true
+    info = try
+        query_server_runtime(node.IP; server_port=node.port, timeout)
+    catch
+        return false
+    end
+    info.ready && info.listener_id == expected.listener_id && info.server_id != expected.server_id || return false
+    reconciled = lock(node_states_lock) do
+        key = (node.IP, node.port)
+        get(restart_quarantine, key, nothing) === expected || return false
+        current = get(node_states, key, default_node_runtime_state())
+        isempty(current.task_id) && isempty(current.job_id) || return false
+        delete!(restart_quarantine, key)
+        node_states[key] = NodeRuntimeState(info.state == :idle ? NODE_IDLE : NODE_BUSY, current.generation + UInt64(1), "", "")
+        return true
+    end
+    reconciled && log_conductor_event("RESTART_NODE_RECONCILED"; node_name=node.name, node_ip=node.IP, node_port=node.port,
+        status="ready", error="operation_id=$(expected.operation_id) listener_id=$(info.listener_id) old_server_id=$(expected.server_id) new_server_id=$(info.server_id)")
+    return reconciled
+end
+
+function restart_operation_response(operation_id::String; busy=false)
+    busy && return management_response(["RESTART_ALL", "1", operation_id, "busy"])
+    operation = get_restart_operation(operation_id)
+    operation === nothing && return management_response(["RESTART_ALL", "1", operation_id, "unknown"])
+    if operation.status == :running
+        return management_response(["RESTART_ALL", "1", operation_id, "running", string(length(operation.targets)), string(length(operation.results))])
+    end
+    summary = operation.summary
+    fields = ["RESTART_ALL", "1", operation_id, "complete", string(summary.total_nodes), string(summary.success_nodes),
+        string(summary.failed_nodes), string(summary.overall_success)]
+    for node in operation.targets
+        result = operation.results[(node.IP, node.port)]
+        append!(fields, [node.IP, string(node.port), node.name, string(result.status), result.old_listener_id,
+            result.old_server_id, string(result.request_sent), string(result.runtime !== nothing)])
+        append!(fields, management_runtime_fields(result.runtime))
+        push!(fields, result.reason)
+    end
+    return management_response(fields)
 end
 
 struct ConductorTask
@@ -1437,7 +1584,7 @@ function apply_observed_node_state!(
         key = (node.IP, node.port)
         current = get(node_states, key, default_node_runtime_state())
         prev_state = current.state
-        if current.generation == expected_generation && isempty(current.task_id)
+        if current.generation == expected_generation && isempty(current.task_id) && !haskey(restart_quarantine, key)
             node_states[key] = NodeRuntimeState(
                 state,
                 current.generation + UInt64(1),
@@ -1465,7 +1612,7 @@ function try_reserve_node_unlocked!(node::NODES, task_id::String)::Bool
     lock(node_states_lock) do
         key = (node.IP, node.port)
         current = get(node_states, key, default_node_runtime_state())
-        if current.state == NODE_IDLE && isempty(current.task_id) && isempty(current.job_id)
+        if current.state == NODE_IDLE && isempty(current.task_id) && isempty(current.job_id) && !haskey(restart_quarantine, key)
             node_states[key] = NodeRuntimeState(
                 NODE_RESERVED,
                 current.generation + UInt64(1),
@@ -1556,6 +1703,7 @@ function probe_node_observation(
     node::NODES;
     timeout=DEFAULT_STATUS_TIMEOUT
 )::NodeObservation
+    node_restart_quarantine(node) === nothing || reconcile_restart_quarantine!(node; timeout)
     snapshot = get_node_runtime_state(node)
     state = try
         probe_node(node; timeout=timeout)
@@ -1619,7 +1767,7 @@ end
 
 function pick_idle_node_right_to_left(nodes::Vector{NODES})::Union{Nothing,NODES}
     for node in reverse(nodes)
-        if get_node_state(node) == NODE_IDLE
+        if get_node_state(node) == NODE_IDLE && node_restart_quarantine(node) === nothing
             return node
         end
     end
@@ -1646,7 +1794,7 @@ function reserve_idle_node_right_to_left_unlocked!(
         for node in reverse(nodes)
             key = (node.IP, node.port)
             current = get(node_states, key, default_node_runtime_state())
-            if current.state == NODE_IDLE && isempty(current.task_id) && isempty(current.job_id)
+            if current.state == NODE_IDLE && isempty(current.task_id) && isempty(current.job_id) && !haskey(restart_quarantine, key)
                 node_states[key] = NodeRuntimeState(
                     NODE_RESERVED,
                     current.generation + UInt64(1),
@@ -1687,6 +1835,7 @@ function idle_node_endpoints()::Vector{String}
         endpoints = String[]
         for ((ip, port), runtime_state) in node_states
             runtime_state.state == NODE_IDLE || continue
+            haskey(restart_quarantine, (ip, port)) && continue
             push!(endpoints, string(ip, ":", port))
         end
         return endpoints
@@ -2265,6 +2414,16 @@ function conductor_server()
                             "|"
                         )
                         println(sock, add_checksum(resp_payload))
+                    elseif cmd == "RESTART_ALL" || cmd == "RESTART_ALL_STATUS"
+                        length(parts) == 3 && parts[2] == "1" && valid_management_uuid(parts[3]) ||
+                            throw(ArgumentError("invalid restart operation command"))
+                        operation_id = String(parts[3])
+                        busy = false
+                        if cmd == "RESTART_ALL"
+                            started = start_conductor_restart!(operation_id, geneAvailableNodeList())
+                            busy = started.status == :busy
+                        end
+                        println(sock, restart_operation_response(operation_id; busy))
                     else
                         println(sock, add_checksum("ERROR|UNKNOWN_COMMAND"))
                     end

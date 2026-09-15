@@ -635,10 +635,36 @@ client / conductor
 - **検証方法:** 応答順を制御できる複数受付fixtureで、全成功・混在結果・部分送信後の切断・
   timeout・operation再照会を試す。件数の整合、未送信と送信後不明の区別、socket/task回収を確認する。
   成否不明nodeにmonitorの旧idleを到着させ、配送除外が解除されないことも検証する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — 一斉command・node結果・期限・除外解除・logの仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - 受理した対象全件の照会/再起動を独立taskで並行開始し、各通信期限で回収する。
+    caller接続から独立した収集taskを操作IDに紐付け、再送では追加送信しない。
+    送信後unknownだけはnode lockで配送除外を記録し、旧STATUS idleの観測では解除しない。
+    monitorからの起動ID照会で同じ受付の新子readyを確認したときだけ除外を解除する。
+- [x] Phase 2 — 一斉command・node結果・期限・除外解除・logの仕様
+  - `start_conductor_restart!(id, nodes; query_timeout=5, restart_timeout=60)`が受理時だけ収集taskを作る。
+    `collect_conductor_restart!`は全対象を先に並行開始し、各結果を記録後にfinishする。
+    query失敗はunsupported/transport_error、再起動は単体APIのstatus。予期しない送信後例外はunknown。
+    `SYNCOPADE_RESTART_QUERY_TIMEOUT/RESTART_TIMEOUT`で制御期限を変更でき、計算期限とは別。
+  - public要求は`RESTART_ALL|1|operation_id`、照会は`RESTART_ALL_STATUS|1|operation_id`。
+    応答はchecksum/percent escape付き`RESTART_ALL|1|id|busy/unknown`、
+    または`...|running|target_count|completed_count`、確定時は`...|complete|total|success|failed|overall_success`。
+    確定応答には対象順に17 field（IP/port/name/status/旧2 ID/request_sent/runtime有無/現在runtime8 field/reason）を続ける。
+  - `record_restart_node_result!`は現在操作の未記録endpointだけ更新する。
+    unknown送信済みnodeは旧2 IDと操作IDをnode lock下で記録し、state down・generation更新。
+    観測適用/予約/LISTで除外を守る。`reconcile_restart_quarantine!`はlock外照会後、
+    同じ除外記録・受付ID一致・server ID変更・readyを再照合して解除する。旧idle/別受付では解除しない。
+  - 監査は既存CSV列のevent/status/errorを使い、操作IDと旧新IDを記録する。確定履歴は後から書き換えない。
+    応答順を制御するloopback fixtureで並行送信、全成功/混在/0対象、通信切断、timeout、遅延/旧idleを検証する。
+- [x] Phase 3 — 実装
+  - 全対象の並行照会/再起動、操作別収集、public開始/照会command、既存CSV監査を接続。
+    unknown nodeの配送除外と起動ID照会による解除を追加。既存generationは維持した。
+    controlled fixtureで送信順と応答喪失を固定する試験を追加。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/regression_conductor_restart_all.jl`: exit 0、22+54+5=81/81。
+    遅延node待機中に別nodeへ送信済み、同IDで追加送信なし。8対象は成功1/失敗7（busy/旧protocol/ID違い/
+    起動失敗/timeout/応答切断/接続不能）。各socket/taskとfixture portを回収した。
+    unknown→旧idle拒否/別listener拒否→同listener新server readyで解除。確定履歴は変更なし。
+    操作状態101/101、既存node状態55/55、dispatch29/29もexit 0。diff成功。対象のみcommit/push。
 
 ## Step 14: 一斉再起動の公開APIとCLIを用意する
 

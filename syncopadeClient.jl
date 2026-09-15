@@ -48,6 +48,12 @@ function decode_management_field(value::AbstractString)::String
     return replace(String(value), "%7C" => "|", "%0A" => "\n", "%0D" => "\r", "%25" => "%")
 end
 
+encode_management_field(value::AbstractString) = replace(String(value), "%" => "%25", "|" => "%7C", "\n" => "%0A", "\r" => "%0D")
+management_response(fields::Vector{String}) = add_checksum(join(encode_management_field.(fields), '|'))
+management_runtime_fields(info::ServerRuntimeInfo) = [info.listener_id, info.server_id, string(info.state),
+    string(info.listener_pid), string(info.server_pid), info.julia_version, info.syncopade_version, string(info.ready)]
+management_runtime_fields(::Nothing) = fill("", 8)
+
 function parse_management_fields(row::String)
     valid, payload = verify_checksum(row)
     valid || throw(ServerManagementProtocolError("invalid management checksum or unsupported server"))
