@@ -217,10 +217,26 @@ client / conductor
 - **検証方法:** 旧/新marker、module同一性、process IDをassertする。
   `--compiled-modules=no`でも再現することを確かめ、ディスク上のprecompile cacheと切り分ける。
   各条件を別子processで実行し、exit 0とfixture以外への書込みなしを確認する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — fixture・観測・入出力・副作用の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - 既存serverをincludeする独立Juliaでtaskのみ・同一路径package更新・配置先切替を別々に実行する。
+    packageは固定UUIDのローカルfixtureをLOAD_PATHから読む。Pkg操作・外部取得を使わない。
+    task moduleの置換警告は試験内で捕捉し、実際に置換されたことと依存module再利用を別々にassertする。
+- [x] Phase 2 — fixture・観測・入出力・副作用の仕様
+  - `reload_call(path, module_name)`は既存call_funcを呼び、置換警告だけを一時stderrへ捕捉して戻り値を返す。
+    package taskの戻り値はmarker、PID、package読込path。`loaded_module`で現在のtask/dependencyを観測する。
+  - 親試験は3条件を別processで実行しexit 0を検査。各子はmktempdir内へfixtureをcopyし、
+    task-onlyは関数cache保持→clear→新版、package条件はclear後旧値・新Julia新版をassertする。
+    fresh起動も`--compiled-modules=no`、本repo Projectを用い、PIDが異なることを検査する。
+    一時ファイル・LOAD_PATH変更は試験process内だけ。製品ファイルやregistryへの書込みはしない。
+- [x] Phase 3 — 実装
+  - 固定UUIDのV1/V2 fixtureと独立process回帰試験を追加。製品コードは未変更。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/regression_package_reload_boundary.jl`: exit 0。
+    task 9/9、overwrite 13/13、switch 14/14、親process検査3/3。stderrなし。
+    overwrite PID 51964→51967、switch 51968→51969、いずれも旧process V1・新process V2。
+    各processは同期wait済み、一時fixtureは自動回収。`git diff --check`成功、既存log SHA-256不変。
+    初回試験も成功したが子stdoutを表示しない呼出しだったため、観測を表示する形で再実行した。
+    このStepの対象のみcommit/pushする（commitはこの記録を含むGit履歴で追跡）。
 
 ## Step 2: task読込み・実行処理を切り出す
 
