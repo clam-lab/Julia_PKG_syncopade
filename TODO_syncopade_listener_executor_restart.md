@@ -559,10 +559,28 @@ client / conductor
   旧serverが新commandを扱えない場合も明示的に失敗する。
 - **検証方法:** parser試験とloopback実CLI試験。
   応答timeout後の照会、空/不正ID、未知protocol、失敗時exit code、package export/docstringを確認する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — API名・引数・戻り値・CLI・終了codeの仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - clientは管理応答を厳格にparseし、正常終了・拒否・通信後の成否不明を分ける。
+    APIは期待IDを必須とし、CLIだけが照会→要求の順を構成する。自動再送はしない。
+    socketはタイマーで期限を設け、timeout時にcloseして通信taskを残さない。
+- [x] Phase 2 — API名・引数・戻り値・CLI・終了codeの仕様
+  - `query_server_runtime(ip; server_port, timeout=5)`→ServerRuntimeInfo。
+    `restart_server_executor(ip; server_port, expected_listener_id, expected_server_id, timeout=60)`→ServerRestartResult。
+    戻り値はstatus/旧ID/runtimeまたはnothing/reason/request_sent。送信前通信失敗はtransport_error、
+    送信開始後のtimeout/不正応答はunknown。自動再送なし。照会の通信/形式失敗は専用例外。
+  - parserはchecksum・版・field数・UUID・状態・PID・ready・成功時のID交換を検査。
+    percent escapeは4種だけdecodeする。宛先は明示IP+port、timeoutは正の有限秒。
+  - CLI `julia --project=. scripts/restart_server.jl IP PORT [--timeout SECONDS]`。
+    終了codeはsuccess=0、明示拒否/停止起動失敗=2、通信/unknown/未対応=3、引数誤り=64。
+    照会後の期待IDで1回だけ要求し、宛先と旧/新ID・状態・理由をstdoutへ表示する。
+- [x] Phase 3 — 実装
+  - 公開型/API/export/docstringと単体CLIを追加。厳格parserと実CLI/timeout/旧protocol試験を追加。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/unit_server_management_protocol.jl`: exit 0、30/30。
+    `test/integration_restart_cli.jl`: exit 0、21+20=41/41。実CLIの0/2/3/64、旧protocol拒否、
+    送信後timeout→同じ受付への照会→交換完了確認、socket切断・再送なしを確認。
+    `test/unit_client_protocol.jl`: exit 0、63/63。package entrypointをincludeして公開exportを検査し、
+    試験起動時のpackage precompile表示に依存しない形にした。diff成功。対象のみcommit/push。
 
 ## Step 12: 一斉操作と投入・配送を排他にする
 

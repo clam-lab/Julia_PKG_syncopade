@@ -1,6 +1,160 @@
 using Sockets
 using UUIDs
 
+"""Identity and readiness of a listener and its current executor; not a package revision guarantee."""
+struct ServerRuntimeInfo
+    listener_id::String
+    server_id::String
+    state::Symbol
+    listener_pid::Int
+    server_pid::Int
+    julia_version::String
+    syncopade_version::String
+    ready::Bool
+end
+
+"""Explicit restart outcome. `unknown` must be reconciled by querying, never blindly retried."""
+struct ServerRestartResult
+    status::Symbol
+    old_listener_id::String
+    old_server_id::String
+    runtime::Union{Nothing,ServerRuntimeInfo}
+    reason::String
+    request_sent::Bool
+end
+
+struct ServerManagementProtocolError <: Exception
+    message::String
+end
+Base.showerror(io::IO, error::ServerManagementProtocolError) = print(io, error.message)
+
+struct ServerManagementTransportError <: Exception
+    message::String
+    request_sent::Bool
+end
+Base.showerror(io::IO, error::ServerManagementTransportError) = print(io, error.message)
+
+function valid_management_uuid(value::AbstractString)::Bool
+    try
+        return string(UUID(value)) == value
+    catch
+        return false
+    end
+end
+
+function decode_management_field(value::AbstractString)::String
+    # Only these four characters are escaped by protocol version 1.
+    occursin(r"%(?!25|7C|0A|0D)", value) && throw(ServerManagementProtocolError("invalid management escape"))
+    return replace(String(value), "%7C" => "|", "%0A" => "\n", "%0D" => "\r", "%25" => "%")
+end
+
+function parse_management_fields(row::String)
+    valid, payload = verify_checksum(row)
+    valid || throw(ServerManagementProtocolError("invalid management checksum or unsupported server"))
+    return decode_management_field.(split(payload, '|'))
+end
+
+function parse_runtime_fields(fields::Vector{String})::ServerRuntimeInfo
+    length(fields) == 8 || throw(ServerManagementProtocolError("invalid runtime field count"))
+    all(valid_management_uuid, fields[1:2]) || throw(ServerManagementProtocolError("invalid runtime identity"))
+    state = Symbol(fields[3])
+    state in (:starting, :idle, :busy, :restarting, :unavailable, :stopping) || throw(ServerManagementProtocolError("unknown runtime state"))
+    listener_pid, server_pid = tryparse.(Int, fields[4:5])
+    listener_pid !== nothing && listener_pid > 0 && server_pid !== nothing && server_pid >= 0 ||
+        throw(ServerManagementProtocolError("invalid runtime PID"))
+    fields[8] in ("true", "false") || throw(ServerManagementProtocolError("invalid runtime ready flag"))
+    ready = fields[8] == "true"
+    if ready
+        state in (:idle, :busy) && server_pid > 0 && !isempty(fields[6]) && !isempty(fields[7]) ||
+            throw(ServerManagementProtocolError("inconsistent runtime readiness"))
+    end
+    return ServerRuntimeInfo(fields[1], fields[2], state, listener_pid, server_pid, fields[6], fields[7], ready)
+end
+
+function parse_server_runtime_response(row::String)::ServerRuntimeInfo
+    fields = parse_management_fields(row)
+    length(fields) == 10 && fields[1:2] == ["RUNTIME", "1"] || throw(ServerManagementProtocolError("unsupported runtime response"))
+    return parse_runtime_fields(fields[3:end])
+end
+
+function parse_server_restart_response(row::String, expected_listener_id::String, expected_server_id::String)::ServerRestartResult
+    fields = parse_management_fields(row)
+    length(fields) == 14 && fields[1:2] == ["RESTART", "1"] || throw(ServerManagementProtocolError("unsupported restart response"))
+    status = Symbol(fields[3])
+    status in (:success, :busy, :id_mismatch, :stop_failed, :startup_failed) || throw(ServerManagementProtocolError("unknown restart status"))
+    fields[4:5] == [expected_listener_id, expected_server_id] || throw(ServerManagementProtocolError("restart response request mismatch"))
+    info = parse_runtime_fields(fields[6:13])
+    if status == :success
+        info.listener_id == expected_listener_id && info.server_id != expected_server_id && info.ready ||
+            throw(ServerManagementProtocolError("restart success without confirmed replacement"))
+    end
+    return ServerRestartResult(status, fields[4], fields[5], info, fields[14], true)
+end
+
+function management_request(ip::AbstractString, port::Integer, payload::String; timeout::Real)
+    0 < port <= 65535 || throw(ArgumentError("port must be in 1:65535"))
+    isfinite(timeout) && timeout > 0 || throw(ArgumentError("timeout must be positive finite seconds"))
+    address = parse(IPAddr, ip)
+    socket = TCPSocket()
+    sent = false
+    expired = Ref(false)
+    timer = Timer(Float64(timeout)) do _
+        expired[] = true
+        close(socket)
+    end
+    try
+        connect(socket, address, port)
+        # A partial write may already be visible remotely; never promise non-execution.
+        sent = true
+        println(socket, add_checksum(payload))
+        row = readline(socket)
+        isempty(row) && throw(EOFError())
+        return row
+    catch error
+        message = expired[] ? "management request timed out" : sprint(showerror, error)
+        throw(ServerManagementTransportError(message, sent))
+    finally
+        close(timer)
+        close(socket)
+    end
+end
+
+"""
+    query_server_runtime(ip; server_port, timeout=5)
+
+Read listener/executor boot IDs and readiness at an explicit endpoint. Never changes a server.
+Throws `ServerManagementTransportError` or `ServerManagementProtocolError` on failure.
+"""
+function query_server_runtime(ip::AbstractString; server_port::Integer, timeout::Real=5.0)::ServerRuntimeInfo
+    return parse_server_runtime_response(management_request(ip, server_port, "RUNTIME"; timeout))
+end
+
+"""
+    restart_server_executor(ip; server_port, expected_listener_id, expected_server_id, timeout=60)
+
+Request exactly one idle executor replacement using previously queried boot IDs.
+`success` confirms replacement, `busy`/`id_mismatch` reject it, and `unknown` means a
+request may have executed. Query runtime after an unknown outcome; do not auto-resend.
+This does not deploy or validate application package versions.
+"""
+function restart_server_executor(ip::AbstractString; server_port::Integer,
+    expected_listener_id::AbstractString, expected_server_id::AbstractString, timeout::Real=60.0)::ServerRestartResult
+    listener_id, server_id = String(expected_listener_id), String(expected_server_id)
+    valid_management_uuid(listener_id) && valid_management_uuid(server_id) || throw(ArgumentError("expected IDs must be canonical UUIDs"))
+    row = try
+        management_request(ip, server_port, "RESTART|1|$listener_id|$server_id"; timeout)
+    catch error
+        error isa ServerManagementTransportError || rethrow()
+        return ServerRestartResult(error.request_sent ? :unknown : :transport_error, listener_id, server_id, nothing, error.message, error.request_sent)
+    end
+    try
+        return parse_server_restart_response(row, listener_id, server_id)
+    catch error
+        error isa ServerManagementProtocolError || rethrow()
+        return ServerRestartResult(:unknown, listener_id, server_id, nothing, error.message, true)
+    end
+end
+
 const DEFAULT_WIRED_LAN_PREFIX = "192.168.12."
 const ACCEPTANCE_TIMEOUT_FIELD_PREFIX = "ACCEPTANCE_TIMEOUT_SECONDS="
 
