@@ -247,10 +247,22 @@ client / conductor
 - **完了条件:** path解決の候補順、String引数、戻り値、例外、cache件数とLRU挙動が変わらない。
   sourceのincludeは起動を伴わず、読込みロジックの複製がない。
 - **検証方法:** Step 1、既存server admission/result試験、cache有効/無効の小さい単体試験。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — 移動する関数と互換入口の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - cache・path・include・実行の定義をそのまま`syncopadeExecutor.jl`へ移し、serverからincludeする。
+    実行processの変更はまだ行わない。状態/公開protocol/entrypointはserverに残す。
+- [x] Phase 2 — 移動する関数と互換入口の仕様
+  - `configured_mount_root/configured_function_cache_size`、path helper、cache lookup/store/clear、
+    `load_remote_function/call_func`とその定数/lock/dictを移す。引数・戻り値・例外を変えない。
+    Mainへのinclude・invokelatestを維持。source includeは定義だけでsocket/process副作用なし。
+  - cache size 0/不正値/上限2のLRUとpath候補順を`test/unit_executor_loading.jl`で確認する。
+    fixture copy以外の書込みはなく、ENVはwithenvで復元する。
+- [x] Phase 3 — 実装
+  - 定義を移動しserverのincludeを追加。単体試験を追加。公開task実行経路は従来のまま。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/<file>.jl`でloading 31/31、
+    server admission 16/16、result protocol 43/43、Step 1（9+13+14、親3）すべてexit 0。
+    overwrite PID 52003→52004、switch 52049→52092。stderrなし。
+    diff whitespace検査成功、既存log hash不変。対象のみcommit/push。
 
 ## Step 3: 2つの起動IDと受付状態を定義する
 
