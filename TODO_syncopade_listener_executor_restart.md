@@ -273,10 +273,28 @@ client / conductor
   `idle -> busy`と`idle -> restarting`は同時成立しない。
   古い起動IDまたは不一致jobの完了通知では現在状態を変更できない。
 - **検証方法:** 遷移表、二重予約、期待ID不一致、unavailableからの明示復旧を決定的な順序で試す。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — 状態record・遷移・lock・戻り値の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - Runtimeは専用lockで状態・2起動ID・実行中jobを一体管理。予約後の通信/計算はlock外。
+    unavailableでも通知完了前のjobを残し、再起動はjob解放後だけ許す。
+    終了要求フラグはbusy jobを消さず、通知後のidle復帰を禁止する。
+- [x] Phase 2 — 状態record・遷移・lock・戻り値の仕様
+  - `ServerRuntime()`はUUID文字列2個、starting、空job、停止falseとlockを持つ。
+    `runtime_snapshot`はlock内で不変NamedTupleをcopyする。
+  - `runtime_mark_ready!`は期待ID一致かつstarting/restartingからのみidleへ。
+    `runtime_reserve_job!(runtime, job_id)`はidleからbusyへ、成功時snapshot・拒否時nothing。
+    `runtime_reserve_restart!(runtime, listener_id, server_id)`はidle/unavailableかつjobなしで
+    restartingへ移す。戻り値`:accepted/:busy/:id_mismatch`。
+  - `runtime_replace_server_id!`はrestarting・期待ID一致時だけ新UUIDを発行。
+    `runtime_finish_job!`は3 ID照合後jobを消し、busyならidle、unavailableならそのまま、停止要求時はstopping。
+    `runtime_mark_unavailable!`は旧IDを無視し、jobを保持。`runtime_request_stop!`は新予約を禁止する。
+    純粋な状態変更だけでsocket/process副作用なし。空job IDはArgumentError。
+- [x] Phase 3 — 実装
+  - Runtime本体と遷移試験を追加。実serverにはまだ接続していない。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/unit_server_runtime_state.jl`: exit 0、
+    32+10+111=153/153。task/restart競合32回は成立が常に片方だけ。
+    stale ID/jobによる変更拒否、失敗後通知待ち、停止後idle復帰禁止を確認。`git diff --check`成功。
+    process/socket起動なし。対象のみcommit/push。
 
 ## Step 4: 親子の専用通信を作る
 
