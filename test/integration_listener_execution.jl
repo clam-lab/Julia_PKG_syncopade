@@ -8,7 +8,7 @@ include(joinpath(@__DIR__, "listener_test_support.jl"))
         @test !isdefined(Main, :ListenerProbe)
         @test !any(id -> id.name == "ReloadProbe", keys(Base.loaded_modules))
         @test listener_request(handle, "STATUS") == "STATUS|idle"
-        @test listener_request(handle, "CACHE_CLEAR") == "ERROR|CACHE_CLEAR_UNAVAILABLE"
+        @test listener_request(handle, "CACHE_CLEAR") == "CACHE|CLEARED|0"
         callback = listen(ip"127.0.0.1", 0)
         conductor = listen(ip"127.0.0.1", 0)
         try

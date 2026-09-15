@@ -42,8 +42,8 @@ function wait_listener_state(handle, state; timeout=10.0)
         error("listener did not reach $state; $(runtime_snapshot(handle.supervisor.runtime))")
 end
 
-function listener_task_payload(callback, function_name, args=String[]; conductor=nothing, task_id="")
-    fixture = joinpath(@__DIR__, "fixtures", "listener_probe.jl")
+function listener_task_payload(callback, function_name, args=String[]; conductor=nothing, task_id="",
+    fixture=joinpath(@__DIR__, "fixtures", "listener_probe.jl"))
     fields = vcat(["127.0.0.1", string(getsockname(callback)[2]), "$fixture:ListenerProbe:$function_name"], args)
     if conductor !== nothing
         append!(fields, [META_TASK_ID_PREFIX * task_id, META_CONDUCTOR_IP_PREFIX * "127.0.0.1",

@@ -166,7 +166,7 @@ function handle_server_connection!(handle::ListenerHandle, socket::TCPSocket)
             println(socket, "STATUS|" * string(runtime_public_state(runtime)))
             return nothing
         elseif message == "CACHE_CLEAR"
-            println(socket, "ERROR|CACHE_CLEAR_UNAVAILABLE")
+            println(socket, clear_listener_cache!(handle))
             return nothing
         end
         job = convMSG2JOB(message)
@@ -190,6 +190,30 @@ function handle_server_connection!(handle::ListenerHandle, socket::TCPSocket)
         executor_audit(supervisor, "connection_error", runtime_snapshot(runtime); reason=sprint(showerror, error))
     end
     return nothing
+end
+
+function clear_listener_cache!(handle::ListenerHandle)
+    supervisor = handle.supervisor
+    runtime = supervisor.runtime
+    reservation = runtime_reserve_cache_clear!(runtime)
+    if reservation === nothing
+        return runtime_snapshot(runtime).state == :unavailable ? "ERROR|CACHE_CLEAR_UNAVAILABLE" : "ERROR|BUSY"
+    end
+    try
+        child = supervisor.child
+        child === nothing && throw(EOFError())
+        timeout = executor_timeout_setting("SYNCOPADE_EXECUTOR_CACHE_TIMEOUT", 5.0)
+        request = ExecutorMessage("CLEAR", reservation.listener_id, reservation.server_id, reservation.control_id, String[])
+        reply = executor_exchange(child, request, "CLEARED"; timeout)
+        executor_audit(supervisor, "cache_cleared", reservation; pid=child.pid, reason="count=$(reply.data[1])")
+        return "CACHE|CLEARED|" * reply.data[1]
+    catch error
+        runtime_mark_unavailable!(runtime, reservation.listener_id, reservation.server_id)
+        executor_audit(supervisor, "cache_failed", reservation; reason=sprint(showerror, error))
+        return "ERROR|CACHE_CLEAR_FAILED"
+    finally
+        runtime_finish_cache_clear!(runtime, reservation)
+    end
 end
 
 function execute_listener_job!(handle::ListenerHandle, job, reservation)

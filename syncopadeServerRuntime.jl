@@ -12,14 +12,15 @@ mutable struct ServerRuntime
     server_id::String
     state::Symbol
     job_id::String
+    control_id::String
     stop_requested::Bool
 end
 
-ServerRuntime() = ServerRuntime(ReentrantLock(), string(uuid4()), string(uuid4()), :starting, "", false)
+ServerRuntime() = ServerRuntime(ReentrantLock(), string(uuid4()), string(uuid4()), :starting, "", "", false)
 
 runtime_snapshot_unlocked(runtime::ServerRuntime) = (
     listener_id=runtime.listener_id, server_id=runtime.server_id,
-    state=runtime.state, job_id=runtime.job_id, stop_requested=runtime.stop_requested,
+    state=runtime.state, job_id=runtime.job_id, control_id=runtime.control_id, stop_requested=runtime.stop_requested,
 )
 runtime_snapshot(runtime::ServerRuntime) = lock(() -> runtime_snapshot_unlocked(runtime), runtime.mutex)
 runtime_ids_match(runtime, listener_id, server_id) =
@@ -30,7 +31,7 @@ function runtime_mark_ready!(runtime::ServerRuntime, listener_id::String, server
         runtime_ids_match(runtime, listener_id, server_id) || return false
         runtime.stop_requested && return false
         runtime.state in (:starting, :restarting) || return false
-        isempty(runtime.job_id) || return false
+        isempty(runtime.job_id) && isempty(runtime.control_id) || return false
         runtime.state = :idle
         return true
     end
@@ -49,7 +50,7 @@ end
 function runtime_reserve_restart!(runtime::ServerRuntime, listener_id::String, server_id::String)::Symbol
     lock(runtime.mutex) do
         runtime_ids_match(runtime, listener_id, server_id) || return :id_mismatch
-        !runtime.stop_requested && isempty(runtime.job_id) && runtime.state in (:idle, :unavailable) || return :busy
+        !runtime.stop_requested && isempty(runtime.job_id) && isempty(runtime.control_id) && runtime.state in (:idle, :unavailable) || return :busy
         runtime.state = :restarting
         return :accepted
     end
@@ -58,7 +59,7 @@ end
 function runtime_replace_server_id!(runtime::ServerRuntime, listener_id::String, server_id::String)
     lock(runtime.mutex) do
         runtime_ids_match(runtime, listener_id, server_id) || return nothing
-        runtime.state == :restarting && isempty(runtime.job_id) && !runtime.stop_requested || return nothing
+        runtime.state == :restarting && isempty(runtime.job_id) && isempty(runtime.control_id) && !runtime.stop_requested || return nothing
         runtime.server_id = string(uuid4())
         return runtime_snapshot_unlocked(runtime)
     end
@@ -100,6 +101,29 @@ function runtime_job_is_current(runtime::ServerRuntime, reservation)::Bool
     lock(runtime.mutex) do
         return runtime_ids_match(runtime, reservation.listener_id, reservation.server_id) &&
             !isempty(reservation.job_id) && runtime.job_id == reservation.job_id && runtime.state in (:busy, :unavailable)
+    end
+end
+
+function runtime_reserve_cache_clear!(runtime::ServerRuntime)
+    lock(runtime.mutex) do
+        runtime.state == :idle && !runtime.stop_requested || return nothing
+        runtime.state = :busy
+        runtime.control_id = string(uuid4())
+        return runtime_snapshot_unlocked(runtime)
+    end
+end
+
+function runtime_finish_cache_clear!(runtime::ServerRuntime, reservation)::Bool
+    lock(runtime.mutex) do
+        runtime_ids_match(runtime, reservation.listener_id, reservation.server_id) || return false
+        !isempty(reservation.control_id) && runtime.control_id == reservation.control_id || return false
+        runtime.control_id = ""
+        if runtime.stop_requested
+            runtime.state = :stopping
+        elseif runtime.state == :busy
+            runtime.state = :idle
+        end
+        return true
     end
 end
 
@@ -242,7 +266,7 @@ end
 function launch_executor!(supervisor::ExecutorSupervisor)
     lock(supervisor.lifecycle_lock) do
         snapshot = runtime_snapshot(supervisor.runtime)
-        snapshot.state in (:starting, :restarting) && !snapshot.stop_requested && isempty(snapshot.job_id) ||
+        snapshot.state in (:starting, :restarting) && !snapshot.stop_requested && isempty(snapshot.job_id) && isempty(snapshot.control_id) ||
             return (ok=false, reason=:busy, message="runtime is not awaiting startup", pid=0)
         supervisor.child === nothing || return (ok=false, reason=:child_present, message="previous child has not been reaped", pid=supervisor.child.pid)
         supervisor.pending_process === nothing || return (ok=false, reason=:child_present, message="startup child has not been reaped", pid=getpid(supervisor.pending_process))
@@ -307,7 +331,7 @@ end
 function stop_executor!(supervisor::ExecutorSupervisor)
     lock(supervisor.lifecycle_lock) do
         snapshot = runtime_snapshot(supervisor.runtime)
-        isempty(snapshot.job_id) && snapshot.state in (:starting, :restarting, :unavailable, :stopping) ||
+        isempty(snapshot.job_id) && isempty(snapshot.control_id) && snapshot.state in (:starting, :restarting, :unavailable, :stopping) ||
             return (ok=false, reason=:busy, message="runtime not reserved for shutdown", pid=0)
         child = supervisor.child
         if supervisor.pending_process !== nothing

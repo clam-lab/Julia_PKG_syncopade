@@ -488,10 +488,28 @@ client / conductor
 - **検証方法:** Step 1のtask単体更新を公開CACHE_CLEAR経由で確認する。
   busy中の制御応答・既存の1秒timeoutとの関係を試し、即時応答できる保証がないことを明示する。
   conductorのcache clear集計へ正常/失敗が正しく伝わることも確認する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — cache制御の応答・競合・timeout仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - cache消去も受付側で1枠を予約し、task/再起動と重ねない。ただしjob IDとは別の制御要求IDを使う。
+    idle時だけ子へ転送し、busy/起動中/交換中は明示拒否する。関数cacheの確認件数だけ成功応答へ使う。
+    応答待ち期限で専用接続を失った場合はunavailableに保ち、成功とは返さない。
+- [x] Phase 2 — cache制御の応答・競合・timeout仕様
+  - Runtimeへcontrol_idを追加し`runtime_reserve_cache_clear!`でidle→busy、
+    `runtime_finish_cache_clear!`で期待2 IDとcontrol IDを照合して解放する。job_idは空のまま。
+    `clear_listener_cache!`はCLEAREDを照合して件数を返し、finallyで制御予約を解放する。
+  - 公開応答は成功`CACHE|CLEARED|count`、busy`ERROR|BUSY`、子不在`ERROR|CACHE_CLEAR_UNAVAILABLE`、
+    通信/検証失敗`ERROR|CACHE_CLEAR_FAILED`。期限は`SYNCOPADE_EXECUTOR_CACHE_TIMEOUT`既定5秒。
+    既存conductorの1秒より長いので、conductor側timeoutだけでは消去未実行を意味しない。
+    busy中は待機せず拒否する。idleでもcold起動等で1秒以内を保証しない。
+  - コピーしたtaskをV1→V2へ書換え、clear前旧関数/clear後新版・同一子を確認。
+    同じ子のpackageは旧moduleのまま。既存conductor集計を試験内moduleで呼び、正常/拒否の件数を検証する。
+- [x] Phase 3 — 実装
+  - 子CLEAR転送と独立の制御予約を追加。public試験の中間未対応assertを正常応答へ更新。
+    wrapper/package変更・busy・子不在・制御timeout・既存conductor集計を試験化した。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/integration_executor_cache_clear.jl`: exit 0、11+16+21=48/48。
+    taskV1→taskV2、package V1維持、起動ID/PID不変、CLEARED件数、busy/子不在/timeout拒否を確認。
+    conductor既存集計は正常1/1・busy失敗1/1。内部logは一時directoryだけ。
+    runtime153/153、公開実行29/29もexit 0。diff検査・既存log hash不変。対象のみcommit/push。
 
 ## Step 10: 計算子だけを再起動する
 

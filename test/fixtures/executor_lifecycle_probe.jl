@@ -13,7 +13,7 @@ elseif mode == "bad_id"
     write_executor_message(socket, ExecutorMessage("READY", ARGS[2], string(uuid4()), "",
         [string(getpid()), string(VERSION), "fixture"]))
     read(socket)
-elseif mode == "ignore_stop"
+elseif mode in ("ignore_stop", "ignore_clear")
     write_executor_message(socket, ExecutorMessage("READY", ARGS[2], ARGS[3], "",
         [string(getpid()), string(VERSION), "fixture"]))
     read_executor_message(socket)
