@@ -161,6 +161,151 @@ function restart_server_executor(ip::AbstractString; server_port::Integer,
     end
 end
 
+struct ConductorRestartNodeResult
+    ip::String
+    port::Int
+    name::String
+    result::ServerRestartResult
+end
+
+"""Operation receipt. A summary exists only for a complete, fully validated result."""
+struct ConductorRestartStatus
+    operation_id::String
+    state::Symbol
+    target_count::Int
+    completed_count::Int
+    nodes::Vector{ConductorRestartNodeResult}
+    summary::Union{Nothing,NamedTuple}
+    reason::String
+end
+
+function management_nonnegative_int(value::String)
+    parsed = tryparse(Int, value)
+    parsed !== nothing && parsed >= 0 || throw(ServerManagementProtocolError("invalid management count"))
+    return parsed
+end
+
+function parse_conductor_restart_response(row::String, operation_id::String)::ConductorRestartStatus
+    fields = parse_management_fields(row)
+    length(fields) >= 4 && fields[1:3] == ["RESTART_ALL", "1", operation_id] && valid_management_uuid(operation_id) ||
+        throw(ServerManagementProtocolError("invalid restart operation header"))
+    state = Symbol(fields[4])
+    if state in (:busy, :unknown)
+        length(fields) == 4 || throw(ServerManagementProtocolError("unexpected operation fields"))
+        return ConductorRestartStatus(operation_id, state, 0, 0, ConductorRestartNodeResult[], nothing, "")
+    elseif state == :running
+        length(fields) == 6 || throw(ServerManagementProtocolError("invalid running operation fields"))
+        total, completed = management_nonnegative_int.(fields[5:6])
+        completed <= total || throw(ServerManagementProtocolError("invalid operation progress"))
+        return ConductorRestartStatus(operation_id, state, total, completed, ConductorRestartNodeResult[], nothing, "")
+    end
+    state == :complete && length(fields) >= 8 || throw(ServerManagementProtocolError("unknown operation state"))
+    total, successes, failures = management_nonnegative_int.(fields[5:7])
+    # Check available fields first, avoiding integer overflow or huge allocations from untrusted counts.
+    (length(fields) - 8) % 17 == 0 && total == (length(fields) - 8) ÷ 17 || throw(ServerManagementProtocolError("incomplete node result list"))
+    successes <= total && failures == total - successes || throw(ServerManagementProtocolError("inconsistent result totals"))
+    fields[8] in ("true", "false") || throw(ServerManagementProtocolError("invalid overall success flag"))
+    nodes = ConductorRestartNodeResult[]
+    seen = Set{Tuple{String,Int}}()
+    for index in 0:(total - 1)
+        entry = fields[(9 + 17index):(25 + 17index)]
+        address = try
+            string(parse(IPAddr, entry[1]))
+        catch
+            throw(ServerManagementProtocolError("invalid node IP"))
+        end
+        port = management_nonnegative_int(entry[2])
+        0 < port <= 65535 || throw(ServerManagementProtocolError("invalid node port"))
+        key = (address, port)
+        key in seen && throw(ServerManagementProtocolError("duplicate node endpoint"))
+        push!(seen, key)
+        status = Symbol(entry[4])
+        entry[7] in ("true", "false") && entry[8] in ("true", "false") || throw(ServerManagementProtocolError("invalid node flags"))
+        sent, has_runtime = entry[7] == "true", entry[8] == "true"
+        runtime = has_runtime ? parse_runtime_fields(entry[9:16]) : nothing
+        !has_runtime && any(!isempty, entry[9:16]) && throw(ServerManagementProtocolError("unexpected runtime data"))
+        result = if status in (:success, :busy, :id_mismatch, :stop_failed, :startup_failed)
+            sent && has_runtime && all(valid_management_uuid, entry[5:6]) || throw(ServerManagementProtocolError("missing restart identity"))
+            parse_server_restart_response(management_response(vcat(["RESTART", "1", entry[4], entry[5], entry[6]], entry[9:16], [entry[17]])), entry[5], entry[6])
+        elseif status == :unknown
+            sent && all(valid_management_uuid, entry[5:6]) || throw(ServerManagementProtocolError("unknown outcome without request identity"))
+            ServerRestartResult(status, entry[5], entry[6], runtime, entry[17], sent)
+        elseif status in (:unsupported, :transport_error)
+            !sent && !has_runtime && all(isempty, entry[5:6]) || throw(ServerManagementProtocolError("invalid pre-request failure"))
+            ServerRestartResult(status, "", "", nothing, entry[17], false)
+        else
+            throw(ServerManagementProtocolError("unknown node restart outcome"))
+        end
+        push!(nodes, ConductorRestartNodeResult(entry[1], port, entry[3], result))
+    end
+    count(node -> node.result.status == :success, nodes) == successes || throw(ServerManagementProtocolError("success count does not match node results"))
+    overall = total > 0 && successes == total
+    (fields[8] == "true") == overall || throw(ServerManagementProtocolError("incorrect overall success"))
+    summary = (total_nodes=total, success_nodes=successes, failed_nodes=failures, overall_success=overall)
+    return ConductorRestartStatus(operation_id, :complete, total, total, nodes, summary, "")
+end
+
+function unresolved_conductor_restart(operation_id::String, state::Symbol, reason::String)
+    ConductorRestartStatus(operation_id, state, 0, 0, ConductorRestartNodeResult[], nothing, reason)
+end
+
+"""
+    start_conductor_executor_restart(ip; conductor_port, operation_id=string(uuid4()), timeout=5)
+
+Start one operation over all configured nodes. Keep the returned operation ID even if
+the reply is `outcome_unknown`. Never starts a second operation to recover a lost reply.
+"""
+function start_conductor_executor_restart(ip::AbstractString; conductor_port::Integer,
+    operation_id::AbstractString=string(uuid4()), timeout::Real=5.0)::ConductorRestartStatus
+    id = String(operation_id)
+    valid_management_uuid(id) || throw(ArgumentError("operation_id must be a canonical UUID"))
+    row = try
+        management_request(ip, conductor_port, "RESTART_ALL|1|$id"; timeout)
+    catch error
+        error isa ServerManagementTransportError || rethrow()
+        return unresolved_conductor_restart(id, error.request_sent ? :outcome_unknown : :not_started, error.message)
+    end
+    try
+        return parse_conductor_restart_response(row, id)
+    catch error
+        error isa ServerManagementProtocolError || rethrow()
+        return unresolved_conductor_restart(id, :outcome_unknown, error.message)
+    end
+end
+
+"""Query a recorded operation only. `unknown` after conductor restart is not permission to reissue it."""
+function query_conductor_executor_restart(ip::AbstractString; conductor_port::Integer,
+    operation_id::AbstractString, timeout::Real=5.0)::ConductorRestartStatus
+    id = String(operation_id)
+    valid_management_uuid(id) || throw(ArgumentError("operation_id must be a canonical UUID"))
+    return parse_conductor_restart_response(management_request(ip, conductor_port, "RESTART_ALL_STATUS|1|$id"; timeout), id)
+end
+
+"""Wait by querying the same operation ID. Does not retry restart commands; timeout is not a computation limit."""
+function wait_conductor_executor_restart(ip::AbstractString; conductor_port::Integer,
+    operation_id::AbstractString, timeout::Real=90.0, request_timeout::Real=5.0, poll_interval::Real=0.1)::ConductorRestartStatus
+    all(value -> isfinite(value) && value > 0, (timeout, request_timeout, poll_interval)) || throw(ArgumentError("wait intervals must be positive finite seconds"))
+    id = String(operation_id)
+    valid_management_uuid(id) || throw(ArgumentError("operation_id must be a canonical UUID"))
+    started = time_ns()
+    elapsed() = Float64(time_ns() - started) / 1e9
+    last = unresolved_conductor_restart(id, :outcome_unknown, "no operation response received")
+    while elapsed() < timeout
+        remaining = timeout - elapsed()
+        remaining <= 0 && break
+        try
+            last = query_conductor_executor_restart(ip; conductor_port, operation_id=id, timeout=min(request_timeout, remaining))
+            last.state != :running && return last
+        catch error
+            error isa ServerManagementTransportError || error isa ServerManagementProtocolError || rethrow()
+            last = unresolved_conductor_restart(id, :outcome_unknown, sprint(showerror, error))
+        end
+        remaining = timeout - elapsed()
+        remaining > 0 && sleep(min(poll_interval, remaining))
+    end
+    return last
+end
+
 const DEFAULT_WIRED_LAN_PREFIX = "192.168.12."
 const ACCEPTANCE_TIMEOUT_FIELD_PREFIX = "ACCEPTANCE_TIMEOUT_SECONDS="
 

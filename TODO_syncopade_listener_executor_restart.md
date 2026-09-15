@@ -679,10 +679,32 @@ client / conductor
   既存の単体再起動APIとCLIはそのまま利用できる。
 - **検証方法:** parserでnode件数・重複endpoint・欠落ID・不正集計を検証し、
   loopback CLIで全成功と部分失敗の表示・exit code、操作IDによる結果回収を確認する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — 公開API・結果型・CLI・終了codeの仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - 一斉操作の開始・照会・待機を分離する。待機は同じ操作IDの照会だけを繰り返し、再開始しない。
+    runningには確定集計を付けず、completeの全node結果と集計を厳格に照合する。
+    実CLIはloopback限定の試験conductor子processとcontrolled nodeで検証する。
+- [x] Phase 2 — 公開API・結果型・CLI・終了codeの仕様
+  - 公開APIは`start_conductor_executor_restart`、`query_conductor_executor_restart`、
+    `wait_conductor_executor_restart`。IP/conductor_portを明示し、開始はoperation_idをcallerで生成（省略時client生成）。
+    照会/待機はID必須。開始後通信不明はID付きoutcome_unknown、接続前失敗はnot_startedを返す。
+    waitは既定90秒、照会期限5秒・間隔0.1秒、同じIDだけ照会し、記録unknownなら停止する。
+  - `ConductorRestartStatus`はID/state/対象数/完了数/node結果/確定summaryまたはnothing/reason。
+    `ConductorRestartNodeResult`はIP/port/name/単体結果。parserはfield数、endpoint重複、旧新ID、
+    runtime有無、件数合計、成功nodeの定義、0対象非成功を照合する。
+  - CLI `scripts/restart_conductor_servers.jl IP PORT [--operation-id UUID] [--status] [--timeout SECONDS]`。
+    --statusはID必須で照会のみ。新規開始はIDを先に表示し、応答不明でも同じIDの照会だけで回収する。
+    exitは全成功0、busy/部分失敗/0対象2、通信不明/記録unknown3、継続中4、引数誤り64。
+  - 試験conductorは子process内でIP=loopback・node一覧・log保存先だけを固定し、実機profileを使わない。
+    全成功/部分失敗CLI、同ID照会、操作中拒否、caller切断後回収を実通信で検証する。
+- [x] Phase 3 — 実装
+  - 一斉API/公開型/export/CLIと厳格parserを追加。local conductor専用子process fixtureを追加し、
+    実CLI、同操作IDの照会、caller切断、操作中SUBMIT/CACHE拒否を試験化した。
+- [x] Phase 4 — 検証・結果・commit/push
+  - bulk parser30/30、実CLI18+22+6=46/46、単体管理parser30/30、既存client63/63すべてexit 0。
+    コマンドはいずれも`julia --startup-file=no --project=. --threads=4 test/<file>.jl`。
+    実conductor接続を切った後も同IDで結果回収、操作中SUBMIT/CACHE拒否、全成功/部分失敗/0対象/継続中を確認。
+    初回の灯子の試験helper誤り（pipeへのclosewrite）は入力pipeのcloseへ局所修正し再実行。
+    全conductor子のexit 0・port回収、diff検査、既存log hash不変。対象のみcommit/push。
 
 ## Step 15: package更新反映を公開経路で確認する
 
