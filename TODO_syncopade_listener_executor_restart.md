@@ -7,9 +7,11 @@
   単体再起動→一斉操作管理→並行送信→公開操作→統合検証の順に全体を18 Stepへ組み直した。
 - このTodoの作成・確認はStep 1にも、そのPhase 1にも含めない。
 - 進行方式: 強化C。検証済みStepごとにcommit/pushし、前提変更が必要なら停止する。
-- 現在: Step 1–16は検証・commit/push済み（`3f7884f`まで）。Step 17のSIGINT試験失敗で一度停止。
+- 現在: 全18 Stepの実装・検証完了。Step 1–16は`3f7884f`まで、Step 17は`1a27ae4`でcommit/push済み。
+  Step 18は全35-file suite exit 0、子2557/2557・親70/70を確認し、本記録と運用文書をcommit/pushする。
+  Step 17のSIGINT試験失敗で一度停止した履歴は残す。
   先生の「直す方針あるなら直して進めて」により、終了入口・子への割込み伝搬・試験後始末の見直しと再開を承認。
-  Step 17は改訂後の検証に合格。対象差分をcommit/push後、Step 18へ進む。version/tag・本番LAN操作は引き続き対象外。
+  Todo退避・version/tag・本番LAN操作・実MDO最適化は実施していない。
 - 作成時HEAD: `ce9d69c2ba06d701a8abc9957d8bf481ade7e4d2`、`master`、`v0.1.4`。
 - 既存の完了Todoはすべて`history/`にあるため、今回の作成時に移動するTodoはない。
 - 作成時の既存差分: `logs/conductor_events.csv`の4行追加。
@@ -906,10 +908,46 @@ client / conductor
 - **検証方法:** `julia --startup-file=no --project=. --threads=4 test/runtests.jl`、
   `git diff --check`、文書リンク・公開APIの照合、既存log差分の保全、残留process/port確認。
   合計件数は実測し、過去の654件を今回の結果として転記しない。
-- [ ] Phase 1 — 統合・文書方針とメモ
-- [ ] Phase 2 — suite登録・文書構成・最終判定の仕様
-- [ ] Phase 3 — 実装・文書整理
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 統合・文書方針とメモ
+  - 既存15 test fileに今回の20 fileを加え、各fileを独立Juliaで実行する35-file suiteとする。
+    子のexit/stderr検査は変更せず、LAN不要・一時fixture限定の境界を維持する。
+  - 運用文書は「cache clearではpackageは更新されない」「受付IDと計算ID」「単体と一斉操作」「不明時は照会」
+    を中心に、CLI/API、対象profile、計算時間と制御期限の区別、q/Ctrl-C終了を記す。
+    成否の根拠は最新suiteの実測とし、macOS/Julia 1.12.3・ローカル複数processまでの保証範囲を明示する。
+- [x] Phase 2 — suite登録・文書構成・最終判定の仕様
+  - `ISOLATED_TEST_FILES`へcache/package境界、executor読込・状態・専用protocol・起動寿命、listener実行/異常、
+    cache/restart、管理protocol/API/CLI、conductor操作排他/一斉/実複数process、package刷新、終了試験を登録する。
+    run_isolated_testの入力/戻り値・一時log・独立processとexit/stderr判定はそのまま。
+  - `docs/EXECUTOR_RESTART.md`にIDと状態、単体API/CLI、一斉API/CLIとoperation ID復旧、
+    partial/unknown/zeroの非成功判定、隔離解除条件、制御timeout設定、batch切替、終了動作、保証外を記す。
+    commandのIP/portは明示的な置換用引数とし、本番操作を自動実行する例にはしない。
+    `docs/TESTING.md`は35-file suite、新規試験一覧、直接/wrapper/include-only、ローカル終了試験を反映する。
+  - 最終判定: suite exit 0、全35子exit 0/stderr空、実測assertion集計、diff check、公開export/文書link照合、
+    既存log hash不変、所有process残留なし、対象だけcommit/push。Todo退避・版更新・tagは含めない。
+- [x] Phase 3 — 実装・文書整理
+  - 35 fileをsuiteへ登録。既存のexit/stderr検査は変更なし。
+    EXECUTOR_RESTART文書を追加し、TESTINGの試験範囲・entrypoint・終了動作・LAN手動試験の前提を更新。
+    一斉操作のpartial結果、操作記録と隔離の非永続性、全投入元の停止が利用側責務であることも明記した。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/runtests.jl`はexit 0、4m09.4s。
+    ISOLATED_TEST_COUNT=35。全子processのexit 0/stderr空を親70/70で確認。
+    子のassertionは実測2557/2557（既存15 file 654、新規20 file 1903）。親検査と合わせ2627/2627。
+  - 新規fileの実測件数（登録順）:
+    package境界39、読込31、runtime153、専用protocol45、子loop33、子lifecycle120、受付実行30、
+    子異常64、cache51、再起動79、単体管理protocol30、単体CLI41、conductor操作100、
+    一斉controlled81、一斉protocol30、一斉CLI46、公開package刷新174、単体conductor結合67、
+    一斉実process82、終了607。競合試験のassertion数は勝者によって変わるため、将来の固定期待値とはしない。
+  - 実一斉試験: 受付PID58775/58786、旧計算子58785/58797→新計算子58806/58805。
+    listener ID `23dc4efd-bffc-42c3-b938-aa2ea08c4247` / `aa4d461f-a5df-42ec-b4d2-4ac435668872`不変。
+    4 task完了、到達不能込み2/3の非成功集計、package上書き/配置切替・precompile有/無も再確認した。
+  - 最終終了試験: wrapper/4 threads/busy/group SIGINTの親58934・子58935・port59740。
+    通知OK→子回収→親exit 130を含む全32 case成功。各caseのport再利用assertと、記録された所有PID全件の消滅を確認。
+    suite一時artifact directoryも回収済み。実運用server/conductorには接続していない。
+  - 公開export 9件、文書内Julia例2件の構文、相対link、末尾改行、見出し後改行、35-file重複なしを確認。
+    見出し検査の初回はshell例内のコメントを誤認したため、検査commandをcode block除外へ修正して再検証した。
+    これは文書検査側の灯子のミスで、製品codeや完了条件の変更はない。
+    `git diff --check`合格。既存log SHA-256は作成時と同じ。
+    Todo、TESTING、EXECUTOR_RESTART、runtestsの4ファイルのみcommit/push。
 
 ## 相互確認の要点
 
