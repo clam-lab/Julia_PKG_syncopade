@@ -306,10 +306,26 @@ client / conductor
   空文字、改行、`|`、Unicodeを損失なく送受信でき、不正frameは実行前に拒否する。
 - **検証方法:** IOBufferまたはloopbackで分割read、途中EOF、不正長、ID不一致を試す。
   codecの往復だけでなく、未知の応答を状態へ適用しないことを確認する。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — メッセージ・frame・失敗時の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - 専用socketで長さ付きUTF-8文字列列を運ぶ。Julia Serializationやtask stdoutは使わない。
+    frame全体長・field数・各field長を検証してからメッセージ解釈する。
+    protocolを独立moduleに置き、IDやcommand不一致を状態更新前に例外として拒否する。
+- [x] Phase 2 — メッセージ・frame・失敗時の仕様
+  - `ExecutorMessage(kind, listener_id, server_id, request_id, data::Vector{String})`。
+    wireは32bit big-endianの全体byte長、field数、各fieldのbyte長+UTF-8。
+    fieldは版`1`、kind、listener/server/request ID、data。上限16 MiB・4096 field。
+  - `READY`は空request ID、PID/Julia版/Syncopade版。`EXECUTE`はjob UUIDとfile/module/func/args。
+    `RESULT`は同じjob UUIDとOK/resultまたはERROR/errorType/message。
+    `CLEAR/CLEARED`は要求UUIDと空data/非負件数、`STOP/STOPPED`は要求UUIDと空data。
+    起動IDはUUIDとして検査する。異常frameはArgumentError、途中EOFはEOFError。
+  - `write_executor_message/read_executor_message`がIOを所有せずcodec処理、
+    `expect_executor_message`が期待kind・2 ID・request IDを照合。失敗時はruntimeへ適用しない。
+- [x] Phase 3 — 実装
+  - 専用codecとIOBuffer/loopback分割転送試験を追加。公開protocolと製品serverは未変更。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/unit_executor_protocol.jl`: exit 0、45/45。
+    Unicode/改行/pipe/空文字、分割転送、途中EOF、長さ上限、未知command/版、ID不一致を確認。
+    不一致応答後のruntime不変とsocket回収を確認。diff検査成功。対象のみcommit/push。
 
 ## Step 5: 計算子の実行ループを作る
 
