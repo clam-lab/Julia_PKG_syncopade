@@ -3,6 +3,7 @@ using UUIDs
 using Dates
 include("syncopadeNodeConfig.jl")
 include("syncopadeExecutor.jl")
+include("syncopadeServerRuntime.jl")
 
 const server_state = Ref(:idle)  # :idle or :busy
 const server_state_lock = ReentrantLock()
@@ -116,115 +117,137 @@ function syncopade_server(port::Int)
     syncopade_server(target.ip, port)
 end
 
-function syncopade_server(bind_ip::IPAddr, port::Int)
+mutable struct ListenerHandle
+    socket::Sockets.TCPServer
+    bind_ip::IPAddr
+    port::Int
+    supervisor::ExecutorSupervisor
+    accept_task::Union{Nothing,Task}
+    startup_task::Union{Nothing,Task}
+    job_task::Union{Nothing,Task}
+    connections::Dict{TCPSocket,Task}
+end
+
+function syncopade_server(bind_ip::IPAddr, port::Int;
+    config=ExecutorLaunchConfig(), audit=stdout, output=stdout, errors=stderr)
     server = listen(bind_ip, port)
-    println("bind address: ", bind_ip, ":", port)
-    
-    @async begin
-        while true
-            # クライアントからの接続を待つ
-            sock = accept(server)
-            @async begin
-                reservation_owned = false
-                try
-                    # クライアントからのメッセージを受信
-                    row_msg = readline(sock)
-                    # チェックサムを検証
-                    ok, msg = checksum(row_msg)
-                    # チェックサムエラーならばソケットを閉じて次へ
-                    if !ok
-                        println("Checksum error!")
-                        close(sock)
-                        return
-                    end
-
-                    # Check for STATUS command
-                    if msg == "STATUS"
-                        println(sock, "STATUS|" * string(get_server_state()))
-                        close(sock)
-                        return
-                    end
-
-                    if msg == "CACHE_CLEAR"
-                        cleared = clear_function_cache!()
-                        println(sock, "CACHE|CLEARED|" * string(cleared))
-                        close(sock)
-                        return
-                    end
-
-                    # メッセージを解析してジョブ情報を得る
-                    job = convMSG2JOB(msg)
-
-                    # Reserve the single execution slot before issuing a job ID.
-                    if !try_reserve_server!()
-                        println(sock, "ERROR|BUSY")
-                        close(sock)
-                        return
-                    end
-                    reservation_owned = true
-
-                    # ジョブIDを生成
-                    jobId = string(uuid4())
-
-                    # 即時応答を返しソケットを閉じる
-                    println(sock, "OK|STARTED|" * jobId)
-                    close(sock)
-
-                    # 非同期で計算を実行し，コールバックを送信
-                    @async begin
-                        started_at = Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss")
-                        finished_at = started_at
-                        exec_status = "ERROR"
-                        callback_ok = false
-                        error_message = ""
-                        try
-                            result = call_func(job.file_name, job.module_name, job.function_name, job.args)
-                            exec_status = "OK"
-                            callback_ok = send_result(job, jobId, true; result=string(result))
-                        catch e
-                            errType = if e isa LoadError
-                                "LOAD_ERROR"
-                            elseif e isa UndefVarError
-                                "NAME_ERROR"
-                            elseif e isa MethodError
-                                "METHOD_ERROR"
-                            elseif e isa ArgumentError
-                                "ARG_ERROR"
-                            else
-                                "RUNTIME_ERROR"
-                            end
-                            errMsg = sprint(showerror, e)
-                            error_message = errType * "|" * errMsg
-                            callback_ok = send_result(job, jobId, false; errType=errType, errMsg=errMsg)
-                        finally
-                            finished_at = Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss")
-                            send_done_notification(
-                                job,
-                                jobId,
-                                string(bind_ip),
-                                port;
-                                status=exec_status,
-                                started_at=started_at,
-                                finished_at=finished_at,
-                                callback_ok=callback_ok,
-                                error_message=error_message
-                            )
-                            release_server!()
-                        end
-                    end
-                    reservation_owned = false
-                catch e
-                    reservation_owned && release_server!()
-                    # 受信処理での致命的エラーはログ出力して終了
-                    println("Error handling connection: ", e)
-                    try
-                        close(sock)
-                    catch
-                    end
-                end
+    actual_port = Int(getsockname(server)[2])
+    supervisor = ExecutorSupervisor(ServerRuntime(); config, audit, output, errors)
+    handle = ListenerHandle(server, bind_ip, actual_port, supervisor, nothing, nothing, nothing, Dict{TCPSocket,Task}())
+    println(output, "bind address: ", bind_ip, ":", actual_port)
+    handle.startup_task = @async launch_executor!(supervisor)
+    handle.accept_task = @async begin
+        while isopen(server)
+            socket = try
+                accept(server)
+            catch
+                isopen(server) && rethrow()
+                break
+            end
+            handle.connections[socket] = @async try
+                handle_server_connection!(handle, socket)
+            finally
+                close(socket)
+                delete!(handle.connections, socket)
             end
         end
-    end    
+    end
+    return handle
+end
+
+function handle_server_connection!(handle::ListenerHandle, socket::TCPSocket)
+    supervisor = handle.supervisor
+    runtime = supervisor.runtime
+    reservation = nothing
+    try
+        valid, message = checksum(readline(socket))
+        valid || return nothing
+        if message == "STATUS"
+            println(socket, "STATUS|" * string(runtime_public_state(runtime)))
+            return nothing
+        elseif message == "CACHE_CLEAR"
+            println(socket, "ERROR|CACHE_CLEAR_UNAVAILABLE")
+            return nothing
+        end
+        job = convMSG2JOB(message)
+        job_id = string(uuid4())
+        reservation = runtime_reserve_job!(runtime, job_id)
+        if reservation === nothing
+            println(socket, "ERROR|BUSY")
+            return nothing
+        end
+        executor_audit(supervisor, "job_reserved", reservation; pid=supervisor.child.pid, reason="job_id=$job_id")
+        println(socket, "OK|STARTED|" * job_id)
+        close(socket)
+        handle.job_task = let accepted_reservation = reservation
+            @async execute_listener_job!(handle, job, accepted_reservation)
+        end
+        reservation = nothing  # Execution task now owns this reservation.
+    catch error
+        if reservation !== nothing
+            runtime_finish_job!(runtime, reservation.listener_id, reservation.server_id, reservation.job_id)
+        end
+        executor_audit(supervisor, "connection_error", runtime_snapshot(runtime); reason=sprint(showerror, error))
+    end
+    return nothing
+end
+
+function execute_listener_job!(handle::ListenerHandle, job, reservation)
+    supervisor = handle.supervisor
+    runtime = supervisor.runtime
+    child = supervisor.child
+    job_id = reservation.job_id
+    started_at = Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss")
+    exec_status = "ERROR"
+    callback_ok = false
+    error_message = ""
+    try
+        child === nothing && throw(EOFError())
+        request = ExecutorMessage("EXECUTE", reservation.listener_id, reservation.server_id, job_id,
+            vcat([job.file_name, job.module_name, job.function_name], job.args))
+        result = executor_exchange(child, request, "RESULT")
+        if result.data[1] == "OK"
+            exec_status = "OK"
+            callback_ok = send_result(job, job_id, true; result=result.data[2])
+        else
+            error_message = result.data[2] * "|" * result.data[3]
+            callback_ok = send_result(job, job_id, false; errType=result.data[2], errMsg=result.data[3])
+        end
+    catch error
+        runtime_mark_unavailable!(runtime, reservation.listener_id, reservation.server_id)
+        error_message = "EXECUTOR_UNAVAILABLE|" * sprint(showerror, error)
+        callback_ok = send_result(job, job_id, false; errType="EXECUTOR_UNAVAILABLE",
+            errMsg="Executor result unavailable; task side effects may have occurred: " * sprint(showerror, error))
+    finally
+        try
+            send_done_notification(job, job_id, string(handle.bind_ip), handle.port;
+                status=exec_status, started_at,
+                finished_at=Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS.sss"),
+                callback_ok, error_message)
+        finally
+            runtime_finish_job!(runtime, reservation.listener_id, reservation.server_id, job_id)
+            executor_audit(supervisor, "job_finished", reservation;
+                pid=child === nothing ? 0 : child.pid, reason="job_id=$job_id status=$exec_status callback_ok=$callback_ok")
+        end
+    end
+    return nothing
+end
+
+function stop_listener!(handle::ListenerHandle)
+    runtime_request_stop!(handle.supervisor.runtime)
+    close(handle.socket)
+    handle.accept_task === nothing || wait(handle.accept_task)
+    # Close only request sockets; accepted jobs are owned by job_task.
+    pending = collect(handle.connections)
+    for (socket, _) in pending
+        close(socket)
+    end
+    for (_, task) in pending
+        wait(task)
+    end
+    handle.startup_task === nothing || wait(handle.startup_task)
+    handle.job_task === nothing || wait(handle.job_task)
+    return stop_executor!(handle.supervisor)
 end
 
 # 受け取ったメッセージの生データをもらって，

@@ -413,10 +413,34 @@ client / conductor
   計算を待機点で保持し、受付の応答と排他を確認する。既存result/admission試験も通す。
   CACHE_CLEARの子転送はStep 9で接続する。それまでは未対応を明示して拒否し、
   親の空cacheを消して成功応答する経路は残さない。この中間状態を実運用へ投入しない。
-- [ ] Phase 1 — 実装方針・メモ
-- [ ] Phase 2 — 受付・実行・通知・解放の仕様
-- [ ] Phase 3 — 実装
-- [ ] Phase 4 — 検証・結果・commit/push
+- [x] Phase 1 — 実装方針・メモ
+  - 受付handleが公開socket、Supervisor、accept task、実行taskを所有する。
+    Runtimeの予約でjob UUIDを登録してからSTARTEDを返し、子結果のID照合後に親がcallback/DONEを送る。
+    serverのincludeは引き続き定義だけ。既存単体試験向けの旧状態関数は互換入口として残す。
+    受付を止め子を回収する内部cleanup入口を用意し、mainへの通常終了接続はStep 17で検証する。
+- [x] Phase 2 — 受付・実行・通知・解放の仕様
+  - `syncopade_server(bind_ip, port; config, audit, output, errors)`はListenerHandleを返す。
+    port=0なら実割当portをhandleに保持してDONEにも使用する。startup/acceptは独立task。
+    `stop_listener!`は新受付を閉じ、起動task・実行job・接続処理を回収して子を停止する。
+  - `handle_server_connection!`はSTATUSと未対応CACHE_CLEAR拒否、task解析/予約/STARTEDを担当。
+    job UUIDは予約候補として作り、拒否時は公開しない。予約取得後のsocket失敗では同じjobだけ解放する。
+  - `execute_listener_job!`は子へEXECUTE、応答照合、既存RESULT/TASK_RESULT/DONE送信、finallyで同じID/jobを解放。
+    処理済み関数例外は子の分類をそのまま返す。通信消失はEXECUTOR_UNAVAILABLEとして区別しunavailableへ。
+    自動検出/終端競合の詳細検証はStep 8。監査にjobと起動IDを残す。
+  - loopback試験はPID/fixture package未load、task成功/例外、conductor付きDONE、待機点での並行拒否とSTATUSを検証。
+    task/sourceはローカルfixture、ファイル待機点は試験の一時directoryだけ。
+- [x] Phase 3 — 実装
+  - 公開受付をSupervisorへ接続、結果/DONEは親側のまま。CACHE_CLEARは中間段階として明示拒否。
+    実受付を所有/回収する試験helperとpackage/待機点fixture、公開経路試験を追加した。
+- [x] Phase 4 — 検証・結果・commit/push
+  - `julia --startup-file=no --project=. --threads=4 test/integration_listener_execution.jl`: exit 0、29/29。
+    親PID53827/子53830、listener 2f274ce1-8351-43c5-849c-40c552a05bce、
+    server 06a090cf-7679-476d-8787-36e082e51444。3 job成功/例外通知、busy拒否4件、親package未loadを確認。
+    既存admission16/16、result43/43もexit 0。子終了/公開port回収・diff検査成功。対象のみcommit/push。
+  - 灯子の局所ミスを修正して再検証: TCPServerの名前空間漏れ、@asyncへ渡す予約変数の固定漏れ。
+    後者は予約をletで固定してから元変数を解放する変更で、仕様/Step順の変更なし。
+    stderr検査は実際の正常precompile表示をエラー扱いしたため、UUIDs/fixtureの成功表示だけを明示許可。
+    子のDEPOTも一時directoryへ隔離した。途中失敗試験の残留子なしをpsで確認済み。
 
 ## Step 8: 子の異常終了を回収する
 
