@@ -7,11 +7,12 @@
   単体再起動→一斉操作管理→並行送信→公開操作→統合検証の順に全体を18 Stepへ組み直した。
 - このTodoの作成・確認はStep 1にも、そのPhase 1にも含めない。
 - 進行方式: 強化C。検証済みStepごとにcommit/pushし、前提変更が必要なら停止する。
-- 現在: 全18 Stepの実装・検証完了。Step 1–16は`3f7884f`まで、Step 17は`1a27ae4`でcommit/push済み。
-  Step 18は全35-file suite exit 0、子2557/2557・親70/70を確認し、本記録と運用文書をcommit/pushする。
+- 現在: 全18 Stepの実装・検証・commit/push完了。Step 1–16は`3f7884f`まで、Step 17は`1a27ae4`、
+  Step 18は`425a2c2`。全35-file suite exit 0、子2557/2557・親70/70を確認済み。
   Step 17のSIGINT試験失敗で一度停止した履歴は残す。
   先生の「直す方針あるなら直して進めて」により、終了入口・子への割込み伝搬・試験後始末の見直しと再開を承認。
-  Todo退避・version/tag・本番LAN操作・実MDO最適化は実施していない。
+  2026-09-16、先生の「じゃあ終了処理して、バージョンあげましょう」により本書を`history/`へ退避。
+  版更新は末尾の終了処理記録で扱う。tag・本番LAN操作・実MDO最適化は実施していない。
 - 作成時HEAD: `ce9d69c2ba06d701a8abc9957d8bf481ade7e4d2`、`master`、`v0.1.4`。
 - 既存の完了Todoはすべて`history/`にあるため、今回の作成時に移動するTodoはない。
 - 作成時の既存差分: `logs/conductor_events.csv`の4行追加。
@@ -25,7 +26,8 @@
 単一nodeへの指定に加え、conductorへの1回の指示で設定された全nodeの計算Juliaへ
 並行して再起動を指示し、node別の結果をまとめて確認できるようにする。
 
-現行コードでは次の経路になっている。
+以下の調査・構成案はTodo作成時の記録で、実装・検証後の経路は各Stepと`docs/EXECUTOR_RESTART.md`に記す。
+作成時のコードでは次の経路になっていた。
 
 - `scripts/run_server.jl`が`syncopadeServer.jl`の`main()`を呼ぶ。
 - 同一Julia内の受付処理が`call_func`でtaskを実行する。
@@ -960,3 +962,18 @@ client / conductor
 6. 完了判定はlocalの複数process試験まで。本番nodeへの展開・version/tagは別作業とする。
 
 2026-09-16「じゃあ強化cで！」により相互確認完了。Step 1 Phase 1から順に進める。
+
+## 終了処理（2026-09-16）
+
+- 指示: 「じゃあ終了処理して、バージョンあげましょう」。完了した18 Stepへの追加実装は行わない。
+- Phase 1 — 方針: 完了Todoを`history/`へ移し、運用・試験文書の参照先を整えてcommit/pushする。
+  続いて既存のtask/result契約を保つ版更新として`0.1.4`から`0.1.5`へ上げ、検証後に別commit/pushする。
+  tagは別指示まで作成しない。既存logを変更せず、本番server/conductorにも操作しない。
+- Phase 2 — 入出力・副作用: 整理対象は本書と`docs/EXECUTOR_RESTART.md`、`docs/TESTING.md`。
+  版の正本は`Project.toml`のみとし、過去の版・試験fixtureの版は書き換えない。関数の追加・変更はない。
+  検証は相対link、全18 StepのPhase完了、差分、既存log hashと、版更新後の全35-file suiteを使う。
+  さらに新規Juliaのpackage版と実計算子が報告する版を照合する。実試験はloopback・一時portだけを使う。
+- Phase 3 — Todo退避、完了状態の更新、文書から本書への参照先変更を実施。
+- Phase 4 — 文書整理の検証87/87、`git diff --check`合格。
+  全18 StepのPhase 1–4完了、旧配置の消滅、相対link・末尾改行、既存log hash不変を確認した。
+  本書と運用・試験文書だけを整理commit/pushの対象とする。版更新はこの整理のcommit/push後に行う。

@@ -185,7 +185,7 @@ CLI `main`をREPLで使う用途は保証せず、組込み利用では`syncopad
 BUSY時の投入保持、部分失敗、終了時の結果通知・子回収を確認した。
 実MDO最適化、本番LANへの展開、Windows console/Linux/他Julia版の動作確認は含めない。
 特にsignal受信にはJulia Baseのevent-loop/I/O-lock helperを使うので、Julia更新時に終了試験も再実行する。
-実行方法と試験一覧は[Testing Guide](TESTING.md)、実測記録は[Todo](../TODO_syncopade_listener_executor_restart.md)を参照。
+実行方法と試験一覧は[Testing Guide](TESTING.md)、実測記録は[完了Todo](../history/TODO_syncopade_listener_executor_restart.md)を参照。
 
 - [Julia code loading](https://docs.julialang.org/en/v1/manual/code-loading/): 同一sessionで読み込み済みpackageが再利用される境界。
 - [libuv signal handle](https://docs.libuv.org/en/v1.x/signal.html): signalをevent loopで扱うAPIとOS差。

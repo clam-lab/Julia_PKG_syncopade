@@ -79,7 +79,7 @@ Validation receipt for the listener/executor restart change (Julia 1.12.3/macOS)
 607 shutdown checks. These are observed counts, not fixed expectations for
 future runs; some race tests make a different number of assertions depending on
 which reservation wins. Detailed records are in the
-[restart Todo](../TODO_syncopade_listener_executor_restart.md).
+[completed restart Todo](../history/TODO_syncopade_listener_executor_restart.md).
 
 ## 4. Run one-PC integration tests
 
