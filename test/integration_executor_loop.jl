@@ -1,4 +1,4 @@
-using Test, Sockets, UUIDs
+using Test, Sockets, UUIDs, TOML
 include(joinpath(@__DIR__, "..", "syncopadeExecutorProtocol.jl"))
 using .ExecutorProtocol
 
@@ -23,7 +23,7 @@ function executor_loop_case(disconnect::Bool)
             @test child_pid != getpid()
             @test child_pid == getpid(process)
             @test ready.data[2] == string(VERSION)
-            @test ready.data[3] == "0.1.4"
+            @test ready.data[3] == TOML.parsefile(joinpath(@__DIR__, "..", "Project.toml"))["version"]
             if disconnect
                 close(socket)
             else

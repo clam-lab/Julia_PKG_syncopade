@@ -12,7 +12,7 @@
   Step 17のSIGINT試験失敗で一度停止した履歴は残す。
   先生の「直す方針あるなら直して進めて」により、終了入口・子への割込み伝搬・試験後始末の見直しと再開を承認。
   2026-09-16、先生の「じゃあ終了処理して、バージョンあげましょう」により本書を`history/`へ退避。
-  版更新は末尾の終了処理記録で扱う。tag・本番LAN操作・実MDO最適化は実施していない。
+  版`0.1.5`への更新と検証も完了（末尾の終了処理記録）。tag・本番LAN操作・実MDO最適化は実施していない。
 - 作成時HEAD: `ce9d69c2ba06d701a8abc9957d8bf481ade7e4d2`、`master`、`v0.1.4`。
 - 既存の完了Todoはすべて`history/`にあるため、今回の作成時に移動するTodoはない。
 - 作成時の既存差分: `logs/conductor_events.csv`の4行追加。
@@ -977,3 +977,32 @@ client / conductor
 - Phase 4 — 文書整理の検証87/87、`git diff --check`合格。
   全18 StepのPhase 1–4完了、旧配置の消滅、相対link・末尾改行、既存log hash不変を確認した。
   本書と運用・試験文書だけを整理commit/pushの対象とする。版更新はこの整理のcommit/push後に行う。
+- 整理commit `c800e2e`を`origin/master`へpush済み。
+- 版更新 Phase 1 — 文書整理後、上記の版更新方針を適用する。
+- 版更新 Phase 2 — `Project.toml`とpackage読込み情報、実計算子のREADY情報が
+  同じ`0.1.5`になることを確認し、再起動前後の受付ID不変・計算ID変更・新子readyも併せて検査する。
+- 版更新 Phase 3 — `Project.toml`のversionだけを`0.1.5`に更新。製品ロジックの変更はない。
+- 版更新 Phase 4 — 版照合と全35-file suiteを実行。初回の不一致と対処、再検証結果を以下に記す。
+- 検証中の不一致: `integration_executor_loop.jl:26`が実計算子の版を`0.1.4`に固定していた。
+  応答は正しく`0.1.5`だったが、通常終了・接続断の2 caseが同じ期待値で失敗した。
+  これは灯子の試験コードの固定値によるミスで、製品の起動・通信・終了の不具合ではない。
+- 対処 Phase 1 — 実応答とProjectの版を比較するという試験目的を維持し、古い版への固定だけを除く。
+  版更新の整合範囲内なので強化Cで対処する。実行済みsuiteは失敗記録として扱い、修正後に全件再実行する。
+- 対処 Phase 2 — `test/integration_executor_loop.jl`だけで標準library `TOML`を読み、
+  リポジトリの`Project.toml`のversionとREADY応答を照合する。製品の版取得関数を期待値に流用しない。
+  package依存・関数入出力・通信・終了仕様は変更しない。protocolのサンプルに含まれる旧版文字列は変更しない。
+- 対処 Phase 3 — 上記の期待値照合を実装。製品ファイルの変更は版番号だけのまま。
+- 対処 Phase 4 — `julia --startup-file=no --project=. --threads=4 test/integration_executor_loop.jl`は
+  exit 0、33/33。通常終了・接続断とも子exit 0、port再利用と後始末を確認した。
+- 版照合の先行結果: `Pkg.project().version`、`Base.pkgversion(Syncopade)`、実子の再起動前後の応答を
+  `0.1.5`と照合し15/15、exit 0。受付62522・旧子62529→新子62533・port58288。
+  受付ID不変、新計算ID、ready、子回収・port再利用を確認し、検査後は3 PIDとも残留なし。
+- 全体試験の初回はexit 1、4m15.4s。全35 fileを実行し、不合格fileは上記の`integration_executor_loop.jl`だけ。
+  その子は31/33、親のexit/stderr確認は68/70。失敗を成功扱いせず、後始末終了を確認して再実行した。
+- 最終結果: `julia --startup-file=no --project=. --threads=4 test/runtests.jl`はexit 0、4m13.6s。
+  全35 file、子2558/2558・親70/70、合計2628/2628。子stderrは全件空。
+  Step 18からの件数差1は操作競合試験の実測101件（前回100件）によるもので、試験の省略・条件緩和はない。
+  起動loop33、package刷新174、一斉実process82、終了607を含む全件を改めて検証した。
+  記録された所有PID 99件の残留なし、一時suite directory回収済み。各試験内でport再利用も確認した。
+- 版更新の最終対象は`Project.toml`、`test/integration_executor_loop.jl`、本書の3ファイル。
+  `git diff --check`合格、既存log SHA-256不変。tagを作らず、検証済み差分だけをcommit/pushする。
