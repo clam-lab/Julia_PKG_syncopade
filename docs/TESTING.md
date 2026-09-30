@@ -18,7 +18,10 @@ test helper globals from leaking into the next test.
 - `examples/01_basic_server_client.jl`: direct client -> server flow.
 - `examples/02_conductor_list.jl`: query conductor `LIST` and print available nodes.
 - `examples/03_submit_dispatch_retry.jl`: submit task to conductor and wait callback.
-- `test/runtests.jl`: isolated deterministic test entrypoint (35 files).
+- `test/runtests.jl`: isolated deterministic test entrypoint (36 files).
+- `test/unit_node_config.jl`: both configured profiles, exact node endpoints,
+  conductor candidate loading, and M4-first reservation with legacy fallback.
+  Uses in-memory node states and a temporary log; never contacts a LAN node.
 - `test/unit_client_protocol.jl`: checksum and parse tests for client protocol.
 - `test/unit_conductor_queue.jl`: conductor queue, LIFO, retry, default callback port tests.
 - `test/integration_single_pc.jl`: manual one-PC integration smoke test.
@@ -80,6 +83,13 @@ Validation receipt for the listener/executor restart change (Julia 1.12.3/macOS)
 future runs; some race tests make a different number of assertions depending on
 which reservation wins. Detailed records are in the
 [completed restart Todo](../history/TODO_syncopade_listener_executor_restart.md).
+
+Validation receipt for the four-node addition (2026-09-30, Julia 1.12.3/macOS):
+36 isolated files exited 0 with empty stderr; 2,794 child assertions and 72 parent
+checks passed (2,866 combined), in 4m43.3s. This includes 237 configuration/priority
+checks and the existing 607 shutdown checks. Logged test processes and temporary
+suite artifacts were confirmed gone afterward. The configured M4 machines were
+not contacted; their live deployment and execution remain unverified.
 
 ## 4. Run one-PC integration tests
 
@@ -209,10 +219,34 @@ Each example accepts optional positional arguments.
 ## 6. Node Profile / LAN selection memo
 
 Node lists are now managed in `syncopadeNodeConfig.jl`.
-- Profile `lan12`: `192.168.12.*` nodes (default)
-- Profile `lan100`: `192.168.100.*` nodes
+
+- Profile `lan12`: 16 entries on `192.168.12.*` (default).
+- Profile `lan100`: 16 entries on `192.168.100.*`.
+
+The four added M4 Mac mini nodes have these endpoints:
+
+| Name | lan12 endpoint | lan100 endpoint |
+|---|---|---|
+| KIX | 192.168.12.15:8015 | 192.168.100.107:8107 |
+| FIVES | 192.168.12.16:8016 | 192.168.100.105:8105 |
+| JESSE | 192.168.12.17:8017 | 192.168.100.106:8106 |
+| REX | 192.168.12.18:8018 | 192.168.100.104:8104 |
+
+Each profile preserves its existing 12 entries and appends KIX, FIVES, JESSE,
+then REX. The conductor selects usable idle nodes from the end of the list:
+REX, JESSE, FIVES, KIX, then the existing nodes in their previous priority order.
+If no new node is available, existing idle nodes can still receive work; the
+conductor does not wait for an M4 to become free. This is a configured preference,
+not automatic hardware benchmarking, dynamic performance weighting, or migration of running work.
+The profiles are alternative network lists, not 32 distinct physical machines.
 
 Select network profile with `SYNCOPADE_NODE_PROFILE` when starting both server and conductor:
+
+The conductor's own bind/callback address is selected separately by
+`SYNCOPADE_WIRED_PREFIX` (default `192.168.12.`). On a dual-network machine,
+selecting `lan100` alone does not change that address preference. Match both
+settings and check the startup address; if no local IP matches the prefix, the
+current implementation falls back to `getipaddr()`.
 
 ```bash
 # default (lan12)
@@ -220,13 +254,37 @@ julia syncopadeServer.jl
 julia syncopadeConductor.jl
 
 # use 192.168.100.* list
-SYNCOPADE_NODE_PROFILE=lan100 julia syncopadeServer.jl
-SYNCOPADE_NODE_PROFILE=lan100 julia scripts/run_server.jl
-SYNCOPADE_NODE_PROFILE=lan100 julia syncopadeConductor.jl
-SYNCOPADE_NODE_PROFILE=lan100 julia scripts/run_conductor.jl
+SYNCOPADE_NODE_PROFILE=lan100 SYNCOPADE_WIRED_PREFIX=192.168.100. julia syncopadeServer.jl
+SYNCOPADE_NODE_PROFILE=lan100 SYNCOPADE_WIRED_PREFIX=192.168.100. julia scripts/run_server.jl
+SYNCOPADE_NODE_PROFILE=lan100 SYNCOPADE_WIRED_PREFIX=192.168.100. julia syncopadeConductor.jl
+SYNCOPADE_NODE_PROFILE=lan100 SYNCOPADE_WIRED_PREFIX=192.168.100. julia scripts/run_conductor.jl
 ```
 
 Server behavior:
+
 - `syncopadeServer.jl` picks a bind target from the selected profile.
 - It tries profile entries in order and uses the first local IP that can be bound.
 - If none can be bound, it falls back to `getipaddr()` behavior.
+
+### Applying a node-list change
+
+1. Stop new submissions from all producers. Wait for queued, running, reserved,
+   or outcome-unknown tasks and any management operations to be resolved.
+2. Update the configuration used by the conductor. New servers using the
+   no-argument startup path should also use the updated configuration and the
+   intended profile. Prepare their application packages and shared files, and
+   verify the printed bind IP/port and the required callback routes.
+3. Restart the conductor after the work has drained. Its running process does
+   not reload an edited configuration file automatically, and its in-memory
+   queue/task/management state is not preserved across restart. Cache clear or
+   executor-only restart does not reload the conductor's node list.
+4. Check the conductor's status display for all configured entries. `LIST`
+   reports only usable idle nodes, not every registered node. Test result
+   delivery on the new nodes before resuming the normal workload.
+
+Adding list entries alone does not require restarting existing servers.
+Conductor-wide cache clear and executor restart include the new configured
+nodes too, so offline new nodes can make an all-node operation fail.
+Local configuration tests do not establish that the new machines are online,
+have the right packages/mounts, or can complete real calculations. Deployment
+and live-node verification remain separate operations.

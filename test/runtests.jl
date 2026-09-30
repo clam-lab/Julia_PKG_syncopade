@@ -2,6 +2,7 @@ using Test
 
 const TEST_REPOSITORY_ROOT = normpath(joinpath(@__DIR__, ".."))
 const ISOLATED_TEST_FILES = String[
+    "unit_node_config.jl",
     "unit_client_protocol.jl",
     "unit_conductor_queue.jl",
     "unit_conductor_node_state.jl",

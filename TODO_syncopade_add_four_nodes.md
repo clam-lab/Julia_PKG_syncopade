@@ -9,6 +9,8 @@
   優先方針の確認後、上記の別指示で実行を開始する。
 - 進行方式: 強化C。各StepのPhase 1→2→3→4を順に実施・記録し、Stepごとの追加指示を待たず進める。
   灯子の誤字・単純な実装ミスは修正して同じ検証をやり直す。前提変更・Todo見直しが必要なら停止する。
+- 現在: 全3 Stepの実装・検証完了。Step 1は`74a0751`、Step 2は`351e5ae`でcommit/push済み。
+  Step 3の結果は末尾に記録。実LANへの反映・実機通信試験、version/tag更新、Todo退避は実施していない。
 - 実行開始後は完了Stepごとに、検証済みの対象ファイルだけをcommit/pushする。
 - 作成時HEAD: `bf37c9b3dcdb2f10f61df817f22f404af61783e0`（`master`、package version `0.1.5`）。
 - トップに既存Todoはなく、過去の完了Todoは`history/`へ退避済み。今回移動する既存Todoはない。
@@ -125,14 +127,47 @@ portは既存規則 `8000 + IPv4アドレスの末尾` に従う。
   `julia --startup-file=no --project=. --threads=4 test/runtests.jl`。
   suiteの通信は既存のloopback一時fixtureのみ。子processのexit/stderrと後始末まで確認し、
   文書リンク・`git diff --check`・既存log hashも検証する。実測結果を記録して対象のみcommit/pushする。
-- [ ] Phase 1 — 回帰試験・文書化の方針を確定
-- [ ] Phase 2 — 試験の入力・期待値・副作用と文書項目を確定
-- [ ] Phase 3 — 試験追加・suite登録・文書追記
-- [ ] Phase 4 — 個別確認・全体試験・記録・commit/push
+- [x] Phase 1 — 回帰試験・文書化の方針を確定
+  - Step 2は`351e5ae`でcommit/push済み。製品差分は両配列への合計8行だけ。
+  - 新規試験は設定の期待値とconductorが作る候補一覧を照合し、M4優先と既存nodeへの割当て継続も
+    メモリ内の模擬idle状態で検証する。実LANへのprobe・main・監視・待受け・task配送は呼ばない。
+  - 文書には指定された8 endpoint、末尾優先、profileと自身の通信IPの区別、反映時の安全な再起動手順を記す。
+    既存の35-file suiteを36-fileへ拡張し、過去の検証件数は当時の記録として保持する。
+- [x] Phase 2 — 試験の入力・期待値・副作用と文書項目を確定
+  - `unit_node_config.jl`はconductorの定義だけをincludeし、既存12件と新4件の独立した期待配列を持つ。
+    両profile各16件・指定値・順序、IPv4/port、名前/endpoint重複、既定/未知profile、環境変数選択を検査する。
+  - `geneAvailableNodeList()`の16要素を設定と照合する。模擬状態を全件idleにして、実際の予約関数
+    `reserve_idle_node_right_to_left!`を順番に呼び、REX/JESSE/FIVES/KIX→既存12件の逆順で予約され、
+    全件予約済みなら追加予約がないことを確認する。task自体は投入・配送しない。
+  - 副作用は試験process内のnode状態と専用一時directoryの予約logだけ。`withenv`で環境変数を復元し、
+    finallyで状態を消去・log writerを停止して一時directoryを回収する。製品関数は変更しない。
+  - suiteのexit/stderr判定は変更せず、新規1 fileを追加する。文書は現行36 fileと設定の運用を更新し、
+    過去の35-file検証記録は書き換えない。設定の反映と実ノードの通信・計算確認を明確に分ける。
+- [x] Phase 3 — 試験追加・suite登録・文書追記
+  - `unit_node_config.jl`を追加し、36-file suiteへ登録した。期待値は既存24件・追加8件を明記し、
+    conductorの実予約関数で新4台優先と既存nodeへの継続割当てを検査する。実LANへの通信は行わない。
+  - `docs/TESTING.md`に両profile各16件、追加先一覧、優先順、二系統LANの選択と反映手順を記載した。
+    過去の検証記録とsuiteのexit/stderr検査は維持した。
+- [x] Phase 4 — 個別確認・全体試験・記録・commit/push
+  - 単独の`julia --startup-file=no --project=. --threads=4 test/unit_node_config.jl`は237/237、exit 0。
+    両profileの16件をconductorがそのまま読み、REX/JESSE/FIVES/KIX→D-O以降の既存nodeの順で
+    予約することを確認した。専用logの停止・一時directory回収・環境変数復元も合格。
+  - suite登録36件・重複なし・全file存在、文書内8 endpoint、構文・末尾改行・相対link・既存log hashの
+    整合確認は25/25、exit 0。`git diff --check`も合格。
+  - `julia --startup-file=no --project=. --threads=4 test/runtests.jl`はexit 0、4m43.3s。
+    全36 file、子2794/2794・親72/72、合計2866/2866。全子のstderrは空。
+    新規設定237、既存試験2557（操作競合100）、終了処理607を含む全件を検証した。
+    競合試験の件数は実行により変動するため、今回の実測として記録する。
+  - 記録された所有PID 99件の残留なし、一時suite directory回収済み。既存fixtureのport再利用検査も合格。
+    最終のwrapper/4 threads/busy/group SIGINTは親45544・子45545・port58868で正常に後始末された。
+    実行環境はJulia 1.12.3、macOS/Darwin、aarch64。実LANと新4台の実機には接続していない。
+  - 既存log SHA-256不変。Step 3の対象は本Todo、TESTING、runtests、新規unit_node_configの4ファイルのみ。
+    検証済みのこの4ファイルをcommit/pushする。製品側は両profile末尾への8行追記だけで、
+    conductor/serverの関数・version・tagは変更していない。
 
 ## 今回の完了判定
 
 - 両profileへの指定どおりの追記と、ローカルでの設定読込み・回帰試験までを完了範囲とする。
 - 新4台が実際に通信・計算できることは、実ノードで別途確認するまで未確認と報告する。
 - 前提変更やStep追加が必要なら、局所的に継ぎ足さずTodo全体の見直しを先生に提案して止まる。
-- 2026-09-30の相互確認・開始指示に基づき、全3 Stepを順番に実行する。
+- 2026-09-30の相互確認・開始指示に基づき、全3 Stepを順番に実行・検証した。
