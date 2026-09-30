@@ -9,8 +9,10 @@
   優先方針の確認後、上記の別指示で実行を開始する。
 - 進行方式: 強化C。各StepのPhase 1→2→3→4を順に実施・記録し、Stepごとの追加指示を待たず進める。
   灯子の誤字・単純な実装ミスは修正して同じ検証をやり直す。前提変更・Todo見直しが必要なら停止する。
-- 現在: 全3 Stepの実装・検証完了。Step 1は`74a0751`、Step 2は`351e5ae`でcommit/push済み。
-  Step 3の結果は末尾に記録。実LANへの反映・実機通信試験、version/tag更新、Todo退避は実施していない。
+- 現在: 全3 Stepの実装・検証・commit/push完了。Step 1は`74a0751`、Step 2は`351e5ae`、Step 3は`ab16a37`。
+  2026-09-30、次の実機試験Todoの作成に合わせて本書を`history/`へ退避。
+  先生からconductor再起動後の一覧反映・新4台IDLE・SMB接続完了の報告あり。
+  これらは先生の実機確認であり、灯子による計算投入の検証とは区別する。version/tagは更新していない。
 - 実行開始後は完了Stepごとに、検証済みの対象ファイルだけをcommit/pushする。
 - 作成時HEAD: `bf37c9b3dcdb2f10f61df817f22f404af61783e0`（`master`、package version `0.1.5`）。
 - トップに既存Todoはなく、過去の完了Todoは`history/`へ退避済み。今回移動する既存Todoはない。
