@@ -2,7 +2,9 @@
 
 ## 状態
 
-- 2026-09-30作成。同日、先生から「もち，強化Cでいこうよ」と開始承認を受けた。Step 1検証完了、実機投入はまだゼロ。
+- 2026-09-30作成。同日、先生から「もち，強化Cでいこうよ」と開始承認を受けた。
+  Step 1完了・push済み (`1ffa1a0`)。Step 2でREXへ1件投入後、結果返送の60秒期限超過で停止。
+  Step 2は未完了、Step 3–6は未着手。実機投入は合計1件、正常完了を確認できた実機試験は0件。
 - 前の設定追加は全3 Step完了（HEAD `ab16a3752db85be363db97eb8a33bf511af53fd4`）。
   完了Todoを[historyへ退避](history/TODO_syncopade_add_four_nodes.md)した。
 - 先生の報告: 新4台がconductor上でIDLE、SMB接続済み、共有パスは全台`/Volumes/syncopade_nfs`で一致。
@@ -96,7 +98,7 @@
 - [x] Phase 1 — 方針・前提を確認
 - [x] Phase 2 — 入出力・合否・後始末仕様を確定
 - [x] Phase 3 — 試験driverとローカル確認を実装
-- [x] Phase 4 — ローカル検証・接続先/投入停止の確認・記録（commit/pushは直後に実施）
+- [x] Phase 4 — ローカル検証・接続先/投入停止の確認・記録・commit/push (`1ffa1a0`)
 
 ### Step 1 / Phase 1 記録
 
@@ -156,10 +158,47 @@
 - **対象ファイル:** 本Todo、今回専用の試験log。Step 1のdriverを使う。
 - **完了条件:** REXの指定endpointで共通の合否判定をすべて満たす。
 - **検証方法:** 起動ID、受付job ID、結果`30030.0`、返送照合、idle復帰、callback後始末を記録する。
-- [ ] Phase 1 — REXの宛先・事前状態を確認
-- [ ] Phase 2 — 1件の入力と判定条件を固定
-- [ ] Phase 3 — 1件だけ投入
+- [x] Phase 1 — REXの宛先・事前状態を確認
+- [x] Phase 2 — 1件の入力と判定条件を固定
+- [x] Phase 3 — 1件だけ投入
 - [ ] Phase 4 — 結果/復帰/後始末確認・記録・commit/push
+
+### Step 2 / Phase 1 記録
+
+- REX `192.168.12.18:8018`を明示指定する。直前の読み取り確認はidle/readyで起動IDも不変。
+  検証済みdriverをそのまま使用し、投入直前のRUNTIMEでも再確認する。通常計算休止の前提は継続。
+
+### Step 2 / Phase 2 記録
+
+- 入力: direct、REXの上記endpoint、callback `192.168.12.2:0`（実portをlogへ記録）、
+  共有source絶対パス、既定の2ベクトル、待ち期限60秒（受付通信は5秒）。
+- 出力・合否: job ID一致、送信元IPがREX、`30030.0`、同一起動IDのidle復帰、callback port再利用。
+  副作用は試験1件と自分の待受けのみ。logは`logs/four_node_readiness_20260930_step2_rex.log`。
+
+### Step 2 / Phase 3 記録
+
+- 2026-09-30 18:18:26 JST、REXへ1件だけ直接投入した。
+  `OK|STARTED|28067c82-be94-4ffb-9421-a59ec9a31c74`を受信。callbackは`192.168.12.2:61170`。
+  受付までは成功、結果・復帰はPhase 4で確認する。再投入はしていない。
+
+### Step 2 / Phase 4 記録 — 不合格・停止
+
+- **症状:** 18:19:26 JSTにcallback待ち60秒を超過、試験processはexit 1。
+  結果接続自体を受け付けられなかったため、値・job ID照合・idle復帰は確認できていない。
+- **根拠:** [今回の生log](logs/four_node_readiness_20260930_step2_rex.log)に受付job IDと失敗を記録。
+  期限直後の読み取り照会はREX `busy / ready=true`、listener/server ID・PIDは投入前と同じ。
+  受付拒否やserver停止と同一視しない。`ready=true`は次の計算を受けられる意味ではなく、busyは継続していた。
+- **原因候補:** sourceの読込み、計算子の処理、結果返送などのどこで待っているかは未確定。
+  現在のRUNTIME応答には実行位置がなく、この結果だけでSMBやfirewallの不具合とは断定しない。
+- **確認方法:** REX側のrun_server出力で、該当job IDの受理後から現在までの出力を確認する。
+  source読込みエラー、fixtureの開始/計算結果出力、callback接続エラーの有無を順に照合する。
+- **修正案:** 原因未確定のため未決定。試験期限の延長・再投入・cache clear・再起動で押し切らない。
+  続行に環境変更や調査手順の変更が必要なら、先生とTodo全体を見直す。
+- **検証方法:** 原因を絞った後に必要な修正と再試験条件を相互確認する。現時点ではStep 2を完了扱いしない。
+- **後始末:** 自分のcallback待受けを閉じ、`192.168.12.2:61170`の再bind成功を確認した。
+  自分の試験processは終了済み。REX側の計算・executor・listenerには終了指示を送っていない。
+  遅れて返送される結果を受け取る待受けはもうないため、実行結果は不明のまま扱う。
+- 既存`logs/conductor_events.csv`のSHA-256は開始前と同じ。今回のTodoと専用logだけを停止記録としてcommit/pushする。
 
 ## Step 3: JESSEへ直接1件送る
 

@@ -1,0 +1,9 @@
+2026-09-30T18:18:26.640 event=begin mode=:direct target_ip="192.168.12.18" target_port=8018 callback_ip="192.168.12.2" source="/Volumes/syncopade_nfs/syncopadeBasicTestScript.jl" sha256="06c7c238922e62ff14f5e6b692e1bf6e90f4bd93276b0993c584a455f96b6c8d" timeout=60.0
+2026-09-30T18:18:26.677 event=before ip="192.168.12.18" port=8018 runtime=Main.FourNodeReadiness.ServerRuntimeInfo("f5b27e1e-47a7-4c18-a07c-3aab19537378", "b376e030-edeb-4c1c-b504-8ad552f62b43", :idle, 5677, 5687, "1.12.7", "0.1.5", true)
+2026-09-30T18:18:26.690 event=callback_listening callback_ip="192.168.12.2" bound_port=61170
+2026-09-30T18:18:26.693 event=acceptance_response row="OK|STARTED|28067c82-be94-4ffb-9421-a59ec9a31c74"
+2026-09-30T18:18:26.693 event=accepted accepted_id="28067c82-be94-4ffb-9421-a59ec9a31c74"
+2026-09-30T18:19:26.732 event=failure message="callback timed out; computation outcome unknown" submission_attempted=true accepted_id="28067c82-be94-4ffb-9421-a59ec9a31c74" outcome="not assumed unexecuted; never resend automatically"
+2026-09-30T18:19:26.745 event=reconcile_runtime ip="192.168.12.18" port=8018 runtime=Main.FourNodeReadiness.ServerRuntimeInfo("f5b27e1e-47a7-4c18-a07c-3aab19537378", "b376e030-edeb-4c1c-b504-8ad552f62b43", :busy, 5677, 5687, "1.12.7", "0.1.5", true)
+2026-09-30T18:19:26.745 event=callback_closed_and_rebind_verified callback_ip="192.168.12.2" bound_port=61170
+2026-09-30T18:19:26.745 event=FAIL message="callback timed out; computation outcome unknown"
