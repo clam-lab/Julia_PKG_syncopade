@@ -90,10 +90,23 @@ portは既存規則 `8000 + IPv4アドレスの末尾` に従う。
 - **検証方法:** 設定のみを読む独立Juliaで全対応・件数・port規則・endpoint重複なしを検証する。
   作成時commitの既存12件とStep 1のlan12一覧を比較し、不変を確認する。
   `git diff --check`、既存log hash不変を確認して対象のみcommit/pushする。
-- [ ] Phase 1 — 実装方針とIP対応の確認メモを確定
-- [ ] Phase 2 — 設定の入出力・変更範囲・検証仕様を確定
-- [ ] Phase 3 — lan100へ4件追記
-- [ ] Phase 4 — 両LANの対応検証・差分確認・記録・commit/push
+- [x] Phase 1 — 実装方針とIP対応の確認メモを確定
+  - Step 1は`74a0751`でcommit/push済み。次はlan100だけを変更する。
+  - KIX=107、FIVES=105、JESSE=106、REX=104を指定表から個別に照合し、列挙順で末尾に追記する。
+    lan12の16件とlan100の既存12件は保持する。
+- [x] Phase 2 — 設定の入出力・変更範囲・検証仕様を確定
+  - 入力`profile="lan100"`に対する一覧だけを16件へ拡張。追加4件のportは順に8107/8105/8106/8104。
+    関数・既定値・profile選択の仕組みは不変。
+  - 作成時commitとの先頭12件比較に加え、Step 1 commitから読み込んだlan12全16件との比較を行う。
+    新4台の名前の順序が両LANで一致し、各IP・portが独立した指定期待値と一致することを検査する。
+- [x] Phase 3 — lan100へ4件追記
+  - 指定表の4行を末尾に追加。既存lan100の12件とlan12の16件、関数定義は変更していない。
+- [x] Phase 4 — 両LANの対応検証・差分確認・記録・commit/push
+  - `julia --startup-file=no --project=. -e ...`による独立設定比較は76/76、exit 0。
+    両profile各16件、指定8 endpoint、両LANの新4台の名前順一致を確認した。
+    lan12全件はStep 1 commitと一致、両profileの先頭12件は作成時commitと一致。
+    全32件のIPv4・port規則・重複なし、既定値不変、既存log hash不変も確認した。
+  - `git diff --check`合格。製品差分はlan100末尾4行だけ。本Todoと設定ファイルだけをcommit/pushする。
 
 ## Step 3: 読込みの回帰試験と反映手順を残す
 
