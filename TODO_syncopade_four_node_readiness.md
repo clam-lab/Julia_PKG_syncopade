@@ -2,7 +2,7 @@
 
 ## 状態
 
-- 2026-09-30作成。同日、先生から「もち，強化Cでいこうよ」と開始承認を受けた。Step 1を開始。
+- 2026-09-30作成。同日、先生から「もち，強化Cでいこうよ」と開始承認を受けた。Step 1検証完了、実機投入はまだゼロ。
 - 前の設定追加は全3 Step完了（HEAD `ab16a3752db85be363db97eb8a33bf511af53fd4`）。
   完了Todoを[historyへ退避](history/TODO_syncopade_add_four_nodes.md)した。
 - 先生の報告: 新4台がconductor上でIDLE、SMB接続済み、共有パスは全台`/Volumes/syncopade_nfs`で一致。
@@ -94,9 +94,9 @@
   実機の事前確認は承認後の読み取り専用STATUS/RUNTIME/LISTと、conductorの状態表示・記録の確認まで。
   このStepで実機へ計算は投入しない。
 - [x] Phase 1 — 方針・前提を確認
-- [ ] Phase 2 — 入出力・合否・後始末仕様を確定
-- [ ] Phase 3 — 試験driverとローカル確認を実装
-- [ ] Phase 4 — ローカル検証・接続先/投入停止の確認・記録・commit/push
+- [x] Phase 2 — 入出力・合否・後始末仕様を確定
+- [x] Phase 3 — 試験driverとローカル確認を実装
+- [x] Phase 4 — ローカル検証・接続先/投入停止の確認・記録（commit/pushは直後に実施）
 
 ### Step 1 / Phase 1 記録
 
@@ -107,6 +107,48 @@
 - conductorの割当先はcallback接続の送信元IPから特定し、LIST内の一意なserver endpointと対応させる。
   task/job IDをconductorの`TASK_STATUS`完了記録と照合する。遠隔CSVへの書込みや新しい照会APIは追加しない。
   試験logには受付・callback・終端の各記録を残す。通常計算休止は先生の報告を前提とし、LISTをqueue空の証明にはしない。
+
+### Step 1 / Phase 2 記録
+
+- `run_probe(mode, target_ip, target_port, callback_ip, callback_port, source, timeout; io)`:
+  modeはdirect/conductor、portは対象1–65535・callback 0–65535（0はOSが空きを選択）、
+  IPは明示IPv4、sourceは絶対パスで既存正本とSHA-256一致、timeoutは正の有限秒数とする。
+  戻り値はjob/task ID・実worker endpoint・callback port・結果。異常は例外、CLIではexit 1。
+  副作用は1件だけの投入・一時待受け・指定ioへの監査記録。再送・再起動・cache変更・共有書込みはしない。
+- `receive_once(listener, timeout)`: 1接続の送信元IPとchecksum付き1行を取得する。
+  受付応答より先にcallbackが来ても、先に開いたlisten socketの待ち行列で受けられる。
+  有限期限でaccept/readを打ち切り、自分の接続とTimerを必ず閉じる。独立した受信Taskは作らない。
+- `checked_payload(row)` / `validate_result(mode, accepted_id, message)`:
+  既存parserを利用し、checksum、protocol、受付ID、ok、厳密な結果文字列`30030.0`を検査する。
+- `read_task_status(...)` / `wait_terminal(...)`: 有限期限付きTASK_STATUS照会でtask/job IDと
+  `terminal / WORKER_DONE_OK`を確認する。callbackの送信元IPをLISTのendpointと対応させた記録と照合する。
+- `wait_idle(...)`: 試験前後でlistener/server IDが同一、ready/idleへ復帰したことを有限期限内に確認する。
+  conductor modeでは投入前LISTの候補のRUNTIMEを読み、実際に選ばれたworkerの前後IDを照合する。
+- 送信後の失敗は結果不明として記録し、既知task IDのTASK_STATUSと対象RUNTIMEを読み取り照会して止まる。
+  受理を否定できない場合は「未実行」と断定しない。試験の受付待ちは最大5秒、結果・終端・idle待ちは各60秒を基本にする。
+- 終了時にはcallback待受けを閉じ、同一IP/portを再度bindできることも確認する。
+  ローカル検証は127.0.0.1上の模擬応答だけを使い、正常・ERROR・ID/値違い・checksum違い・待ち期限超過・後始末を検査する。
+- CLIは上記7引数に今回専用logのパスを加えた8引数。既存logがあれば上書きせず拒否する。
+
+### Step 1 / Phase 3 記録
+
+- `test/integration_four_node_readiness.jl`を追加。includeは定義だけ、明示起動で1件だけ通信する。
+  既存APIのchecksum/parser/有限期限付き要求を使用し、socket・Timerの終了とport再利用を検査する。
+- `test/unit_four_node_readiness_driver.jl`を追加。127.0.0.1上の模擬相手で正常と異常を検査する。
+  稼働中のconductor/server、node設定、共有source、通常suiteの自動起動対象は変更していない。
+
+### Step 1 / Phase 4 検証記録
+
+- 初回ローカル検証は灯子の模擬応答内の`continue`が非同期関数の外側のloopを参照する構文ミスで開始できなかった。
+  当該模擬応答を終了する`return nothing`へ修正した。実機への通信はなし。強化Cの単純ミス修正範囲として再検証する。
+- 最終ローカル検証: `julia --startup-file=no --project=. test/unit_four_node_readiness_driver.jl`、251/251成功、exit 0。
+  CLIのlog生成・既存log上書き拒否と、指定LAN以外への接続拒否も確認した。
+- 関連既存テスト: `unit_client_protocol.jl` 63/63、`unit_result_protocol.jl` 43/43、
+  `unit_server_management_protocol.jl` 30/30。全てexit 0。製品コード無変更のため今回は関連範囲を検証し、全suiteの再実行はしていない。
+- 読み取り専用事前確認を再実施し、MSE-06のLISTに新4台が含まれ、全4台idle/ready・開始前と同じ起動IDを確認した。
+- 共有fixtureと正本のSHA-256一致、既存conductor CSVのSHA-256不変を確認した。
+  サーバ側実装はcache照会前にsourceの存在を調べる。今回の試験では関数cacheを消さず、cache未使用や毎回のファイル再読込みまでは保証しない。
+- Todo開始前の整理はcommit `44e39c5`でpush済み。今回追加ファイルを含むdiffを検査後、Step 1としてcommit/pushする。
 
 ## Step 2: REXへ直接1件送る
 
