@@ -12,6 +12,10 @@ const SYNCOPADE_NODE_PROFILES = Dict(
         (ip="192.168.12.11", port=8011, name="GNK_EG-6"),
         (ip="192.168.12.12", port=8012, name="C-3PX"),
         (ip="192.168.12.13", port=8013, name="D-O"),
+        (ip="192.168.12.15", port=8015, name="KIX"),
+        (ip="192.168.12.16", port=8016, name="FIVES"),
+        (ip="192.168.12.17", port=8017, name="JESSE"),
+        (ip="192.168.12.18", port=8018, name="REX"),
     ],
     "lan100" => [
         (ip="192.168.100.26", port=8026, name="C-3PX"),

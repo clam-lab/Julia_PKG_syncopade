@@ -61,10 +61,22 @@ portは既存規則 `8000 + IPv4アドレスの末尾` に従う。
 - **検証方法:** 独立Juliaで設定ファイルだけをincludeし、件数・名前/IP/portの対応・port規則・endpoint重複なしを
   assertionで確認する。作成時commitとの比較で既存一覧の不変を確認する。socketを開かず、LANへ接続しない。
   `git diff --check`、対象外差分なし、既存log hash不変を確認して対象のみcommit/pushする。
-- [ ] Phase 1 — 実装方針と確認メモを確定
-- [ ] Phase 2 — 設定の入出力・変更範囲・検証仕様を確定
-- [ ] Phase 3 — lan12へ4件追記
-- [ ] Phase 4 — 独立検証・差分確認・記録・commit/push
+- [x] Phase 1 — 実装方針と確認メモを確定
+  - 承認済みTodoを`4a360d0`でcommit/push。作成時HEAD・remote一致と既存log hashを確認した。
+  - 変更箇所はlan12配列の末尾4行に限定する。既存12件を維持し、KIX/FIVES/JESSE/REXの順に追記する。
+    lan100は次Stepまで変更しない。読み込み試験だけを使い、実LANへ接続しない。
+- [x] Phase 2 — 設定の入出力・変更範囲・検証仕様を確定
+  - 入力`profile="lan12"`に対する一覧の末尾が、指定4台の`(ip::String, port::Int, name::String)`になる。
+    既定値、未知profileの例外、関数本体・副作用は不変。lan100の出力も不変。
+  - 独立Juliaで現行設定と作成時commitの設定を別moduleに読み込み、先頭12件・lan100全件を比較する。
+    追加4件は先生の指定を独立した期待値として照合し、IP形式・port規則・endpoint/name重複も検査する。
+- [x] Phase 3 — lan12へ4件追記
+  - 指定されたIP・port・大文字の名前で4行を追加。関数・既定値・既存の行は変更していない。
+- [x] Phase 4 — 独立検証・差分確認・記録・commit/push
+  - `julia --startup-file=no --project=. -e ...`による独立設定比較は67/67、exit 0。
+    lan12は16件・指定4件一致、既存12件とlan100全件は作成時commitと一致した。
+    全28件のIPv4・port規則・重複なし、既定値不変、既存log hash不変も確認した。
+  - `git diff --check`合格。製品差分はlan12末尾4行だけ。本Todoと設定ファイルだけをcommit/pushする。
 
 ## Step 2: lan100へ同じ4台を追加する
 
