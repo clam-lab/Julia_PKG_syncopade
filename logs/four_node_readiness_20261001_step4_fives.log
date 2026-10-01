@@ -1,0 +1,11 @@
+2026-10-01T09:26:41.956 event=begin mode=:direct target_ip="192.168.12.16" target_port=8016 callback_ip="192.168.12.2" source="/Volumes/syncopade_nfs/syncopadeBasicTestScript.jl" sha256="06c7c238922e62ff14f5e6b692e1bf6e90f4bd93276b0993c584a455f96b6c8d" timeout=60.0
+2026-10-01T09:26:41.978 event=before ip="192.168.12.16" port=8016 runtime=Main.FourNodeReadiness.ServerRuntimeInfo("13165829-b6f1-4486-bb84-a4d99c1f0447", "684321fb-3507-4163-ab78-518abf99a04a", :idle, 5640, 5650, "1.12.7", "0.1.5", true)
+2026-10-01T09:26:41.991 event=callback_listening callback_ip="192.168.12.2" bound_port=50549
+2026-10-01T09:26:42.001 event=acceptance_response row="OK|STARTED|4acb18f4-5bb9-475f-b369-ff783440fddc"
+2026-10-01T09:26:42.001 event=accepted accepted_id="4acb18f4-5bb9-475f-b369-ff783440fddc"
+2026-10-01T09:26:42.783 event=callback peer_ip="192.168.12.16" row="RESULT|4acb18f4-5bb9-475f-b369-ff783440fddc|OK|30030.0|5b"
+2026-10-01T09:26:42.783 event=worker_identified worker_ip="192.168.12.16" worker_port=8016 task_id="" job_id="4acb18f4-5bb9-475f-b369-ff783440fddc"
+2026-10-01T09:26:42.785 event=idle_restored ip="192.168.12.16" port=8016 runtime=Main.FourNodeReadiness.ServerRuntimeInfo("13165829-b6f1-4486-bb84-a4d99c1f0447", "684321fb-3507-4163-ab78-518abf99a04a", :idle, 5640, 5650, "1.12.7", "0.1.5", true)
+2026-10-01T09:26:42.785 event=result_verified task_id="" job_id="4acb18f4-5bb9-475f-b369-ff783440fddc" value="30030.0"
+2026-10-01T09:26:42.786 event=callback_closed_and_rebind_verified callback_ip="192.168.12.2" bound_port=50549
+2026-10-01T09:26:42.786 event=PASS result=(task_id = "", job_id = "4acb18f4-5bb9-475f-b369-ff783440fddc", worker_ip = "192.168.12.16", worker_port = 8016, callback_port = 50549, result = "30030.0")

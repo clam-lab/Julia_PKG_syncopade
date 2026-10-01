@@ -4,8 +4,8 @@
 
 - 2026-09-30作成。同日、先生から「もち，強化Cでいこうよ」と開始承認を受けた。
   Step 1完了・push済み (`1ffa1a0`)。Step 2初回はREXへ1件投入後、結果返送の60秒期限超過で停止した。
-  2026-10-01の再試験でStep 2、続いてJESSEのStep 3が成功。Step 4–6は未着手。
-  実機投入は合計3件（初回timeout・正常2件）、正常完了確認はREX/JESSEの2台。
+  2026-10-01にREX再試験・JESSE・FIVESのStep 2–4が成功。Step 5–6は未着手。
+  実機投入は合計4件（初回timeout・正常3件）、正常完了確認はREX/JESSE/FIVESの3台。
 - 2026-10-01、先生からREX側のアクセス許可ダイアログでOKを押したとの報告と「再テストしてみて」の指示を受けた。
   この指示ではStep 2のREX再試験1件だけを実施し、commit `3bfeb59`でpushした。
 - 同日、先生から「ほかのもネットワークディレクトリへのアクセスのパーミッション開いてきたよ」と報告があった。
@@ -287,10 +287,35 @@
 - **対象ファイル:** 本Todo、今回専用の試験log。Step 1のdriverを使う。
 - **完了条件:** FIVESの指定endpointで共通の合否判定をすべて満たす。
 - **検証方法:** 同じ入力・判定を使い、FIVES固有の起動ID・job ID・結果・idle復帰を記録する。
-- [ ] Phase 1 — FIVESの宛先・事前状態を確認
-- [ ] Phase 2 — 1件の入力と判定条件を固定
-- [ ] Phase 3 — 1件だけ投入
-- [ ] Phase 4 — 結果/復帰/後始末確認・記録・commit/push
+- [x] Phase 1 — FIVESの宛先・事前状態を確認
+- [x] Phase 2 — 1件の入力と判定条件を固定
+- [x] Phase 3 — 1件だけ投入
+- [x] Phase 4 — 結果/復帰/後始末確認・記録・commit/push
+
+### Step 4 / Phase 1 記録 — 2026-10-01
+
+- Step 3をcommit `40a1ded`でpush済み。FIVES `192.168.12.16:8016`の09:26 JSTのRUNTIMEはidle/ready。
+  先生のネットワークディレクトリ許可済みという報告を前提に、既存driverでこの1台だけ試す。
+  製品・driver・共有source・LANを変更せず、投入直前にも状態を取り直す。
+
+### Step 4 / Phase 2 記録
+
+- 入力はdirect、FIVESの上記endpoint、callback `192.168.12.2:0`、共有上の既存basic fixture、
+  `[2,3,5]`と`[7,11,13]`。受付5秒・結果/復帰各60秒。
+- 合否はjob ID一致、送信元FIVES、成功値`30030.0`、同一起動IDのidle復帰、callback後始末。
+  副作用は1件の計算と一時待受けのみ。logは`logs/four_node_readiness_20261001_step4_fives.log`。
+
+### Step 4 / Phase 3 記録
+
+- 09:26:42 JST、FIVESへ指定入力を1件だけ送信し、job ID `4acb18f4-5bb9-475f-b369-ff783440fddc`を受け付けた。
+  callbackは`192.168.12.2:50549`。再送・設定変更は行っていない。
+
+### Step 4 / Phase 4 記録 — 成功
+
+- [専用log](logs/four_node_readiness_20261001_step4_fives.log): exit 0。
+  09:26:42.783にFIVESから受付と同じjob IDの`OK / 30030.0`を受信。
+  checksum一致、同じlistener/server ID・PIDでidle/ready復帰、callback port再bind成功を確認した。
+- 独立したlog再照合も12/12成功。Todoと専用logだけをStep 4完了としてcommit/pushする。
 
 ## Step 5: KIXへ直接1件送る
 
