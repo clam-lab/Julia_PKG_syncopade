@@ -4,10 +4,12 @@
 
 - 2026-09-30作成。同日、先生から「もち，強化Cでいこうよ」と開始承認を受けた。
   Step 1完了・push済み (`1ffa1a0`)。Step 2初回はREXへ1件投入後、結果返送の60秒期限超過で停止した。
-  2026-10-01の再試験は全判定成功し、Step 2完了。Step 3–6は未着手。
-  実機投入は合計2件（初回timeout・今回成功）、正常完了を確認できた実機試験はREXの1件。
+  2026-10-01の再試験でStep 2、続いてJESSEのStep 3が成功。Step 4–6は未着手。
+  実機投入は合計3件（初回timeout・正常2件）、正常完了確認はREX/JESSEの2台。
 - 2026-10-01、先生からREX側のアクセス許可ダイアログでOKを押したとの報告と「再テストしてみて」の指示を受けた。
-  今回はStep 2のREX再試験1件だけを実施した。Step 3以降へは進めていない。
+  この指示ではStep 2のREX再試験1件だけを実施し、commit `3bfeb59`でpushした。
+- 同日、先生から「ほかのもネットワークディレクトリへのアクセスのパーミッション開いてきたよ」と報告があった。
+  残り3台も許可済みという前提で、承認済みの強化Cに沿ってStep 3から再開する。Stepの追加・順序変更はしない。
 - 前の設定追加は全3 Step完了（HEAD `ab16a3752db85be363db97eb8a33bf511af53fd4`）。
   完了Todoを[historyへ退避](history/TODO_syncopade_add_four_nodes.md)した。
 - 先生の報告: 新4台がconductor上でIDLE、SMB接続済み、共有パスは全台`/Volumes/syncopade_nfs`で一致。
@@ -247,10 +249,37 @@
 - **対象ファイル:** 本Todo、今回専用の試験log。Step 1のdriverを使う。
 - **完了条件:** JESSEの指定endpointで共通の合否判定をすべて満たす。
 - **検証方法:** REXと同じ入力・判定を使い、JESSE固有の起動ID・job ID・結果・idle復帰を記録する。
-- [ ] Phase 1 — JESSEの宛先・事前状態を確認
-- [ ] Phase 2 — 1件の入力と判定条件を固定
-- [ ] Phase 3 — 1件だけ投入
-- [ ] Phase 4 — 結果/復帰/後始末確認・記録・commit/push
+- [x] Phase 1 — JESSEの宛先・事前状態を確認
+- [x] Phase 2 — 1件の入力と判定条件を固定
+- [x] Phase 3 — 1件だけ投入
+- [x] Phase 4 — 結果/復帰/後始末確認・記録・commit/push
+
+### Step 3 / Phase 1 記録 — 2026-10-01
+
+- JESSE `192.168.12.17:8017`を直接指定する。09:25 JSTの読み取り照会でidle/readyを確認した。
+  callback側アドレス`192.168.12.2`も確認済み。共有sourceと正本のhash一致、既存conductor CSVのhash不変。
+- 先生の許可操作を環境側の準備完了として受け取り、製品・driver・共有ファイルは変更せず、既存driverで1件だけ試す。
+  投入直前にもRUNTIMEを取り直し、REXの成功をJESSEの成功として扱わない。
+
+### Step 3 / Phase 2 記録
+
+- 入力はdirect、JESSEの上記endpoint、callback `192.168.12.2:0`、共有上の既存basic fixture、
+  `[2,3,5]`と`[7,11,13]`。受付5秒・結果/復帰各60秒を維持する。
+- 受付/返送job ID、送信元JESSE、成功値`30030.0`、同一起動IDのidle復帰、callback後始末を全て必須とする。
+  副作用は1件の計算と一時待受けのみ。専用logは`logs/four_node_readiness_20261001_step3_jesse.log`。
+
+### Step 3 / Phase 3 記録
+
+- 09:25:32 JST、JESSEへ指定した入力を1件だけ送信。
+  受付job IDは`bb29a8c4-9338-4f9f-bb95-a56688a1a820`、callbackは`192.168.12.2:50518`。
+  入力変更・再送・再起動・cache clearは行っていない。
+
+### Step 3 / Phase 4 記録 — 成功
+
+- [専用log](logs/four_node_readiness_20261001_step3_jesse.log): exit 0。
+  09:25:33.079にJESSEから同じjob IDの`OK / 30030.0`を受信し、checksumを検証した。
+  同じlistener/server ID・PIDでidle/ready復帰、callback port再bind成功を確認した。
+- log再読込の独立照合も12/12成功。実投入は1件のみ。Todoと専用logだけをStep 3完了としてcommit/pushする。
 
 ## Step 4: FIVESへ直接1件送る
 
