@@ -4,12 +4,12 @@
 
 - 2026-09-30作成。同日、先生から「もち，強化Cでいこうよ」と開始承認を受けた。
   Step 1完了・push済み (`1ffa1a0`)。Step 2初回はREXへ1件投入後、結果返送の60秒期限超過で停止した。
-  2026-10-01にREX再試験・JESSE・FIVES・KIXのStep 2–5が成功。Step 6は未着手。
-  実機投入は合計5件（初回timeout・正常4件）、新4台それぞれの正常完了を確認済み。
+  2026-10-01にREX再試験・JESSE・FIVES・KIXの直接試験とconductor経由の試験が成功し、全6 Step完了。
+  実機投入は合計6件（初回timeout 1件・正常5件）。新4台の個別確認とconductor経由1件の正常完了を確認済み。
 - 2026-10-01、先生からREX側のアクセス許可ダイアログでOKを押したとの報告と「再テストしてみて」の指示を受けた。
   この指示ではStep 2のREX再試験1件だけを実施し、commit `3bfeb59`でpushした。
 - 同日、先生から「ほかのもネットワークディレクトリへのアクセスのパーミッション開いてきたよ」と報告があった。
-  残り3台も許可済みという前提で、承認済みの強化Cに沿ってStep 3から再開する。Stepの追加・順序変更はしない。
+  残り3台も許可済みという前提で、承認済みの強化Cに沿ってStep 3–6を順番に完了した。Stepの追加・順序変更はしていない。
 - 前の設定追加は全3 Step完了（HEAD `ab16a3752db85be363db97eb8a33bf511af53fd4`）。
   完了Todoを[historyへ退避](history/TODO_syncopade_add_four_nodes.md)した。
 - 先生の報告: 新4台がconductor上でIDLE、SMB接続済み、共有パスは全台`/Volumes/syncopade_nfs`で一致。
@@ -369,10 +369,58 @@
   実際に割り当てたworkerとそのidle復帰を確認できる。4台同時利用の証拠とは扱わない。
 - **検証方法:** 同じ共有source・入力で1件SUBMITし、callback、TASK_STATUS、対応する配送/完了記録を照合する。
   終了後に今回のcallback待受けが残らず、全5件の成否と未検証範囲が記録されていることを確認する。
-- [ ] Phase 1 — conductorの宛先・queue/worker状態を確認
-- [ ] Phase 2 — 1件の入力・task/job照合・正常終端条件を固定
-- [ ] Phase 3 — 1件だけ投入
-- [ ] Phase 4 — 結果/終端/割当先/後始末確認・総括・commit/push
+- [x] Phase 1 — conductorの宛先・queue/worker状態を確認
+- [x] Phase 2 — 1件の入力・task/job照合・正常終端条件を固定
+- [x] Phase 3 — 1件だけ投入
+- [x] Phase 4 — 結果/終端/割当先/後始末確認・総括・commit/push
+
+### Step 6 / Phase 1 記録 — 2026-10-01
+
+- Step 5をcommit `ee16815`でpush済み。09:28 JST、MSE-06 `192.168.12.4:9004`のLIST応答とchecksumを確認した。
+  表示された11 endpointは全てlan12で、新4台を含む。11台全てのRUNTIMEもidle/readyを確認した。
+- LISTは待ち行列の空を証明しない。通常投入休止という先生の前提を継続し、今回の直接試験は全件終了済みとして進める。
+  profile・候補順・他nodeの稼働状態を人為的に変えず、通常の割当結果を記録する。
+- 既存driverは候補ごとの起動IDを保存し、callback送信元IPと照合する。conductorのTASK_STATUSを完了記録として読む。
+
+### Step 6 / Phase 2 記録
+
+- 入力はconductor mode、MSE-06 `192.168.12.4:9004`、callback `192.168.12.2:0`、
+  直接試験と同じ共有basic fixture・2ベクトル。受付5秒・結果/終端/復帰各60秒とする。
+- `OK|QUEUED`のtask IDをcallbackのtask IDと照合し、成功値`30030.0`を確認する。
+  callbackのjob IDをTASK_STATUSの`terminal / WORKER_DONE_OK`に記録されたjob IDと照合する。
+- 実workerはcallbackの送信元IPと投入前LISTの一意なendpointで特定し、起動ID不変のidle復帰を確認する。
+  副作用はSUBMIT 1件と自分の待受けのみ。logは`logs/four_node_readiness_20261001_step6_conductor.log`。
+
+### Step 6 / Phase 3 記録
+
+- 09:29:18 JST、MSE-06へSUBMITを1件送った。受付task IDは`b6a6649b-632c-475f-809a-7f6aa668846b`。
+  callbackは`192.168.12.2:50614`。通常の配送でREX `192.168.12.18:8018`から返送があり、
+  job IDは`b6dc2746-996d-40f0-b1a7-c9e8ad86d316`。割当先の固定や再送はしていない。
+
+### Step 6 / Phase 4 記録 — 成功、全Step完了
+
+- [専用log](logs/four_node_readiness_20261001_step6_conductor.log): exit 0。
+  09:29:18.743にREXから同じtask IDの`TASK_RESULT`を受信し、checksum・成功値`30030.0`を検証した。
+  09:29:18.798にconductorの`terminal / WORKER_DONE_OK`と同じtask/job IDを確認した。
+- 09:29:18.800に実workerであるREXの同一起動ID・PIDのidle/ready復帰、同18.801にcallbackの終了とport再bind成功を確認した。
+  通常の選択でREXに届いた事実は確認できたが、この1件だけを4台同時利用・配分性能の証拠とはしない。
+- logの独立再照合・TASK_STATUSの再照会・新4台の最終RUNTIME確認は27/27成功。
+  09:30:11 JSTの確認終了時、新4台はいずれも開始前と同じ起動ID・PIDでidle/ready。
+- 5件の正常job IDが全て異なること、初回REX timeoutの記録を残していることも確認した。
+  成功5件で失敗1件を帳消しにせず、実際の投入総数は6件として報告する。
+- 製品・設定・driver・共有fixture・versionは無変更。既存conductor CSVのSHA-256は開始前の値から不変。
+  Todoと今回の専用logだけをStep 6完了としてcommit/pushする。server停止・cache clear・タグ付け・Todo退避はしていない。
+
+## 完了範囲と残る確認
+
+- 完了: lan12上の新4台それぞれの既存共有source指定による関数実行・結果返送・ID照合・idle復帰。
+  MSE-06の通常conductor受付/配送/結果通知/終端管理も、同じ軽い計算1件で確認した。
+- 未検証: 実際の研究計算の依存package、SMB書込み、長時間/高負荷、4台同時実行、lan100側。
+  cacheは消していないため、毎回source本文を再読込みしたことやcold start性能までは保証しない。
+- macOSのアクセス許可操作後に同じ試験が通ったことは確認済み。ただし初回の遠隔ログがないため、
+  その時点で待っていた処理位置や初回計算結果を断定しない。
+- Step別のpush済みcommit: Step 1 `1ffa1a0`、Step 2再試験 `3bfeb59`、Step 3 `40a1ded`、
+  Step 4 `7fa0348`、Step 5 `ee16815`。Step 6のcommitは本記録を含む直後のcommitに対応する。
 
 ## 停止条件
 
