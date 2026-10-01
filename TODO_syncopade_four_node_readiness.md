@@ -3,8 +3,11 @@
 ## 状態
 
 - 2026-09-30作成。同日、先生から「もち，強化Cでいこうよ」と開始承認を受けた。
-  Step 1完了・push済み (`1ffa1a0`)。Step 2でREXへ1件投入後、結果返送の60秒期限超過で停止。
-  Step 2は未完了、Step 3–6は未着手。実機投入は合計1件、正常完了を確認できた実機試験は0件。
+  Step 1完了・push済み (`1ffa1a0`)。Step 2初回はREXへ1件投入後、結果返送の60秒期限超過で停止した。
+  2026-10-01の再試験は全判定成功し、Step 2完了。Step 3–6は未着手。
+  実機投入は合計2件（初回timeout・今回成功）、正常完了を確認できた実機試験はREXの1件。
+- 2026-10-01、先生からREX側のアクセス許可ダイアログでOKを押したとの報告と「再テストしてみて」の指示を受けた。
+  今回はStep 2のREX再試験1件だけを実施した。Step 3以降へは進めていない。
 - 前の設定追加は全3 Step完了（HEAD `ab16a3752db85be363db97eb8a33bf511af53fd4`）。
   完了Todoを[historyへ退避](history/TODO_syncopade_add_four_nodes.md)した。
 - 先生の報告: 新4台がconductor上でIDLE、SMB接続済み、共有パスは全台`/Volumes/syncopade_nfs`で一致。
@@ -33,7 +36,7 @@
 - conductorはMSE-06（設定上の表記は`MSE-6`）の`192.168.12.4:9004`。
   先生の指定と実応答に基づき、今回の宛先はlan12に限定する。lan100へは接続しない。
   このPCのlan12アドレスは`192.168.12.2`。結果返送と待受けに明示して使い、portは試験入口で確定する。
-  現時点ではアドレスの存在だけを確認済みで、別ノードからの結果返送は未検証。
+  2026-10-01の再試験でREXからの結果返送を確認済み。他3台からの返送は未検証。
 - 通常の新規投入が止まり、既存の待機・実行中・成否不明の仕事がないことを確認してから実機試験を始める。
   IDLE一覧だけをqueueが空であることの証拠にしない。
 - 計算の入力は`[2,3,5]`と`[7,11,13]`、期待値は`30030.0`。
@@ -161,7 +164,7 @@
 - [x] Phase 1 — REXの宛先・事前状態を確認
 - [x] Phase 2 — 1件の入力と判定条件を固定
 - [x] Phase 3 — 1件だけ投入
-- [ ] Phase 4 — 結果/復帰/後始末確認・記録・commit/push
+- [x] Phase 4 — 結果/復帰/後始末確認・記録・commit/push（2026-10-01再試験で成功）
 
 ### Step 2 / Phase 1 記録
 
@@ -199,6 +202,44 @@
   自分の試験processは終了済み。REX側の計算・executor・listenerには終了指示を送っていない。
   遅れて返送される結果を受け取る待受けはもうないため、実行結果は不明のまま扱う。
 - 既存`logs/conductor_events.csv`のSHA-256は開始前と同じ。今回のTodoと専用logだけを停止記録としてcommit/pushする。
+
+### Step 2 再試験 / Phase 1 記録 — 2026-10-01
+
+- 前回停止後、先生から「ターミナルのネットワーク関連アクセス許可ダイアログが出ていた」「OKを押した」と報告があった。
+  ダイアログの正確な文面と遠隔側の処理位置は未確認。許可待ちは原因候補であり、まだ確定扱いにはしない。
+- 2026-10-01 09:02 JSTの読み取り照会では、REXは前回と同じlistener/server ID・PIDでidle/readyへ戻っていた。
+  前回jobの結果は未受信のまま保存し、今回の成功結果で前回の記録を上書きしない。
+- 方針は既存driver・同じ共有source・同じ入力でREXへ1件だけ再投入。投入直前のRUNTIMEでもidle/readyを確認する。
+  共有sourceと正本のSHA-256は引き続き一致。製品コード・試験driver・期限・共有ファイル・設定は変更しない。
+
+### Step 2 再試験 / Phase 2 記録 — 2026-10-01
+
+- 入力: direct、`192.168.12.18:8018`、callback `192.168.12.2:0`、
+  `/Volumes/syncopade_nfs/syncopadeBasicTestScript.jl:syncopadeBasicTestScript:test`、`[2,3,5]`と`[7,11,13]`。
+  受付5秒・結果/復帰各60秒を維持する。
+- 合否は受付job IDとcallbackの一致、送信元REX、`ok=true / 30030.0`、同一起動IDのidle復帰、callbackの後始末。
+- 副作用は先生が明示した再試験1件と自分の待受けのみ。
+  新規log `logs/four_node_readiness_20261001_step2_rex_retry1.log`へ記録し、前回logを保持する。
+
+### Step 2 再試験 / Phase 3 記録 — 2026-10-01
+
+- 09:05:19 JST、上記の固定入力をREXへ1件だけ送った。
+  `OK|STARTED|eb0ce938-3a7a-4029-ae10-d91c7bf25a7a`を受信。今回のcallbackは`192.168.12.2:50315`。
+  受付前RUNTIMEは前回と同じlistener/server ID・PIDでidle/ready。追加再送はしていない。
+
+### Step 2 再試験 / Phase 4 記録 — 成功
+
+- [今回の生log](logs/four_node_readiness_20261001_step2_rex_retry1.log)に全経路を記録。試験processはexit 0。
+  09:05:19.248に受付、09:05:19.372にREX `192.168.12.18`から
+  `RESULT|eb0ce938-3a7a-4029-ae10-d91c7bf25a7a|OK|30030.0|5e`を受信した。
+- checksum・job ID・成功状態・期待値が一致。09:05:19.374に前後で同じlistener/server ID・PIDのidle/ready復帰を確認した。
+  09:05:19.375にcallback `192.168.12.2:50315`を閉じ、同一portの再bind成功を確認した。
+- logを独立に再読込して、受付/返送が各1件、checksum・job ID・積の期待値・起動ID・後始末を11項目で再照合し、11/11成功。
+- 製品コード・試験driver・共有source・server起動IDを変えず、先生の許可操作後の再試験が成功した。
+  初回が許可待ちだったという説明と整合するが、ダイアログの種類や初回jobの計算結果までは確定しない。
+  cacheを維持した試験なので、今回新たに共有ファイルの本文を読み直した証拠とは扱わない。
+- 前回log・既存conductor CSVは無変更。共有fixtureと正本のSHA-256も不変。
+  今回のTodoと新規logだけをStep 2完了としてcommit/pushする。他3台・conductor経由は未試験のまま。
 
 ## Step 3: JESSEへ直接1件送る
 
